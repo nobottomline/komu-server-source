@@ -8,10 +8,12 @@ package suwayomi.tachidesk.manga.impl.extension
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import eu.kanade.tachiyomi.util.lang.Hash
+import java.io.ByteArrayOutputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.Collections
 import java.util.jar.JarEntry
 import java.util.jar.JarFile
 
@@ -21,12 +23,46 @@ internal object ExtensionJarVerifier {
         val signerFingerprint: String,
         val verifiedEntries: Int,
         val uncompressedBytes: Long,
+        val verifiedEntryNames: Set<String>,
     )
+
+    class AuthenticatedEntry internal constructor(
+        val signature: Result,
+        bytes: ByteArray,
+    ) {
+        private val authenticatedBytes = bytes.copyOf()
+
+        fun copyBytes(): ByteArray = authenticatedBytes.copyOf()
+    }
 
     fun verify(
         jarPath: Path,
         expectedSigningKey: String,
-    ): Result {
+    ): Result = authenticate(jarPath, expectedSigningKey, requestedEntry = null, requestedEntryLimit = 0).signature
+
+    /** Returns entry bytes authenticated in the same [JarFile] verification pass. */
+    fun verifyAndRead(
+        jarPath: Path,
+        expectedSigningKey: String,
+        entryName: String,
+        entrySizeLimit: Long,
+    ): AuthenticatedEntry {
+        require(entryName.isNotBlank()) { "Authenticated entry name is blank" }
+        require(entrySizeLimit in 1..MAX_ENTRY_BYTES) { "Authenticated entry size limit is invalid" }
+        return authenticate(jarPath, expectedSigningKey, entryName, entrySizeLimit).let { authenticated ->
+            AuthenticatedEntry(
+                signature = authenticated.signature,
+                bytes = requireNotNull(authenticated.requestedEntryBytes) { "Signed extension JAR has no '$entryName'" },
+            )
+        }
+    }
+
+    private fun authenticate(
+        jarPath: Path,
+        expectedSigningKey: String,
+        requestedEntry: String?,
+        requestedEntryLimit: Long,
+    ): AuthenticationResult {
         val normalizedKey = expectedSigningKey.lowercase()
         require(normalizedKey.matches(SHA256_HEX)) { "Store signing key is not a SHA-256 fingerprint" }
 
@@ -42,8 +78,11 @@ internal object ExtensionJarVerifier {
         return JarFile(jarPath.toFile(), true).use { jar ->
             requireNotNull(jar.manifest) { "Signed extension JAR has no manifest" }
             val names = mutableSetOf<String>()
+            val verifiedEntryNames = mutableSetOf<String>()
             var verifiedEntries = 0
             var uncompressedBytes = 0L
+            var requestedEntryBytes: ByteArray? = null
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
 
             val entries = jar.entries()
             while (entries.hasMoreElements()) {
@@ -57,8 +96,13 @@ internal object ExtensionJarVerifier {
                 }
 
                 var entryBytes = 0L
+                val capturedBytes =
+                    if (entry.name == requestedEntry) {
+                        ByteArrayOutputStream()
+                    } else {
+                        null
+                    }
                 jar.getInputStream(entry).use { input ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     while (true) {
                         val read = input.read(buffer)
                         if (read == -1) break
@@ -69,6 +113,12 @@ internal object ExtensionJarVerifier {
                         }
                         require(uncompressedBytes <= MAX_UNCOMPRESSED_BYTES) {
                             "Extension JAR exceeds the total decoded size limit"
+                        }
+                        if (capturedBytes != null) {
+                            require(entryBytes <= requestedEntryLimit) {
+                                "Authenticated JAR entry '${entry.name}' exceeds its parser size limit"
+                            }
+                            capturedBytes.write(buffer, 0, read)
                         }
                     }
                 }
@@ -85,13 +135,29 @@ internal object ExtensionJarVerifier {
                         "Extension JAR entry '${entry.name}' is unsigned or signed by a different store key",
                     )
                 }
+                verifiedEntryNames += entry.name
+                capturedBytes?.let { requestedEntryBytes = it.toByteArray() }
                 verifiedEntries++
             }
 
             require(verifiedEntries > 0) { "Extension JAR contains no signed content" }
-            Result(normalizedKey, verifiedEntries, uncompressedBytes)
+            AuthenticationResult(
+                signature =
+                    Result(
+                        signerFingerprint = normalizedKey,
+                        verifiedEntries = verifiedEntries,
+                        uncompressedBytes = uncompressedBytes,
+                        verifiedEntryNames = Collections.unmodifiableSet(LinkedHashSet(verifiedEntryNames)),
+                    ),
+                requestedEntryBytes = requestedEntryBytes,
+            )
         }
     }
+
+    private data class AuthenticationResult(
+        val signature: Result,
+        val requestedEntryBytes: ByteArray?,
+    )
 
     private fun validateEntryName(entry: JarEntry) {
         val name = entry.name

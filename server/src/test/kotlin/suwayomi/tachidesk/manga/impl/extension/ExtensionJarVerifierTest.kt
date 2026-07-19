@@ -104,6 +104,26 @@ class ExtensionJarVerifierTest {
         }
     }
 
+    @Test
+    fun `authenticated entry result is an immutable defensive snapshot`() {
+        val authenticated =
+            ExtensionJarVerifier.verifyAndRead(
+                jarPath = findKeiyoushiJar(),
+                expectedSigningKey = KEIYOUSHI_SIGNING_KEY,
+                entryName = "AndroidManifest.xml",
+                entrySizeLimit = ExtensionJarManifestParser.MAX_MANIFEST_BYTES.toLong(),
+            )
+        val firstCopy = authenticated.copyBytes()
+        val originalFirstByte = firstCopy.first()
+        firstCopy[0] = (originalFirstByte.toInt() xor 0xFF).toByte()
+
+        assertEquals(originalFirstByte, authenticated.copyBytes().first())
+        assertFailsWith<UnsupportedOperationException> {
+            @Suppress("UNCHECKED_CAST")
+            (authenticated.signature.verifiedEntryNames as MutableSet<String>).clear()
+        }
+    }
+
     private fun createUnsignedJar(entryName: String): Path {
         val jarPath = tempDirectory.resolve("unsigned-${entryName.hashCode()}.jar")
         val manifest = Manifest().apply { mainAttributes[Attributes.Name.MANIFEST_VERSION] = "1.0" }
