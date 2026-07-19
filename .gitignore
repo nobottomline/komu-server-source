@@ -12,6 +12,14 @@ build
 server/out
 AndroidCompat/out
 
+# Module compiler outputs accidentally tracked by the historical Komu fork.
+# Keep these explicit: a broad `bin/` rule could hide intentional scripts.
+/AndroidCompat/bin/
+/AndroidCompat/Config/bin/
+/server/bin/
+/server/server-config/bin/
+/server/server-config-generate/bin/
+
 # WebUI is either to be downloaded on-demand or is a dynamic build asset
 server/src/main/resources/WebUI.zip
 
