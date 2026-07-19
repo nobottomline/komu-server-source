@@ -97,26 +97,23 @@ object Extension {
             } ?: throw NullPointerException("Could not find extension for $pkgName")
         val jarUrl = extension[ExtensionTable.jarUrl]
         val apkUrl = extension[ExtensionTable.apkUrl]
+        val selectedArtifact = ExtensionInstallArtifactPolicy.selectPublishedArtifact(apkUrl, jarUrl)
 
-        return when {
-            jarUrl != null -> {
+        return when (selectedArtifact.kind) {
+            ExtensionInstallArtifactPolicy.Kind.DIRECT_JAR -> {
                 installExtension {
-                    val jar = fetchExtensionFile(jarUrl)
+                    val jar = fetchExtensionFile(selectedArtifact.url)
                     val manifest = extractAndParseAndroidManifest(jar)
                     ExtensionPackage.Jar(jar, manifest)
                 }
             }
 
-            apkUrl != null -> {
+            ExtensionInstallArtifactPolicy.Kind.APK -> {
                 installExtension {
-                    val apk = fetchExtensionFile(apkUrl)
+                    val apk = fetchExtensionFile(selectedArtifact.url)
                     val packageInfo = getPackageInfo(apk)
                     ExtensionPackage.Apk(apk, packageInfo)
                 }
-            }
-
-            else -> {
-                throw NullPointerException("Could not find extension url for $pkgName")
             }
         }
     }
@@ -147,6 +144,7 @@ object Extension {
     ): String =
         when {
             extensionName.endsWith(".jar") -> {
+                ExtensionInstallArtifactPolicy.requireExternalJarExecution()
                 installExtension(
                     true,
                     {
