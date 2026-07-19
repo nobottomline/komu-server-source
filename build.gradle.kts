@@ -2,6 +2,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import org.jlleitschuh.gradle.ktlint.KtlintExtension
 import org.jlleitschuh.gradle.ktlint.KtlintPlugin
+import org.gradle.api.tasks.compile.JavaCompile
 
 plugins {
     alias(libs.plugins.kotlin.jvm) apply false
@@ -48,12 +49,17 @@ subprojects {
     }
 
     tasks {
+        withType<JavaCompile> {
+            options.release = libs.versions.jvmTarget.get().toInt()
+        }
+
         withType<KotlinJvmCompile> {
             if (plugins.hasPlugin(KtlintPlugin::class)) {
                 dependsOn("ktlintFormat")
             }
             compilerOptions {
                 jvmTarget = JvmTarget.fromTarget(libs.versions.jvmTarget.get())
+                freeCompilerArgs.add("-Xjdk-release=${libs.versions.jvmTarget.get()}")
                 freeCompilerArgs.add("-Xcontext-parameters")
             }
         }

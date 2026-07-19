@@ -1,5 +1,6 @@
 import de.undercouch.gradle.tasks.download.Download
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+import suwayomi.gradle.VerifyJavaArtifactTask
 import java.time.Instant
 
 plugins {
@@ -164,6 +165,8 @@ buildConfig {
 }
 
 tasks {
+    val packagedServer = named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar")
+
     shadowJar {
         isZip64 = true
         manifest {
@@ -182,6 +185,19 @@ tasks {
         archiveClassifier.set("")
         destinationDirectory.set(File("$rootDir/server/build"))
         mergeServiceFiles()
+    }
+
+    val verifyEmbeddedJava17Artifact =
+        register<VerifyJavaArtifactTask>("verifyEmbeddedJava17Artifact") {
+            group = "verification"
+            description = "Verifies that every class visible to embedded Java 17 uses compatible bytecode"
+            dependsOn(packagedServer)
+            archiveFile.set(packagedServer.flatMap { it.archiveFile })
+            targetJava.set(libs.versions.jvmTarget.map(String::toInt))
+        }
+
+    check {
+        dependsOn(verifyEmbeddedJava17Artifact)
     }
 
     test {

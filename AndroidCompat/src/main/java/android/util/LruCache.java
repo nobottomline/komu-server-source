@@ -222,7 +222,10 @@ public class LruCache<K, V> {
     }
 
     private Map.Entry<K, V> eldest() {
-        return map.firstEntry();
+        // LinkedHashMap.firstEntry() is Java 21+; iterator order has the same
+        // eldest-entry semantics and remains available on the embedded JDK 17.
+        var iterator = map.entrySet().iterator();
+        return iterator.hasNext() ? iterator.next() : null;
     }
 
     /**
