@@ -7,120 +7,65 @@ package suwayomi.tachidesk.manga.impl.extension
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.nio.file.Path
-import java.nio.file.StandardCopyOption
 
-/**
- * Coordinates the filesystem half of an extension activation with its
- * database transaction.
- *
- * The candidate must already have passed parsing, conversion and class-load
- * validation. [commitMetadata] must perform all database writes in one
- * transaction and must not return until that transaction has committed.
- *
- * This boundary guarantees exception-level rollback. It deliberately does not
- * claim process-crash atomicity: a durable activation journal is required for
- * recovery if the process dies between the file swap and the database commit.
- */
+/** Coordinates a validated JAR publication with its database transaction. */
 internal object ExtensionArtifactActivation {
+    private val logger = KotlinLogging.logger {}
+
     fun <T> commit(
+        packageName: String,
+        databaseIdentity: String,
         stagedArtifact: Path,
         activeArtifact: Path,
         previousArtifact: Path?,
-        commitMetadata: () -> T,
+        commitMetadata: (markerKey: String) -> T,
+        isCommitMarkerPresent: (markerKey: String) -> Boolean,
+        removeCommitMarker: (markerKey: String) -> Unit,
     ): T {
-        val staged = stagedArtifact.toAbsolutePath().normalize()
-        val active = activeArtifact.toAbsolutePath().normalize()
-        val previous = previousArtifact?.toAbsolutePath()?.normalize()
-
-        require(Files.isRegularFile(staged)) { "Staged extension artifact does not exist: $staged" }
-        require(staged != active) { "Staged and active extension artifacts must be different files" }
-        require(active.parent != null) { "Active extension artifact must have a parent directory" }
-        require(staged.parent == active.parent) {
-            "Staged and active extension artifacts must share a filesystem directory"
-        }
-
-        Files.createDirectories(active.parent)
-
-        val replacesPreviousInPlace = previous == active && Files.isRegularFile(active)
-        val rollbackCopy =
-            if (replacesPreviousInPlace) {
-                Files.createTempFile(active.parent, ".${active.fileName}.rollback-", ".jar").also {
-                    Files.copy(active, it, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES)
-                }
-            } else {
-                null
-            }
+        val root = activeArtifact.toAbsolutePath().normalize().parent
+        val journal = ExtensionActivationJournal(root)
+        var entry = journal.prepare(packageName, databaseIdentity, stagedArtifact, activeArtifact, previousArtifact)
 
         try {
-            try {
-                moveReplacing(staged, active)
-            } catch (activationFailure: Throwable) {
-                restoreInPlaceBackup(active, rollbackCopy, activationFailure)
-                throw activationFailure
-            }
+            entry = journal.transition(entry, ExtensionActivationJournal.State.FILE_SWAP_PENDING)
+            journal.publish(entry)
+            entry = journal.transition(entry, ExtensionActivationJournal.State.FILE_VISIBLE)
 
-            val result =
-                try {
-                    commitMetadata()
-                } catch (metadataFailure: Throwable) {
-                    rollbackActivation(active, rollbackCopy, metadataFailure)
-                    throw metadataFailure
+            val result = commitMetadata(entry.record.markerKey)
+
+            // From this point the DB marker is authoritative. Journal/backup
+            // cleanup is retryable startup work and must not roll back a
+            // transaction that has already committed.
+            runCatching {
+                entry = journal.transition(entry, ExtensionActivationJournal.State.DB_COMMITTED)
+                journal.finalizeCommitted(entry)
+                removeCommitMarker(entry.record.markerKey)
+            }.onFailure {
+                logger.warn(it) {
+                    "Extension ${entry.record.packageName} committed; activation cleanup deferred to startup recovery"
                 }
-
-            // Metadata has committed. Cleanup failures must not pretend that
-            // the transaction failed and must never roll back the new file.
-            if (previous != null && previous != active) runCatching { Files.deleteIfExists(previous) }
-            rollbackCopy?.let { runCatching { Files.deleteIfExists(it) } }
+            }
             return result
-        } finally {
-            runCatching { Files.deleteIfExists(staged) }
-            rollbackCopy?.let { runCatching { Files.deleteIfExists(it) } }
-        }
-    }
+        } catch (failure: Throwable) {
+            val databaseCommitted =
+                runCatching { isCommitMarkerPresent(entry.record.markerKey) }
+                    .getOrElse { markerFailure ->
+                        failure.addSuppressed(markerFailure)
+                        // The commit status is unknown. Preserve every recovery
+                        // artifact and journal instead of guessing.
+                        throw failure
+                    }
 
-    private fun rollbackActivation(
-        active: Path,
-        rollbackCopy: Path?,
-        originalFailure: Throwable,
-    ) {
-        try {
-            Files.deleteIfExists(active)
-            if (rollbackCopy != null) moveReplacing(rollbackCopy, active)
-        } catch (rollbackFailure: Throwable) {
-            originalFailure.addSuppressed(rollbackFailure)
-        }
-    }
-
-    private fun restoreInPlaceBackup(
-        active: Path,
-        rollbackCopy: Path?,
-        originalFailure: Throwable,
-    ) {
-        if (rollbackCopy == null) return
-        try {
-            Files.deleteIfExists(active)
-            moveReplacing(rollbackCopy, active)
-        } catch (rollbackFailure: Throwable) {
-            originalFailure.addSuppressed(rollbackFailure)
-        }
-    }
-
-    private fun moveReplacing(
-        source: Path,
-        target: Path,
-    ) {
-        try {
-            Files.move(
-                source,
-                target,
-                StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING,
-            )
-        } catch (_: AtomicMoveNotSupportedException) {
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING)
+            if (databaseCommitted) {
+                runCatching { journal.finalizeCommitted(entry) }
+                    .onFailure(failure::addSuppressed)
+            } else {
+                runCatching { journal.rollback(entry) }
+                    .onFailure(failure::addSuppressed)
+            }
+            throw failure
         }
     }
 }

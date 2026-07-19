@@ -49,12 +49,15 @@ import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.clearCachedImage
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.saveImage
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
+import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ApplicationDirs
+import suwayomi.tachidesk.server.serverConfig
 import uy.kohesive.injekt.injectLazy
 import java.io.InputStream
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -383,23 +386,29 @@ object Extension {
                 PackageTools.jarLoaderMap.remove(stagedJar.absolutePathString())?.close()
 
                 ExtensionArtifactActivation.commit(
+                    packageName = pkgName,
+                    databaseIdentity = activationDatabaseIdentity(),
                     stagedArtifact = stagedJar,
                     activeArtifact = activeJar,
                     previousArtifact = previousJar?.takeIf { isInstalled },
-                ) {
-                    setupJar(
-                        sources = sources,
-                        className = className,
-                        extensionName = extensionName,
-                        extensionLibVersion = extensionLibVersion,
-                        apkName = apkName,
-                        pkgName = pkgName,
-                        versionName = metadata.versionName,
-                        versionCode = metadata.versionCode,
-                        contentWarning = contentWarning,
-                        origin = origin,
-                    )
-                }
+                    commitMetadata = { markerKey ->
+                        setupJar(
+                            sources = sources,
+                            className = className,
+                            extensionName = extensionName,
+                            extensionLibVersion = extensionLibVersion,
+                            apkName = apkName,
+                            pkgName = pkgName,
+                            versionName = metadata.versionName,
+                            versionCode = metadata.versionCode,
+                            contentWarning = contentWarning,
+                            origin = origin,
+                            activationMarkerKey = markerKey,
+                        )
+                    },
+                    isCommitMarkerPresent = ::isActivationMarkerPresent,
+                    removeCommitMarker = ::removeActivationMarker,
+                )
 
                 previousJar?.let { oldJar ->
                     runCatching { PackageTools.jarLoaderMap.remove(oldJar.absolutePathString())?.close() }
@@ -446,6 +455,7 @@ object Extension {
         versionCode: Int,
         contentWarning: Int,
         origin: InstallOrigin,
+        activationMarkerKey: String,
     ) {
         val langs = sources.map { it.lang }.toSet()
         val extensionLang =
@@ -520,7 +530,61 @@ object Extension {
                 }
                 logger.debug { "Installed source ${httpSource.name} (${httpSource.lang}) with id:${httpSource.id}" }
             }
+            ExtensionActivationMarkerTable.insert {
+                it[markerKey] = activationMarkerKey
+                it[packageName] = pkgName
+            }
         }
+    }
+
+    internal fun recoverPendingActivations(): ExtensionActivationJournal.RecoveryReport {
+        val journal = ExtensionActivationJournal(Path(applicationDirs.extensionsRoot))
+        val report =
+            journal.recoverAll(
+                activationDatabaseIdentity(),
+                ::isActivationMarkerPresent,
+                ::removeActivationMarker,
+            )
+
+        // A marker can outlive its journal if the process dies after journal
+        // deletion but before marker cleanup. With no remaining journal it is
+        // no longer part of a recoverable operation and can be swept safely.
+        val liveMarkers = journal.loadAll().map { it.record.markerKey }.toSet()
+        transaction {
+            ExtensionActivationMarkerTable
+                .selectAll()
+                .map { it[ExtensionActivationMarkerTable.markerKey] }
+                .filter { it.startsWith(ExtensionActivationJournal.MARKER_PREFIX) && it !in liveMarkers }
+                .forEach { staleMarker ->
+                    ExtensionActivationMarkerTable.deleteWhere { markerKey eq staleMarker }
+                }
+        }
+        return report
+    }
+
+    private fun isActivationMarkerPresent(markerKey: String): Boolean =
+        transaction {
+            ExtensionActivationMarkerTable.selectAll().where { ExtensionActivationMarkerTable.markerKey eq markerKey }.any()
+        }
+
+    private fun removeActivationMarker(markerKey: String) {
+        transaction {
+            ExtensionActivationMarkerTable.deleteWhere { ExtensionActivationMarkerTable.markerKey eq markerKey }
+        }
+    }
+
+    private fun activationDatabaseIdentity(): String {
+        val material =
+            listOf(
+                serverConfig.databaseType.value.name,
+                serverConfig.databaseUrl.value,
+                serverConfig.databaseUsername.value,
+                applicationDirs.dataRoot,
+            ).joinToString("\u0000")
+        return MessageDigest
+            .getInstance("SHA-256")
+            .digest(material.toByteArray(Charsets.UTF_8))
+            .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
     }
 
     private fun cachePackageIcon(extPackage: ExtensionPackage) {

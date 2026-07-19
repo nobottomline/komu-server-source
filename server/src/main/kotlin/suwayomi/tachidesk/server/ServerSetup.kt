@@ -41,6 +41,7 @@ import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.i18n.LocalizationHelper
 import suwayomi.tachidesk.manga.impl.backup.proto.ProtoBackupExport
 import suwayomi.tachidesk.manga.impl.download.DownloadManager
+import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
 import suwayomi.tachidesk.manga.impl.update.IUpdater
 import suwayomi.tachidesk.manga.impl.update.Updater
@@ -392,6 +393,7 @@ fun applicationSetup() {
     runMigrations(applicationDirs)
 
     databaseUp()
+    recoverExtensionActivations()
 
     try {
         LocalSource.register()
@@ -421,6 +423,7 @@ fun applicationSetup() {
                 "Database changed - type=$databaseType url=$databaseUrl, username=[REDACTED], password=[REDACTED], hikaricp=$hikariCp"
             }
             databaseUp()
+            recoverExtensionActivations()
 
             LocalSource.register()
         },
@@ -528,4 +531,18 @@ fun applicationSetup() {
         },
         ignoreInitialValue = false,
     )
+}
+
+private fun recoverExtensionActivations() {
+    try {
+        val report = Extension.recoverPendingActivations()
+        if (report.rolledBack > 0 || report.finalized > 0) {
+            logger.info {
+                "Recovered extension activations: rolledBack=${report.rolledBack}, finalized=${report.finalized}"
+            }
+        }
+    } catch (error: Throwable) {
+        logger.error(error) { "Extension activation recovery failed; refusing to load extension code" }
+        shutdownApp(ExitCode.ExtensionActivationRecoveryFailure)
+    }
 }

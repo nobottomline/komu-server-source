@@ -25,6 +25,7 @@ enum class ExitCode(
     LocalSourceIconCopyFailure(7),
     LocalSourceSetupFailure(8),
     MigrationsRunFailure(9),
+    ExtensionActivationRecoveryFailure(10),
 }
 
 fun shutdownApp(exitCode: ExitCode) {

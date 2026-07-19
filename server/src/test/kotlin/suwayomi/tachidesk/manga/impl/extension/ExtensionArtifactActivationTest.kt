@@ -19,7 +19,7 @@ class ExtensionArtifactActivationTest {
         val active = temporaryDirectory.resolve("active.jar")
 
         val result =
-            ExtensionArtifactActivation.commit(staged, active, previousArtifact = null) {
+            commit(staged, active, previousArtifact = null) {
                 assertEquals("new", Files.readString(active))
                 "committed"
             }
@@ -36,7 +36,7 @@ class ExtensionArtifactActivationTest {
         val active = temporaryDirectory.resolve("active.jar")
 
         assertThrows(IllegalStateException::class.java) {
-            ExtensionArtifactActivation.commit(staged, active, previousArtifact = null) {
+            commit(staged, active, previousArtifact = null) {
                 throw IllegalStateException("database rejected candidate")
             }
         }
@@ -52,7 +52,7 @@ class ExtensionArtifactActivationTest {
         val staged = write("candidate.staging.jar", "new")
 
         assertThrows(IllegalStateException::class.java) {
-            ExtensionArtifactActivation.commit(staged, active, previousArtifact = active) {
+            commit(staged, active, previousArtifact = active) {
                 assertEquals("new", Files.readString(active))
                 throw IllegalStateException("database rejected candidate")
             }
@@ -68,7 +68,7 @@ class ExtensionArtifactActivationTest {
         val staged = write("candidate.staging.jar", "new")
         val active = temporaryDirectory.resolve("new.jar")
 
-        ExtensionArtifactActivation.commit(staged, active, previous) {
+        commit(staged, active, previous) {
             assertTrue(Files.exists(previous))
             assertEquals("new", Files.readString(active))
         }
@@ -85,7 +85,7 @@ class ExtensionArtifactActivationTest {
         val active = temporaryDirectory.resolve("new.jar")
 
         assertThrows(IllegalStateException::class.java) {
-            ExtensionArtifactActivation.commit(staged, active, previous) {
+            commit(staged, active, previous) {
                 throw IllegalStateException("database rejected candidate")
             }
         }
@@ -100,9 +100,34 @@ class ExtensionArtifactActivationTest {
         contents: String,
     ): Path = temporaryDirectory.resolve(name).also { Files.writeString(it, contents) }
 
+    private fun <T> commit(
+        staged: Path,
+        active: Path,
+        previousArtifact: Path?,
+        commitMetadata: () -> T,
+    ): T {
+        val markers = mutableSetOf<String>()
+        return ExtensionArtifactActivation.commit(
+            packageName = "app.komu.fixture",
+            databaseIdentity = DATABASE_IDENTITY,
+            stagedArtifact = staged,
+            activeArtifact = active,
+            previousArtifact = previousArtifact,
+            commitMetadata = { markerKey ->
+                commitMetadata().also { markers += markerKey }
+            },
+            isCommitMarkerPresent = markers::contains,
+            removeCommitMarker = markers::remove,
+        )
+    }
+
     private fun assertNoRollbackFiles() {
         Files.list(temporaryDirectory).use { paths ->
             assertTrue(paths.noneMatch { it.fileName.toString().contains(".rollback-") })
         }
+    }
+
+    private companion object {
+        const val DATABASE_IDENTITY = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
 }

@@ -18,7 +18,7 @@ import java.util.UUID
 /** Protects the published Komu migration history from upstream number reuse. */
 class DatabaseMigrationLineTest : ApplicationTest() {
     @Test
-    fun `fresh database records the collision-safe ledger through version 62`() {
+    fun `fresh database records the collision-safe ledger through version 63`() {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
         val fixtureDatabase = createFixtureDatabase("komu_fresh")
 
@@ -48,7 +48,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
             runMigrations(migrations.filter { it.version <= 57 }, fixtureDatabase)
             insertReleasedKomuData(fixtureDatabase)
-            runMigrations(migrations.filter { it.version <= 62 }, fixtureDatabase)
+            runMigrations(migrations.filter { it.version <= 63 }, fixtureDatabase)
 
             assertEquals(expectedLedger, readLedger(fixtureDatabase))
             assertEquals(
@@ -72,6 +72,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
             assertTrue(expectedSyncYomiColumns.all(columns::contains))
             assertEquals(expectedSyncYomiTriggers, readTriggers(fixtureDatabase))
             assertTrue("EXTENSIONSTORE" in readTables(fixtureDatabase))
+            assertTrue("EXTENSION_ACTIVATION_MARKER" in readTables(fixtureDatabase))
         } finally {
             TransactionManager.closeAndUnregister(fixtureDatabase)
             TransactionManager.defaultDatabase = previousDefaultDatabase
@@ -169,7 +170,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
         transaction(database) {
             exec(
                 "SELECT VERSION, NAME FROM MIGRATIONS " +
-                    "WHERE VERSION BETWEEN 55 AND 62 ORDER BY VERSION",
+                    "WHERE VERSION BETWEEN 55 AND 63 ORDER BY VERSION",
             ) { rows ->
                 buildMap {
                     while (rows.next()) {
@@ -278,6 +279,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 60 to "AddNewExtensionApiFields",
                 61 to "AddExtensionStore",
                 62 to "AddJarUrlToExtensionTable",
+                63 to "AddExtensionActivationMarker",
             )
 
         val expectedCompatibilityColumns =
@@ -314,6 +316,8 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 "EXTENSION" to "JAR_URL",
                 "EXTENSION" to "CONTENT_WARNING",
                 "SOURCE" to "CONTENT_WARNING",
+                "EXTENSION_ACTIVATION_MARKER" to "MARKER_KEY",
+                "EXTENSION_ACTIVATION_MARKER" to "PACKAGE_NAME",
             )
 
         val expectedSyncYomiTriggers =
