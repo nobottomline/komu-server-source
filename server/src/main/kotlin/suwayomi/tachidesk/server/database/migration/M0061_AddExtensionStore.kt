@@ -11,8 +11,9 @@ import de.neonew.exposed.migrations.helpers.AddTableMigration
 import org.jetbrains.exposed.v1.core.Table
 import org.jetbrains.exposed.v1.core.dao.id.IntIdTable
 
+/** Collision-safe port of upstream M0058_AddExtensionStore. */
 @Suppress("ClassName", "unused")
-class M0058_AddExtensionStore : AddTableMigration() {
+class M0061_AddExtensionStore : AddTableMigration() {
     private class ExtensionStoreTable : IntIdTable() {
         val indexUrl = varchar("index_url", 2048).uniqueIndex()
         val name = varchar("name", 256)

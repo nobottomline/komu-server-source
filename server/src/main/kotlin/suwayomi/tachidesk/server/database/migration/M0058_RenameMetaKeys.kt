@@ -12,8 +12,9 @@ import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.server.database.migration.helpers.toSqlName
 import suwayomi.tachidesk.server.serverConfig
 
+/** Collision-safe port of upstream M0055_RenameMetaKeys. */
 @Suppress("ClassName", "unused")
-class M0055_RenameMetaKeys : SQLMigration() {
+class M0058_RenameMetaKeys : SQLMigration() {
     fun postgresRename(table: String): String =
         "ALTER TABLE $table " +
             "RENAME COLUMN " + "KEY".toSqlName() + " TO META_KEY;"

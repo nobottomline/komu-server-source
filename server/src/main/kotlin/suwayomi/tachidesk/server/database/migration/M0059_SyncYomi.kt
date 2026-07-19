@@ -4,8 +4,9 @@ import de.neonew.exposed.migrations.helpers.SQLMigration
 import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.server.serverConfig
 
+/** Collision-safe port of upstream M0056_SyncYomi. */
 @Suppress("ClassName", "unused")
-class M0056_SyncYomi : SQLMigration() {
+class M0059_SyncYomi : SQLMigration() {
     override val sql =
         when (serverConfig.databaseType.value) {
             DatabaseType.POSTGRESQL -> postgresQuery()

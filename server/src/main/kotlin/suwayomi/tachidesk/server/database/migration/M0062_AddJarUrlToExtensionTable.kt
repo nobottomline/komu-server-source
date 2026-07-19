@@ -9,8 +9,9 @@ package suwayomi.tachidesk.server.database.migration
 
 import de.neonew.exposed.migrations.helpers.AddColumnMigration
 
+/** Collision-safe port of upstream M0059_AddJarUrlToExtensionTable. */
 @Suppress("ClassName", "unused")
-class M0059_AddJarUrlToExtensionTable :
+class M0062_AddJarUrlToExtensionTable :
     AddColumnMigration(
         "extension",
         "jar_url",
