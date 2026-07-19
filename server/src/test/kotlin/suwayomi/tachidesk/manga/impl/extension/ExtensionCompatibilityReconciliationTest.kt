@@ -95,6 +95,8 @@ class ExtensionCompatibilityReconciliationTest : ApplicationTest() {
                 val regular = rows.getValue(REGULAR_PKG)
                 assertFalse(regular.hasUpdate)
                 assertTrue(regular.isObsolete)
+
+                assertFalse(UNINSTALLED_PKG in rows)
             }
         }
 

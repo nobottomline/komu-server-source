@@ -119,7 +119,7 @@ object ExtensionsList {
                     installedExtensions
                         .filter {
                             it.value[ExtensionTable.storeIndexUrl] != null &&
-                                !it.value[ExtensionTable.isCustomPinned]
+                                !(it.value[ExtensionTable.isCustomPinned] && it.value[ExtensionTable.isInstalled])
                         }.mapNotNull { (pkgName, extension) ->
                             extension.takeUnless { uniqueExtensions.any { it.pkgName == pkgName } }
                         }
@@ -127,6 +127,7 @@ object ExtensionsList {
                     installedExtensions
                         .filter {
                             it.value[ExtensionTable.isCustomPinned] &&
+                                it.value[ExtensionTable.isInstalled] &&
                                 uniqueExtensions.none { extension -> extension.pkgName == it.key }
                         }.keys
                 uniqueExtensions.forEach {
