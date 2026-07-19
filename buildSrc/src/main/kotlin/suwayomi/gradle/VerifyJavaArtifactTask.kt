@@ -52,6 +52,11 @@ internal object JavaArtifactCompatibilityVerifier {
                 if (entry.isDirectory || !entry.name.endsWith(CLASS_SUFFIX)) continue
 
                 classCount++
+                if (entry.name == MODULE_INFO_PATH || entry.name.endsWith(MODULE_INFO_SUFFIX)) {
+                    violations += "Module descriptor is not allowed in the embedded classpath artifact: ${entry.name}"
+                    continue
+                }
+
                 val versionedMatch = VERSIONED_CLASS.matchEntire(entry.name)
                 val versionedJava = versionedMatch?.groupValues?.get(1)?.toIntOrNull()
                 val isUnderVersions = entry.name.startsWith(VERSIONS_PREFIX)
@@ -116,6 +121,8 @@ internal object JavaArtifactCompatibilityVerifier {
     private const val CLASS_SUFFIX = ".class"
     private const val MANIFEST_PATH = "META-INF/MANIFEST.MF"
     private const val MULTI_RELEASE_ATTRIBUTE = "Multi-Release"
+    private const val MODULE_INFO_PATH = "module-info.class"
+    private const val MODULE_INFO_SUFFIX = "/module-info.class"
     private const val VERSIONS_PREFIX = "META-INF/versions/"
     private const val MAX_REPORTED_VIOLATIONS = 50
     private val VERSIONED_CLASS = Regex("^META-INF/versions/(\\d+)/.+\\.class$")

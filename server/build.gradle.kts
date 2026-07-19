@@ -184,6 +184,11 @@ tasks {
         archiveVersion.set(getTachideskVersion())
         archiveClassifier.set("")
         destinationDirectory.set(File("$rootDir/server/build"))
+        // The embedded server is launched as one classpath JAR. Module
+        // descriptors from individual dependencies become false and
+        // order-dependent once Shadow merges those dependencies together.
+        exclude("module-info.class")
+        exclude("META-INF/versions/**/module-info.class")
         mergeServiceFiles()
     }
 

@@ -71,6 +71,23 @@ class JavaArtifactCompatibilityVerifierTest {
         assertTrue(error.message.orEmpty().contains("without Multi-Release manifest"))
     }
 
+    @Test
+    fun `rejects module descriptors in classpath artifact`() {
+        val archive =
+            createArchive(
+                multiRelease = true,
+                "example/Main.class" to classHeader(61),
+                "META-INF/versions/21/module-info.class" to classHeader(65),
+            )
+
+        val error =
+            assertFailsWith<IllegalArgumentException> {
+                JavaArtifactCompatibilityVerifier.verify(archive, targetJava = 17)
+            }
+
+        assertTrue(error.message.orEmpty().contains("Module descriptor is not allowed"))
+    }
+
     private fun createArchive(
         multiRelease: Boolean,
         vararg entries: Pair<String, ByteArray>,
