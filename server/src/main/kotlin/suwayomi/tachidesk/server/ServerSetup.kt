@@ -519,9 +519,12 @@ fun applicationSetup() {
 
     SyncManager.scheduleSyncTask()
 
-    // asynchronously initialize CEF
-    GlobalScope.launch {
-        CEFManager.init()
+    // CEF requires desktop AWT/JAWT and native JCEF libraries. The iOS host
+    // provides WKWebView through AndroidCompat instead and cannot load jawt.
+    if (EmbeddedRuntimePlatform.supportsCEF()) {
+        GlobalScope.launch {
+            CEFManager.init()
+        }
     }
 
     serverConfig.subscribeTo(

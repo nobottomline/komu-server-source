@@ -121,7 +121,13 @@ object JavalinSetup {
                         }
 
                         OpdsAPI.defineEndpoints()
-                        GraphQL.defineEndpoints()
+                        // Expedia GraphQL discovers schema classes through classpath scanning.
+                        // OpenJ9's embedded fat-JAR BuiltinClassLoader does not expose those
+                        // entries to the scanner, so initializing GraphQL would abort startup.
+                        // Desktop retains the complete upstream GraphQL surface.
+                        if (EmbeddedRuntimePlatform.supportsClasspathScanning()) {
+                            GraphQL.defineEndpoints()
+                        }
 
                         after { ctx ->
                             // If not matched, the request was for an invalid endpoint
