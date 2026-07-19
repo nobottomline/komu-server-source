@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceFactory
 import eu.kanade.tachiyomi.source.local.LocalSource
+import eu.kanade.tachiyomi.source.online.HttpSource
 import io.github.oshai.kotlinlogging.KotlinLogging
 import net.dongliu.apk.parser.ApkFile
 import net.dongliu.apk.parser.bean.Icon
@@ -45,6 +46,7 @@ import suwayomi.tachidesk.manga.impl.util.source.GetSource
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.clearCachedImage
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.saveImage
+import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ApplicationDirs
@@ -86,7 +88,12 @@ object Extension {
         return savePath
     }
 
-    suspend fun installExtension(pkgName: String): String {
+    suspend fun installExtension(pkgName: String): String = installPublishedExtension(pkgName, forceReinstall = false)
+
+    private suspend fun installPublishedExtension(
+        pkgName: String,
+        forceReinstall: Boolean,
+    ): String {
         logger.debug { "Installing $pkgName" }
         val extension =
             transaction {
@@ -101,7 +108,7 @@ object Extension {
 
         return when (selectedArtifact.kind) {
             ExtensionInstallArtifactPolicy.Kind.DIRECT_JAR -> {
-                installExtension {
+                installExtension(forceReinstall, InstallOrigin.PUBLISHED_STORE) {
                     val jar = fetchExtensionFile(selectedArtifact.url)
                     val manifest = extractAndParseAndroidManifest(jar)
                     ExtensionPackage.Jar(jar, manifest)
@@ -109,7 +116,7 @@ object Extension {
             }
 
             ExtensionInstallArtifactPolicy.Kind.APK -> {
-                installExtension {
+                installExtension(forceReinstall, InstallOrigin.PUBLISHED_STORE) {
                     val apk = fetchExtensionFile(selectedArtifact.url)
                     val packageInfo = getPackageInfo(apk)
                     ExtensionPackage.Apk(apk, packageInfo)
@@ -146,8 +153,9 @@ object Extension {
             extensionName.endsWith(".jar") -> {
                 ExtensionInstallArtifactPolicy.requireExternalJarExecution()
                 installExtension(
-                    true,
-                    {
+                    forceReinstall = true,
+                    origin = InstallOrigin.EXTERNAL_UPLOAD,
+                    fetchPackage = {
                         val jar = copyToExtensionsRoot(inputStream, extensionName)
                         val manifest = extractAndParseAndroidManifest(jar)
                         ExtensionPackage.Jar(jar, manifest)
@@ -157,8 +165,9 @@ object Extension {
 
             extensionName.endsWith(".apk") -> {
                 installExtension(
-                    true,
-                    {
+                    forceReinstall = true,
+                    origin = InstallOrigin.EXTERNAL_UPLOAD,
+                    fetchPackage = {
                         val apk = copyToExtensionsRoot(inputStream, extensionName)
                         val packageInfo = getPackageInfo(apk)
                         ExtensionPackage.Apk(apk, packageInfo)
@@ -268,30 +277,14 @@ object Extension {
         }
     }
 
-    suspend fun installExtension(
+    private suspend fun installExtension(
         forceReinstall: Boolean = false,
+        origin: InstallOrigin = InstallOrigin.PUBLISHED_STORE,
         fetchPackage: suspend () -> ExtensionPackage,
     ): String {
         val extPackage = fetchPackage()
         val metadata = extPackage.metadata
         val pkgName = metadata.packageName
-
-        val isInstalled =
-            transaction {
-                ExtensionTable
-                    .select(ExtensionTable.isInstalled)
-                    .where { ExtensionTable.pkgName eq pkgName }
-                    .firstOrNull()
-            }?.get(ExtensionTable.isInstalled) ?: false
-
-        if (isInstalled) {
-            if (forceReinstall) {
-                uninstallExtension(pkgName)
-            } else {
-                extPackage.file.deleteExisting()
-                return pkgName
-            }
-        }
 
         if (!metadata.reqFeatures.contains(EXTENSION_FEATURE)) {
             extPackage.file.deleteExisting()
@@ -336,23 +329,40 @@ object Extension {
                 sourceClass
             }
 
+        val extensionName =
+            metadata.metaData.getString(METADATA_NAME)
+                ?: metadata.label?.substringAfter("Tachiyomi: ")
+                ?: throw Exception("Could not resolve extension name")
+
+        val extensionLibVersion =
+            metadata.metaData
+                .getString(METADATA_EXTENSION_LIB)
+                .takeUnless { it == "0" }
+                ?: metadata.versionName.substringBeforeLast('.')
+
+        val isInstalled =
+            transaction {
+                ExtensionTable
+                    .select(ExtensionTable.isInstalled)
+                    .where { ExtensionTable.pkgName eq pkgName }
+                    .firstOrNull()
+            }?.get(ExtensionTable.isInstalled) ?: false
+
+        if (isInstalled) {
+            if (forceReinstall) {
+                uninstallExtension(pkgName)
+            } else {
+                extPackage.file.deleteExisting()
+                return pkgName
+            }
+        }
+
         logger.debug { "Main class for extension is $className" }
 
         val extensionsRoot = Path(applicationDirs.extensionsRoot)
         val jarFile = extPackage.prepareJarAndIcons(extensionsRoot)
 
         try {
-            val extensionName =
-                metadata.metaData.getString(METADATA_NAME)
-                    ?: metadata.label?.substringAfter("Tachiyomi: ")
-                    ?: throw Exception("Could not resolve extension name")
-
-            val extensionLibVersion =
-                metadata.metaData
-                    .getString(METADATA_EXTENSION_LIB)
-                    .takeUnless { it == "0" }
-                    ?: metadata.versionName.substringBeforeLast('.')
-
             val apkName =
                 when (extPackage) {
                     is ExtensionPackage.Apk -> extPackage.file.name
@@ -369,6 +379,7 @@ object Extension {
                 versionName = metadata.versionName,
                 versionCode = metadata.versionCode,
                 contentWarning = contentWarning,
+                origin = origin,
             )
         } catch (e: Throwable) {
             // free up the file descriptor if exists
@@ -394,6 +405,7 @@ object Extension {
         versionName: String,
         versionCode: Int,
         contentWarning: Int,
+        origin: InstallOrigin,
     ) {
         // collect sources from the extension
         val extensionMainClassInstance = loadExtensionSources(jarFile, className)
@@ -411,6 +423,16 @@ object Extension {
                 1 -> langs.first()
                 else -> "all"
             }
+        val normalizedContentWarning = ContentWarning.valueOf(contentWarning)
+        val isLegacyNsfw = normalizedContentWarning >= ContentWarning.MIXED
+        val baseUrl = sources.filterIsInstance<HttpSource>().firstOrNull()?.baseUrl
+        val sourceLangs =
+            sources
+                .map { it.lang }
+                .distinct()
+                .joinToString(",")
+                .ifEmpty { null }
+        val isCustomPinned = origin == InstallOrigin.EXTERNAL_UPLOAD
 
         // update extension info
         transaction {
@@ -423,7 +445,11 @@ object Extension {
                     it[this.versionCode] = versionCode.toLong()
                     it[extensionLib] = extensionLibVersion
                     it[lang] = extensionLang
-                    it[this.contentWarning] = contentWarning
+                    it[this.contentWarning] = normalizedContentWarning.ordinal
+                    it[isNsfw] = isLegacyNsfw
+                    it[this.baseUrl] = baseUrl
+                    it[this.sourceLangs] = sourceLangs
+                    it[this.isCustomPinned] = isCustomPinned
                 }
             }
 
@@ -433,7 +459,18 @@ object Extension {
                 it[this.classFQName] = className
                 it[this.versionName] = versionName
                 it[this.versionCode] = versionCode.toLong()
+                it[name] = extensionName
+                it[extensionLib] = extensionLibVersion
+                it[lang] = extensionLang
+                it[this.contentWarning] = normalizedContentWarning.ordinal
+                it[isNsfw] = isLegacyNsfw
+                it[this.baseUrl] = baseUrl
+                it[this.sourceLangs] = sourceLangs
+                it[this.isCustomPinned] = isCustomPinned
+                it[hasUpdate] = false
+                it[isObsolete] = false
             }
+            ExtensionsList.updateMap.remove(pkgName)
 
             val extensionId =
                 ExtensionTable
@@ -448,7 +485,8 @@ object Extension {
                     it[name] = httpSource.name
                     it[lang] = httpSource.lang
                     it[extension] = extensionId
-                    it[this.contentWarning] = contentWarning
+                    it[this.contentWarning] = normalizedContentWarning.ordinal
+                    it[isNsfw] = isLegacyNsfw
                 }
                 logger.debug { "Installed source ${httpSource.name} (${httpSource.lang}) with id:${httpSource.id}" }
             }
@@ -582,13 +620,17 @@ object Extension {
 
                 SourceTable.deleteWhere { SourceTable.extension eq extensionId }
 
-                if (extensionRecord[ExtensionTable.isObsolete] || extensionRecord[ExtensionTable.apkUrl] == null) {
+                val hasStoreCandidate =
+                    extensionRecord[ExtensionTable.storeIndexUrl] != null &&
+                        (extensionRecord[ExtensionTable.apkUrl] != null || extensionRecord[ExtensionTable.jarUrl] != null)
+                if (extensionRecord[ExtensionTable.isObsolete] || !hasStoreCandidate) {
                     ExtensionTable.deleteWhere { ExtensionTable.pkgName eq pkgName }
                 } else {
                     ExtensionTable.update({ ExtensionTable.pkgName eq pkgName }) {
                         it[isInstalled] = false
                         it[hasUpdate] = false
                         it[apkName] = null
+                        it[isCustomPinned] = false
                     }
                 }
 
@@ -604,6 +646,34 @@ object Extension {
 
             jarPath.deleteExisting()
         }
+    }
+
+    /**
+     * Moves a custom upload back to the artifact advertised by its store.
+     * The candidate is downloaded and its manifest is validated before the
+     * active custom artifact is uninstalled by the force-reinstall path.
+     */
+    suspend fun switchExtensionToRepo(pkgName: String): String {
+        val state =
+            transaction {
+                ExtensionTable
+                    .select(
+                        ExtensionTable.isCustomPinned,
+                        ExtensionTable.storeIndexUrl,
+                        ExtensionTable.apkUrl,
+                        ExtensionTable.jarUrl,
+                    ).where { ExtensionTable.pkgName eq pkgName }
+                    .firstOrNull()
+            } ?: throw NoSuchElementException("Could not find extension for $pkgName")
+
+        if (!state[ExtensionTable.isCustomPinned]) return installExtension(pkgName)
+
+        check(
+            state[ExtensionTable.storeIndexUrl] != null &&
+                (state[ExtensionTable.apkUrl] != null || state[ExtensionTable.jarUrl] != null),
+        ) { "Custom extension $pkgName has no published store artifact" }
+
+        return installPublishedExtension(pkgName, forceReinstall = true)
     }
 
     suspend fun updateExtension(pkgName: String): String {
@@ -646,4 +716,9 @@ object Extension {
     }
 
     fun proxyExtensionIconUrl(pkgName: String): String = "/api/v1/extension/icon/$pkgName"
+
+    enum class InstallOrigin {
+        PUBLISHED_STORE,
+        EXTERNAL_UPLOAD,
+    }
 }

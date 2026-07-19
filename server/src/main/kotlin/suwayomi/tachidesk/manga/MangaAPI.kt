@@ -32,6 +32,7 @@ object MangaAPI {
             get("install/{pkgName}", ExtensionController.install)
             post("install", ExtensionController.installFile)
             get("update/{pkgName}", ExtensionController.update)
+            post("switch-to-repo/{pkgName}", ExtensionController.switchToRepo)
             get("uninstall/{pkgName}", ExtensionController.uninstall)
 
             get("icon/{pkgName}", ExtensionController.icon)

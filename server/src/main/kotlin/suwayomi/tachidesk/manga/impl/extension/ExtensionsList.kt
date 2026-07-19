@@ -49,7 +49,7 @@ object ExtensionsList {
             }
         }
 
-        updateExtensionDatabase(allExtensions)
+        reconcileExtensionDatabase(allExtensions)
     }
 
     suspend fun fetchExtensionsCached() {
@@ -73,25 +73,33 @@ object ExtensionsList {
         transaction {
             ExtensionTable.selectAll().filter { it[ExtensionTable.name] != LocalSource.EXTENSION_NAME }.map {
                 ExtensionDataClass(
-                    repo = it[ExtensionTable.storeIndexUrl],
+                    repo = it[ExtensionTable.repo] ?: it[ExtensionTable.storeIndexUrl],
                     apkName = it[ExtensionTable.apkName].orEmpty(),
                     iconUrl = proxyExtensionIconUrl(it[ExtensionTable.pkgName]),
                     name = it[ExtensionTable.name],
                     pkgName = it[ExtensionTable.pkgName],
                     versionName = it[ExtensionTable.versionName],
-                    versionCode = it[ExtensionTable.versionCode].toInt(),
+                    versionCode = it[ExtensionTable.versionCode],
                     lang = it[ExtensionTable.lang],
                     isNsfw = it[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
                     installed = it[ExtensionTable.isInstalled],
                     hasUpdate = it[ExtensionTable.hasUpdate],
                     obsolete = it[ExtensionTable.isObsolete],
+                    baseUrl = it[ExtensionTable.baseUrl],
+                    sourceLangs = it[ExtensionTable.sourceLangs],
+                    isCustomPinned = it[ExtensionTable.isCustomPinned],
+                    storeIndexUrl = it[ExtensionTable.storeIndexUrl],
+                    apkUrl = it[ExtensionTable.apkUrl],
+                    jarUrl = it[ExtensionTable.jarUrl],
+                    extensionLib = it[ExtensionTable.extensionLib],
+                    contentWarning = ContentWarning.valueOf(it[ExtensionTable.contentWarning]),
                 )
             }
         }
 
     private val updateExtensionDatabaseMutex = Mutex()
 
-    private suspend fun updateExtensionDatabase(foundExtensions: List<ExtensionInfo>) {
+    internal suspend fun reconcileExtensionDatabase(foundExtensions: List<ExtensionInfo>) {
         updateExtensionDatabaseMutex.withLock {
             transaction {
                 val uniqueExtensions =
@@ -108,9 +116,19 @@ object ExtensionsList {
                 val extensionsToUpdate = mutableListOf<Pair<ExtensionInfo, ResultRow>>()
                 val extensionsToInsert = mutableListOf<ExtensionInfo>()
                 val extensionsToDelete =
-                    installedExtensions.filter { it.value[ExtensionTable.storeIndexUrl] != null }.mapNotNull { (pkgName, extension) ->
-                        extension.takeUnless { uniqueExtensions.any { it.pkgName == pkgName } }
-                    }
+                    installedExtensions
+                        .filter {
+                            it.value[ExtensionTable.storeIndexUrl] != null &&
+                                !it.value[ExtensionTable.isCustomPinned]
+                        }.mapNotNull { (pkgName, extension) ->
+                            extension.takeUnless { uniqueExtensions.any { it.pkgName == pkgName } }
+                        }
+                val pinnedExtensionsMissingFromStores =
+                    installedExtensions
+                        .filter {
+                            it.value[ExtensionTable.isCustomPinned] &&
+                                uniqueExtensions.none { extension -> extension.pkgName == it.key }
+                        }.keys
                 uniqueExtensions.forEach {
                     val extension = installedExtensions[it.pkgName]
                     if (extension != null) {
@@ -131,31 +149,35 @@ object ExtensionsList {
                                     addBatch(EntityID(extensionRecord[ExtensionTable.id].value, ExtensionTable))
                                     // Always update icon url and repo
                                     this[ExtensionTable.iconUrl] = foundExtension.iconUrl
+                                    this[ExtensionTable.repo] = foundExtension.storeIndexUrl
                                     this[ExtensionTable.storeIndexUrl] = foundExtension.storeIndexUrl
                                     this[ExtensionTable.apkUrl] = foundExtension.apkUrl
                                     this[ExtensionTable.jarUrl] = foundExtension.jarUrl
 
-                                    // add these because batch updates need matching columns
-                                    this[ExtensionTable.hasUpdate] = extensionRecord[ExtensionTable.hasUpdate]
-                                    this[ExtensionTable.isObsolete] = extensionRecord[ExtensionTable.isObsolete]
-
-                                    // a previously removed extension is now available again
-                                    if (extensionRecord[ExtensionTable.isObsolete] &&
-                                        foundExtension.versionCode >= extensionRecord[ExtensionTable.versionCode]
-                                    ) {
-                                        this[ExtensionTable.isObsolete] = false
-                                    }
+                                    // Both flags are derived from the current store snapshot. Never
+                                    // carry a stale true value into the next reconciliation cycle.
+                                    this[ExtensionTable.hasUpdate] = false
+                                    this[ExtensionTable.isObsolete] = false
 
                                     when {
+                                        extensionRecord[ExtensionTable.isCustomPinned] -> {
+                                            // A custom upload owns the active binary until the user
+                                            // explicitly switches back to the store artifact.
+                                            updateMap.remove(foundExtension.pkgName)
+                                        }
+
                                         foundExtension.versionCode > extensionRecord[ExtensionTable.versionCode] -> {
-                                            // there is an update
                                             this[ExtensionTable.hasUpdate] = true
-                                            updateMap.putIfAbsent(foundExtension.pkgName, foundExtension)
+                                            updateMap[foundExtension.pkgName] = foundExtension
                                         }
 
                                         foundExtension.versionCode < extensionRecord[ExtensionTable.versionCode] -> {
-                                            // somehow the user installed an invalid version
                                             this[ExtensionTable.isObsolete] = true
+                                            updateMap.remove(foundExtension.pkgName)
+                                        }
+
+                                        else -> {
+                                            updateMap.remove(foundExtension.pkgName)
                                         }
                                     }
                                 }
@@ -169,6 +191,7 @@ object ExtensionsList {
                                 extensionsToFullyUpdate.forEach { (foundExtension, extensionRecord) ->
                                     addBatch(EntityID(extensionRecord[ExtensionTable.id].value, ExtensionTable))
                                     // extension is not installed, so we can overwrite the data without a care
+                                    this[ExtensionTable.repo] = foundExtension.storeIndexUrl
                                     this[ExtensionTable.storeIndexUrl] = foundExtension.storeIndexUrl
                                     this[ExtensionTable.name] = foundExtension.name
                                     this[ExtensionTable.extensionLib] = foundExtension.extensionLib
@@ -176,9 +199,16 @@ object ExtensionsList {
                                     this[ExtensionTable.versionCode] = foundExtension.versionCode
                                     this[ExtensionTable.lang] = foundExtension.lang
                                     this[ExtensionTable.contentWarning] = foundExtension.contentWarning.ordinal
+                                    this[ExtensionTable.isNsfw] = foundExtension.isLegacyNsfw()
                                     this[ExtensionTable.apkUrl] = foundExtension.apkUrl
                                     this[ExtensionTable.jarUrl] = foundExtension.jarUrl
                                     this[ExtensionTable.iconUrl] = foundExtension.iconUrl
+                                    this[ExtensionTable.baseUrl] = foundExtension.sources.firstOrNull()?.homeUrl
+                                    this[ExtensionTable.sourceLangs] = foundExtension.sourceLangs()
+                                    this[ExtensionTable.isCustomPinned] = false
+                                    this[ExtensionTable.hasUpdate] = false
+                                    this[ExtensionTable.isObsolete] = false
+                                    updateMap.remove(foundExtension.pkgName)
                                 }
                             }.toExecutable()
                             .execute(this@transaction)
@@ -186,6 +216,7 @@ object ExtensionsList {
                 }
                 if (extensionsToInsert.isNotEmpty()) {
                     ExtensionTable.batchInsert(extensionsToInsert) { foundExtension ->
+                        this[ExtensionTable.repo] = foundExtension.storeIndexUrl
                         this[ExtensionTable.storeIndexUrl] = foundExtension.storeIndexUrl
                         this[ExtensionTable.name] = foundExtension.name
                         this[ExtensionTable.pkgName] = foundExtension.pkgName
@@ -194,13 +225,24 @@ object ExtensionsList {
                         this[ExtensionTable.versionCode] = foundExtension.versionCode
                         this[ExtensionTable.lang] = foundExtension.lang
                         this[ExtensionTable.contentWarning] = foundExtension.contentWarning.ordinal
+                        this[ExtensionTable.isNsfw] = foundExtension.isLegacyNsfw()
                         this[ExtensionTable.apkUrl] = foundExtension.apkUrl
                         this[ExtensionTable.jarUrl] = foundExtension.jarUrl
                         this[ExtensionTable.iconUrl] = foundExtension.iconUrl
+                        this[ExtensionTable.baseUrl] = foundExtension.sources.firstOrNull()?.homeUrl
+                        this[ExtensionTable.sourceLangs] = foundExtension.sourceLangs()
                     }
                 }
 
                 // deal with obsolete extensions
+                if (pinnedExtensionsMissingFromStores.isNotEmpty()) {
+                    pinnedExtensionsMissingFromStores.forEach(updateMap::remove)
+                    ExtensionTable.update({ ExtensionTable.pkgName inList pinnedExtensionsMissingFromStores }) {
+                        it[hasUpdate] = false
+                        it[isObsolete] = false
+                    }
+                }
+
                 val extensionsToRemove =
                     extensionsToDelete
                         .groupBy { it[ExtensionTable.isInstalled] }
@@ -208,16 +250,28 @@ object ExtensionsList {
                 // not in the repo, so these extensions are obsolete
                 val obsoleteExtensions = extensionsToRemove[true].orEmpty()
                 if (obsoleteExtensions.isNotEmpty()) {
+                    obsoleteExtensions.forEach(updateMap::remove)
                     ExtensionTable.update({ ExtensionTable.pkgName inList obsoleteExtensions }) {
+                        it[hasUpdate] = false
                         it[isObsolete] = true
                     }
                 }
                 // is not installed, so we can remove the record without a care
                 val removeExtensions = extensionsToRemove[false].orEmpty()
                 if (removeExtensions.isNotEmpty()) {
+                    removeExtensions.forEach(updateMap::remove)
                     ExtensionTable.deleteWhere { ExtensionTable.pkgName inList removeExtensions }
                 }
             }
         }
     }
+
+    private fun ExtensionInfo.isLegacyNsfw(): Boolean = contentWarning >= ContentWarning.MIXED
+
+    private fun ExtensionInfo.sourceLangs(): String? =
+        sources
+            .map { it.lang }
+            .distinct()
+            .joinToString(",")
+            .ifEmpty { null }
 }

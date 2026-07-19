@@ -48,10 +48,13 @@ class ExtensionType(
     val isInstalled: Boolean,
     val hasUpdate: Boolean,
     val isObsolete: Boolean,
+    val baseUrl: String?,
+    val sourceLangs: String?,
+    val isCustomPinned: Boolean,
 ) : Node {
     constructor(row: ResultRow) : this(
         storeIndexUrl = row[ExtensionTable.storeIndexUrl],
-        repo = row[ExtensionTable.storeIndexUrl],
+        repo = row[ExtensionTable.repo] ?: row[ExtensionTable.storeIndexUrl],
         apkName = row[ExtensionTable.apkName].orEmpty(),
         iconUrl = Extension.proxyExtensionIconUrl(row[ExtensionTable.pkgName]),
         name = row[ExtensionTable.name],
@@ -60,7 +63,10 @@ class ExtensionType(
         jarUrl = row[ExtensionTable.jarUrl],
         extensionLib = row[ExtensionTable.extensionLib],
         versionName = row[ExtensionTable.versionName],
-        versionCode = row[ExtensionTable.versionCode].toInt(),
+        versionCode =
+            row[ExtensionTable.versionCode]
+                .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+                .toInt(),
         versionCodeLong = row[ExtensionTable.versionCode],
         lang = row[ExtensionTable.lang],
         isNsfw = row[ExtensionTable.contentWarning] >= ContentWarning.MIXED.ordinal,
@@ -68,6 +74,9 @@ class ExtensionType(
         isInstalled = row[ExtensionTable.isInstalled],
         hasUpdate = row[ExtensionTable.hasUpdate],
         isObsolete = row[ExtensionTable.isObsolete],
+        baseUrl = row[ExtensionTable.baseUrl],
+        sourceLangs = row[ExtensionTable.sourceLangs],
+        isCustomPinned = row[ExtensionTable.isCustomPinned],
     )
 
     fun source(dataFetchingEnvironment: DataFetchingEnvironment): CompletableFuture<SourceNodeList> =

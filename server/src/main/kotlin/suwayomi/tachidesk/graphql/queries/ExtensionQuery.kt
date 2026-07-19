@@ -115,6 +115,9 @@ class ExtensionQuery {
         val isInstalled: Boolean? = null,
         val hasUpdate: Boolean? = null,
         val isObsolete: Boolean? = null,
+        val baseUrl: String? = null,
+        val sourceLangs: String? = null,
+        val isCustomPinned: Boolean? = null,
     ) : HasGetOp {
         override fun getOp(): Op<Boolean>? {
             val opAnd = OpAnd()
@@ -138,6 +141,9 @@ class ExtensionQuery {
             opAnd.eq(isInstalled, ExtensionTable.isInstalled)
             opAnd.eq(hasUpdate, ExtensionTable.hasUpdate)
             opAnd.eq(isObsolete, ExtensionTable.isObsolete)
+            opAnd.eq(baseUrl, ExtensionTable.baseUrl)
+            opAnd.eq(sourceLangs, ExtensionTable.sourceLangs)
+            opAnd.eq(isCustomPinned, ExtensionTable.isCustomPinned)
 
             return opAnd.op
         }
@@ -165,6 +171,9 @@ class ExtensionQuery {
         val isInstalled: BooleanFilter? = null,
         val hasUpdate: BooleanFilter? = null,
         val isObsolete: BooleanFilter? = null,
+        val baseUrl: StringFilter? = null,
+        val sourceLangs: StringFilter? = null,
+        val isCustomPinned: BooleanFilter? = null,
         override val and: List<ExtensionFilter>? = null,
         override val or: List<ExtensionFilter>? = null,
         override val not: ExtensionFilter? = null,
@@ -187,6 +196,9 @@ class ExtensionQuery {
                 andFilterWithCompare(ExtensionTable.isInstalled, isInstalled),
                 andFilterWithCompare(ExtensionTable.hasUpdate, hasUpdate),
                 andFilterWithCompare(ExtensionTable.isObsolete, isObsolete),
+                andFilterWithCompareString(ExtensionTable.baseUrl, baseUrl),
+                andFilterWithCompareString(ExtensionTable.sourceLangs, sourceLangs),
+                andFilterWithCompare(ExtensionTable.isCustomPinned, isCustomPinned),
             )
     }
 

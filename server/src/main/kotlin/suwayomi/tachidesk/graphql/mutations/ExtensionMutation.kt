@@ -24,6 +24,7 @@ class ExtensionMutation {
         val install: Boolean? = null,
         val update: Boolean? = null,
         val uninstall: Boolean? = null,
+        val switchToRepo: Boolean? = null,
     )
 
     data class UpdateExtensionPayload(
@@ -75,6 +76,12 @@ class ExtensionMutation {
         if (patch.uninstall == true) {
             extensions.filter { it.isInstalled }.forEach {
                 Extension.uninstallExtension(it.pkgName)
+            }
+        }
+
+        if (patch.switchToRepo == true) {
+            extensions.filter { it.isCustomPinned }.forEach {
+                Extension.switchExtensionToRepo(it.pkgName)
             }
         }
     }

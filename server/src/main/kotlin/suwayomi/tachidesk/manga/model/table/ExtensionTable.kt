@@ -11,6 +11,11 @@ import org.jetbrains.exposed.v1.core.dao.id.IntIdTable
 
 object ExtensionTable : IntIdTable() {
     val apkName = varchar("apk_name", 1024).nullable()
+
+    // Komu expand/contract compatibility columns. These columns shipped to
+    // users before the upstream extension-store model and must remain mapped
+    // until every released REST client has moved to the new representation.
+    val repo = varchar("repo", 1024).nullable()
     val storeIndexUrl = varchar("store_index_url", 2048).nullable().index()
 
     // default is the local source icon from tachiyomi
@@ -30,10 +35,15 @@ object ExtensionTable : IntIdTable() {
     val versionCode = long("version_code")
     val lang = varchar("lang", 32)
     val contentWarning = integer("content_warning")
+    val isNsfw = bool("is_nsfw").default(false)
 
     val isInstalled = bool("is_installed").default(false)
     val hasUpdate = bool("has_update").default(false)
     val isObsolete = bool("is_obsolete").default(false)
 
     val classFQName = varchar("class_name", 1024).default("") // fully qualified name
+
+    val baseUrl = varchar("base_url", 2048).nullable()
+    val sourceLangs = varchar("source_langs", 4096).nullable()
+    val isCustomPinned = bool("is_custom_pinned").default(false)
 }

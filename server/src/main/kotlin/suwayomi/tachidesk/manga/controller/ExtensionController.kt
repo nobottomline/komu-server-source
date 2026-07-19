@@ -133,6 +133,34 @@ object ExtensionController {
             },
         )
 
+    /** replace a custom upload with the published store artifact */
+    val switchToRepo =
+        handler(
+            pathParam<String>("pkgName"),
+            documentWith = {
+                withOperation {
+                    summary("Extension switch to store artifact")
+                    description(
+                        "Replace a custom-pinned extension with the artifact currently published by its extension store",
+                    )
+                }
+            },
+            behaviorOf = { ctx, pkgName ->
+                ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                ctx.future {
+                    future {
+                        Extension.switchExtensionToRepo(pkgName)
+                    }
+                }
+            },
+            withResults = {
+                httpCode(HttpStatus.CREATED)
+                httpCode(HttpStatus.FOUND)
+                httpCode(HttpStatus.NOT_FOUND)
+                httpCode(HttpStatus.INTERNAL_SERVER_ERROR)
+            },
+        )
+
     /** uninstall extension identified with "pkgName" */
     val uninstall =
         handler(
