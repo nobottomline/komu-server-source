@@ -17,7 +17,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
-import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -46,8 +45,8 @@ internal class DesktopExtensionArtifactTransport(
     }
 
     override suspend fun download(request: ExtensionArtifactTransport.Request): StagedArtifact {
-        validateHttpsUrl(request.url)
-        validatePackageName(request.packageName)
+        ExtensionArtifactInputPolicy.requireHttpsUrl(request.url)
+        ExtensionArtifactInputPolicy.requirePackageName(request.packageName)
         val stagingRoot = requireStagingRoot(request.stagingDirectory)
         val packageToken =
             MessageDigest
@@ -64,7 +63,7 @@ internal class DesktopExtensionArtifactTransport(
                 when (val outcome = execute(currentUrl, stagingPath)) {
                     is DownloadOutcome.Redirect -> {
                         check(redirectCount < MAX_REDIRECTS) { "Extension artifact exceeded the redirect limit" }
-                        validateHttpsUrl(outcome.url.toString())
+                        ExtensionArtifactInputPolicy.requireHttpsUrl(outcome.url.toString())
                         check(visitedUrls.add(outcome.url.toString())) { "Extension artifact redirect loop detected" }
                         currentUrl = outcome.url
                     }
@@ -149,7 +148,7 @@ internal class DesktopExtensionArtifactTransport(
             val locations = response.headers("Location")
             require(locations.size == 1) { "Extension artifact redirect must have exactly one Location" }
             val redirectUrl = requireNotNull(requestedUrl.resolve(locations.single())) { "Extension artifact redirect is invalid" }
-            validateHttpsUrl(redirectUrl.toString())
+            ExtensionArtifactInputPolicy.requireHttpsUrl(redirectUrl.toString())
             return DownloadOutcome.Redirect(redirectUrl)
         }
         check(response.isSuccessful) { "Extension artifact HTTP status is ${response.code}" }
@@ -197,21 +196,6 @@ internal class DesktopExtensionArtifactTransport(
         return root
     }
 
-    private fun validatePackageName(packageName: String) {
-        require(packageName.length <= MAX_PACKAGE_NAME_LENGTH) { "Extension package name is too long" }
-        require(PACKAGE_NAME_PATTERN.matches(packageName)) { "Invalid extension package name" }
-    }
-
-    private fun validateHttpsUrl(url: String) {
-        val uri = runCatching { URI(url) }.getOrElse { throw IllegalArgumentException("Invalid extension artifact URL", it) }
-        require(!uri.isOpaque) { "Extension artifact URL must be hierarchical" }
-        require(uri.scheme.equals("https", ignoreCase = true)) { "Extension artifact URL must use HTTPS" }
-        require(!uri.host.isNullOrBlank()) { "Extension artifact URL must include a host" }
-        require(uri.userInfo == null) { "Extension artifact URL must not contain credentials" }
-        require(uri.fragment == null) { "Extension artifact URL must not contain a fragment" }
-        require(uri.port == -1 || uri.port in 1..65535) { "Extension artifact URL has an invalid port" }
-    }
-
     private sealed interface DownloadOutcome {
         data class Redirect(
             val url: HttpUrl,
@@ -227,10 +211,8 @@ internal class DesktopExtensionArtifactTransport(
 
     companion object {
         private val REDIRECT_STATUS_CODES = setOf(300, 301, 302, 303, 307, 308)
-        private val PACKAGE_NAME_PATTERN = Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+")
         private const val COPY_BUFFER_BYTES = 32 * 1024
         private const val PACKAGE_TOKEN_LENGTH = 16
-        private const val MAX_PACKAGE_NAME_LENGTH = 255
         private const val MAX_REDIRECTS = 5
         private const val USER_AGENT = "Komu-ExtensionArtifactTransport/1"
 
