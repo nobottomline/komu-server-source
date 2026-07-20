@@ -18,7 +18,7 @@ import java.util.UUID
 /** Protects the published Komu migration history from upstream number reuse. */
 class DatabaseMigrationLineTest : ApplicationTest() {
     @Test
-    fun `fresh database records the collision-safe ledger through version 63`() {
+    fun `fresh database records the collision-safe ledger through version 64`() {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
         val fixtureDatabase = createFixtureDatabase("komu_fresh")
 
@@ -48,7 +48,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
             runMigrations(migrations.filter { it.version <= 57 }, fixtureDatabase)
             insertReleasedKomuData(fixtureDatabase)
-            runMigrations(migrations.filter { it.version <= 63 }, fixtureDatabase)
+            runMigrations(migrations.filter { it.version <= 64 }, fixtureDatabase)
 
             assertEquals(expectedLedger, readLedger(fixtureDatabase))
             assertEquals(
@@ -73,6 +73,8 @@ class DatabaseMigrationLineTest : ApplicationTest() {
             assertEquals(expectedSyncYomiTriggers, readTriggers(fixtureDatabase))
             assertTrue("EXTENSIONSTORE" in readTables(fixtureDatabase))
             assertTrue("EXTENSION_ACTIVATION_MARKER" in readTables(fixtureDatabase))
+            assertTrue("EXTENSION_STORE_ENTRY" in readTables(fixtureDatabase))
+            assertTrue("EXTENSION_STORE_SOURCE" in readTables(fixtureDatabase))
         } finally {
             TransactionManager.closeAndUnregister(fixtureDatabase)
             TransactionManager.defaultDatabase = previousDefaultDatabase
@@ -170,7 +172,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
         transaction(database) {
             exec(
                 "SELECT VERSION, NAME FROM MIGRATIONS " +
-                    "WHERE VERSION BETWEEN 55 AND 63 ORDER BY VERSION",
+                    "WHERE VERSION BETWEEN 55 AND 64 ORDER BY VERSION",
             ) { rows ->
                 buildMap {
                     while (rows.next()) {
@@ -280,6 +282,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 61 to "AddExtensionStore",
                 62 to "AddJarUrlToExtensionTable",
                 63 to "AddExtensionActivationMarker",
+                64 to "AddExtensionStoreArtifactLedger",
             )
 
         val expectedCompatibilityColumns =
@@ -318,6 +321,14 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 "SOURCE" to "CONTENT_WARNING",
                 "EXTENSION_ACTIVATION_MARKER" to "MARKER_KEY",
                 "EXTENSION_ACTIVATION_MARKER" to "PACKAGE_NAME",
+                "EXTENSION_STORE_ENTRY" to "STORE_INDEX_URL",
+                "EXTENSION_STORE_ENTRY" to "SIGNING_KEY",
+                "EXTENSION_STORE_ENTRY" to "SNAPSHOT_TOKEN",
+                "EXTENSION_STORE_ENTRY" to "PKG_NAME",
+                "EXTENSION_STORE_ENTRY" to "JAR_URL",
+                "EXTENSION_STORE_SOURCE" to "ENTRY",
+                "EXTENSION_STORE_SOURCE" to "SOURCE_ID",
+                "EXTENSION_STORE_SOURCE" to "HOME_URL",
             )
 
         val expectedSyncYomiTriggers =

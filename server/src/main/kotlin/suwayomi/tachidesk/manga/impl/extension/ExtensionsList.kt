@@ -25,6 +25,8 @@ import suwayomi.tachidesk.manga.impl.extension.Extension.proxyExtensionIconUrl
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionDataClass
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionInfo
+import suwayomi.tachidesk.manga.model.dataclass.ExtensionStore
+import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.time.Duration.Companion.seconds
@@ -37,11 +39,13 @@ object ExtensionsList {
 
     suspend fun fetchExtensions() {
         val allExtensions = mutableListOf<ExtensionInfo>()
+        val refreshedStores = mutableListOf<ExtensionStore>()
 
         ExtensionStoreService.getAndRefresh().forEach { store ->
             try {
                 val extensions = ExtensionStoreService.getExtensions(store)
                 allExtensions.addAll(extensions)
+                refreshedStores.add(store)
             } catch (e: Exception) {
                 logger.warn(e) {
                     "Failed to fetch extensions for store: ${store.indexUrl}"
@@ -49,7 +53,7 @@ object ExtensionsList {
             }
         }
 
-        reconcileExtensionDatabase(allExtensions)
+        reconcileExtensionDatabase(allExtensions, refreshedStores)
     }
 
     suspend fun fetchExtensionsCached() {
@@ -99,26 +103,65 @@ object ExtensionsList {
 
     private val updateExtensionDatabaseMutex = Mutex()
 
-    internal suspend fun reconcileExtensionDatabase(foundExtensions: List<ExtensionInfo>) {
+    internal suspend fun reconcileExtensionDatabase(
+        foundExtensions: List<ExtensionInfo>,
+        refreshedStores: List<ExtensionStore> = emptyList(),
+    ) {
         updateExtensionDatabaseMutex.withLock {
             transaction {
+                val reconciliationExtensions: List<ExtensionInfo>
+                val authoritativeStoreUrls: Set<String>?
+                if (refreshedStores.isNotEmpty()) {
+                    ExtensionStoreArtifactLedger.replaceSuccessfulStores(
+                        transaction = this,
+                        foundExtensions = foundExtensions,
+                        refreshedStores = refreshedStores,
+                    )
+                    reconciliationExtensions = ExtensionStoreArtifactLedger.readAll(this)
+                    authoritativeStoreUrls =
+                        reconciliationExtensions.mapTo(mutableSetOf()) { it.storeIndexUrl } +
+                        refreshedStores.map { it.indexUrl }
+                } else {
+                    // Compatibility path for callers/tests that predate the durable store ledger.
+                    reconciliationExtensions = foundExtensions
+                    authoritativeStoreUrls = null
+                }
                 val uniqueExtensions =
-                    foundExtensions
+                    reconciliationExtensions
                         .groupBy { it.pkgName }
                         .mapValues { (_, extension) ->
-                            extension.maxBy { it.versionCode }
+                            extension.maxWith(
+                                compareBy<ExtensionInfo> { it.versionCode }
+                                    .thenBy { it.storeIndexUrl },
+                            )
                         }.values
                 val installedExtensions =
                     ExtensionTable
                         .selectAll()
                         .toList()
                         .associateBy { it[ExtensionTable.pkgName] }
+                val deletionAuthoritativeStoreUrls =
+                    authoritativeStoreUrls?.let { knownStoreUrls ->
+                        val configuredStoreUrls =
+                            ExtensionStoreTable.selectAll().mapTo(mutableSetOf()) {
+                                it[ExtensionStoreTable.indexUrl]
+                            }
+                        val removedStoreUrls =
+                            installedExtensions.values.mapNotNullTo(mutableSetOf()) {
+                                it[ExtensionTable.storeIndexUrl]?.takeUnless(configuredStoreUrls::contains)
+                            }
+                        knownStoreUrls + removedStoreUrls
+                    }
                 val extensionsToUpdate = mutableListOf<Pair<ExtensionInfo, ResultRow>>()
                 val extensionsToInsert = mutableListOf<ExtensionInfo>()
                 val extensionsToDelete =
                     installedExtensions
                         .filter {
                             it.value[ExtensionTable.storeIndexUrl] != null &&
+                                (
+                                    deletionAuthoritativeStoreUrls == null ||
+                                        it.value[ExtensionTable.storeIndexUrl] in deletionAuthoritativeStoreUrls
+                                ) &&
                                 !(it.value[ExtensionTable.isCustomPinned] && it.value[ExtensionTable.isInstalled])
                         }.mapNotNull { (pkgName, extension) ->
                             extension.takeUnless { uniqueExtensions.any { it.pkgName == pkgName } }
@@ -128,6 +171,10 @@ object ExtensionsList {
                         .filter {
                             it.value[ExtensionTable.isCustomPinned] &&
                                 it.value[ExtensionTable.isInstalled] &&
+                                (
+                                    deletionAuthoritativeStoreUrls == null ||
+                                        it.value[ExtensionTable.storeIndexUrl] in deletionAuthoritativeStoreUrls
+                                ) &&
                                 uniqueExtensions.none { extension -> extension.pkgName == it.key }
                         }.keys
                 uniqueExtensions.forEach {

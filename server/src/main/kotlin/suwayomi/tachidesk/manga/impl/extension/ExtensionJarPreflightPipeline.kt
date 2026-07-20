@@ -16,6 +16,19 @@ internal class ExtensionJarPreflightPipeline(
     private val artifactInspector: ArtifactInspector = DefaultArtifactInspector,
     private val shadowValidator: ShadowValidator = DefaultShadowValidator,
 ) {
+    /** Preferred orchestration entry point: all repository-owned inputs share one transaction snapshot. */
+    suspend fun prepare(
+        input: ExtensionJarPreflightInputSnapshot,
+        stagingDirectory: Path,
+    ): ValidatedCandidate =
+        prepare(
+            expected = input.expected,
+            expectedSigningKey = input.expectedSigningKey,
+            stagingDirectory = stagingDirectory,
+            occupiedSourceOwners = input.occupiedSourceOwners,
+        )
+
+    /** Low-level overload retained for isolated validator tests. Production orchestration uses the snapshot overload. */
     suspend fun prepare(
         expected: ExtensionInfo,
         expectedSigningKey: String,
