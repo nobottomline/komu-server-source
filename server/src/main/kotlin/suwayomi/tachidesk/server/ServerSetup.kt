@@ -43,6 +43,7 @@ import suwayomi.tachidesk.manga.impl.backup.proto.ProtoBackupExport
 import suwayomi.tachidesk.manga.impl.download.DownloadManager
 import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
+import suwayomi.tachidesk.manga.impl.extension.NativeArtifactRuntimeProbe
 import suwayomi.tachidesk.manga.impl.update.IUpdater
 import suwayomi.tachidesk.manga.impl.update.Updater
 import suwayomi.tachidesk.manga.impl.util.lang.renameTo
@@ -266,6 +267,22 @@ fun applicationSetup() {
     setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
 
     logger.info { "Running Suwayomi-Server ${BuildConfig.VERSION}" }
+
+    if (EmbeddedRuntimePlatform.isIOS()) {
+        val nativeArtifactStatus = NativeArtifactRuntimeProbe.probe()
+        if (nativeArtifactStatus.available) {
+            logger.info {
+                "Native extension artifact transport is available: abi=${nativeArtifactStatus.actualAbiVersion}"
+            }
+        } else {
+            logger.warn {
+                "Native extension artifact transport is unavailable: " +
+                    "expectedAbi=${nativeArtifactStatus.expectedAbiVersion}, " +
+                    "actualAbi=${nativeArtifactStatus.actualAbiVersion}, " +
+                    "failureType=${nativeArtifactStatus.failureType}"
+            }
+        }
+    }
 
     logger.debug {
         "Loaded config:\n" +

@@ -40,7 +40,7 @@ internal class NativeExtensionArtifactTransport(
         }
     }
 
-    fun isAvailable(): Boolean = runCatching { bridge.abiVersion() == NATIVE_ABI_VERSION }.getOrDefault(false)
+    fun isAvailable(): Boolean = runCatching { bridge.abiVersion() == NATIVE_ARTIFACT_ABI_VERSION }.getOrDefault(false)
 
     override suspend fun download(request: ExtensionArtifactTransport.Request): StagedArtifact {
         ExtensionArtifactInputPolicy.requireHttpsUrl(request.url)
@@ -99,7 +99,7 @@ internal class NativeExtensionArtifactTransport(
             runCatching {
                 RESULT_JSON.decodeFromString<NativeArtifactDownloadResult>(bytes.toString(StandardCharsets.UTF_8))
             }.getOrElse { throw SecurityException("Native artifact transport returned malformed metadata", it) }
-        check(result.abiVersion == NATIVE_ABI_VERSION) { "Native artifact result ABI does not match the host" }
+        check(result.abiVersion == NATIVE_ARTIFACT_ABI_VERSION) { "Native artifact result ABI does not match the host" }
         return result
     }
 
@@ -216,7 +216,6 @@ internal class NativeExtensionArtifactTransport(
                 Thread(runnable, "komu-native-artifact-download").apply { isDaemon = true }
             }
         val SHA256_HEX = Regex("^[0-9a-f]{64}$")
-        const val NATIVE_ABI_VERSION = 2
         const val NATIVE_TEMP_DIRECTORY = "komu-extension-artifacts-v1"
         const val PACKAGE_TOKEN_LENGTH = 16
 
@@ -241,7 +240,7 @@ internal interface NativeArtifactBridge {
     fun cancel(operationID: ByteArray)
 }
 
-private object JniNativeArtifactBridge : NativeArtifactBridge {
+internal object JniNativeArtifactBridge : NativeArtifactBridge {
     override fun abiVersion(): Int = NativeArtifactDownload.abiVersion()
 
     override fun prepare(operationID: ByteArray): Boolean = NativeArtifactDownload.prepare(operationID)
@@ -254,6 +253,8 @@ private object JniNativeArtifactBridge : NativeArtifactBridge {
 
     override fun cancel(operationID: ByteArray) = NativeArtifactDownload.cancel(operationID)
 }
+
+internal const val NATIVE_ARTIFACT_ABI_VERSION = 2
 
 @Serializable
 internal data class NativeArtifactDownloadResult(
