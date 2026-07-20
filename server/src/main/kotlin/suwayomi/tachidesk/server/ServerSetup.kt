@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.cef.network.CefCookieManager
 import org.koin.core.context.startKoin
@@ -44,6 +45,7 @@ import suwayomi.tachidesk.manga.impl.download.DownloadManager
 import suwayomi.tachidesk.manga.impl.extension.Extension
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
 import suwayomi.tachidesk.manga.impl.extension.NativeArtifactRuntimeProbe
+import suwayomi.tachidesk.manga.impl.extension.NativeArtifactTransportDiagnostic
 import suwayomi.tachidesk.manga.impl.update.IUpdater
 import suwayomi.tachidesk.manga.impl.update.Updater
 import suwayomi.tachidesk.manga.impl.util.lang.renameTo
@@ -285,6 +287,7 @@ fun applicationSetup() {
                     "failureType=${nativeArtifactStatus.failureType}"
             }
         }
+        runNativeArtifactDiagnosticIfConfigured()
     }
 
     logger.debug {
@@ -554,6 +557,40 @@ fun applicationSetup() {
         },
         ignoreInitialValue = false,
     )
+}
+
+private fun runNativeArtifactDiagnosticIfConfigured() {
+    val configuration =
+        runCatching { NativeArtifactTransportDiagnostic.configurationFromEnvironment() }
+            .getOrElse { failure ->
+                logger.error {
+                    "Native artifact transport diagnostic configuration was rejected: " +
+                        "failureType=${failure::class.simpleName}"
+                }
+                return
+            } ?: return
+
+    logger.warn { "Native artifact transport diagnostic is explicitly enabled; install and activation remain disabled" }
+    runCatching { runBlocking { NativeArtifactTransportDiagnostic.run(configuration) } }
+        .onSuccess { evidence ->
+            logger.info {
+                "Native artifact transport diagnostic passed: " +
+                    "finalHost=${evidence.finalHost}, " +
+                    "size=${evidence.size}, " +
+                    "sha256=${evidence.sha256}, " +
+                    "residentStart=${evidence.residentBytesAtStart}, " +
+                    "residentPeak=${evidence.peakResidentBytes}, " +
+                    "residentEnd=${evidence.residentBytesAtEnd}, " +
+                    "residentPeakDelta=${evidence.peakResidentDeltaBytes}, " +
+                    "cancellationErrorCode=${evidence.cancellationErrorCode}, " +
+                    "stagingCleanupVerified=${evidence.stagingCleanupVerified}, " +
+                    "nativeCleanupVerified=${evidence.nativeCleanupVerified}"
+            }
+        }.onFailure { failure ->
+            logger.error {
+                "Native artifact transport diagnostic failed: failureType=${failure::class.simpleName}"
+            }
+        }
 }
 
 private fun recoverExtensionActivations() {

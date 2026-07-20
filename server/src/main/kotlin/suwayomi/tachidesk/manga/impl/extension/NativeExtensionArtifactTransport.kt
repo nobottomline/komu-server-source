@@ -42,7 +42,9 @@ internal class NativeExtensionArtifactTransport(
 
     fun isAvailable(): Boolean = NativeArtifactRuntimeProbe.probe(bridge, expectedNativeRoot).available
 
-    override suspend fun download(request: ExtensionArtifactTransport.Request): StagedArtifact {
+    override suspend fun download(request: ExtensionArtifactTransport.Request): StagedArtifact = downloadWithMetrics(request).artifact
+
+    internal suspend fun downloadWithMetrics(request: ExtensionArtifactTransport.Request): NativeArtifactTransfer {
         ExtensionArtifactInputPolicy.requireHttpsUrl(request.url)
         ExtensionArtifactInputPolicy.requirePackageName(request.packageName)
         val stagingRoot = requireStagingRoot(request.stagingDirectory)
@@ -61,7 +63,11 @@ internal class NativeExtensionArtifactTransport(
         }
 
         return try {
-            adoptNativeResult(result, operationID, stagingRoot, request)
+            val metrics = result.requireTransferMetrics()
+            NativeArtifactTransfer(
+                artifact = adoptNativeResult(result, operationID, stagingRoot, request),
+                metrics = metrics,
+            )
         } catch (failure: Throwable) {
             cleanupLateNativeResult(rawResult, operationID)
             throw failure
@@ -269,9 +275,39 @@ internal data class NativeArtifactDownloadResult(
     val path: String? = null,
     val size: Long = 0,
     val sha256: String? = null,
+    val residentBytesAtStart: Long? = null,
+    val peakResidentBytes: Long? = null,
+    val residentBytesAtEnd: Long? = null,
     val errorCode: String? = null,
     val message: String? = null,
+) {
+    fun requireTransferMetrics(): NativeArtifactTransferMetrics? {
+        val values = listOf(residentBytesAtStart, peakResidentBytes, residentBytesAtEnd)
+        if (values.all { it == null }) return null
+        require(values.none { it == null }) { "Native artifact RSS envelope is incomplete" }
+        val start = requireNotNull(residentBytesAtStart)
+        val peak = requireNotNull(peakResidentBytes)
+        val end = requireNotNull(residentBytesAtEnd)
+        require(start > 0 && end > 0 && peak >= start && peak >= end) {
+            "Native artifact RSS envelope is invalid"
+        }
+        return NativeArtifactTransferMetrics(start, peak, end)
+    }
+}
+
+internal data class NativeArtifactTransfer(
+    val artifact: StagedArtifact,
+    val metrics: NativeArtifactTransferMetrics?,
 )
+
+internal data class NativeArtifactTransferMetrics(
+    val residentBytesAtStart: Long,
+    val peakResidentBytes: Long,
+    val residentBytesAtEnd: Long,
+) {
+    val peakResidentDeltaBytes: Long
+        get() = peakResidentBytes - residentBytesAtStart
+}
 
 internal class NativeArtifactDownloadException(
     val errorCode: String,

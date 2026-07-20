@@ -49,6 +49,54 @@ class NativeExtensionArtifactTransportTest {
         }
 
     @Test
+    fun `complete RSS envelope is exposed with a bounded peak delta`() =
+        runBlocking {
+            val payload = "rss-artifact".toByteArray()
+            val bridge =
+                FakeNativeBridge(download = { operationID ->
+                    val nativeFile = nativeFile(payload, operationID)
+                    success(nativeFile, payload, residentBytes = Triple(100, 140, 120))
+                })
+
+            val transfer = transport(bridge).downloadWithMetrics(request())
+
+            assertEquals(100, transfer.metrics?.residentBytesAtStart)
+            assertEquals(140, transfer.metrics?.peakResidentBytes)
+            assertEquals(120, transfer.metrics?.residentBytesAtEnd)
+            assertEquals(40, transfer.metrics?.peakResidentDeltaBytes)
+            transfer.artifact.close()
+        }
+
+    @Test
+    fun `partial RSS envelope is rejected and operation-owned files are cleaned`() {
+        val payload = "partial-rss".toByteArray()
+        lateinit var nativeFile: Path
+        val bridge =
+            FakeNativeBridge(download = { operationID ->
+                nativeFile = nativeFile(payload, operationID)
+                encode(
+                    NativeArtifactDownloadResult(
+                        abiVersion = 2,
+                        ok = true,
+                        status = 200,
+                        finalUrl = HTTPS_URL,
+                        path = nativeFile.toAbsolutePath().toString(),
+                        size = payload.size.toLong(),
+                        sha256 = sha256(payload),
+                        residentBytesAtStart = 100,
+                    ),
+                )
+            })
+
+        assertFailsWith<IllegalArgumentException> {
+            runBlocking { transport(bridge).downloadWithMetrics(request()) }
+        }
+
+        assertFalse(Files.exists(nativeFile))
+        assertTrue(stagingFiles().isEmpty())
+    }
+
+    @Test
     fun `ABI mismatch fails before preparing native operation`() {
         val bridge = FakeNativeBridge(abiVersion = 1, download = { error("download must not run") })
 
@@ -214,6 +262,7 @@ class NativeExtensionArtifactTransportTest {
         path: Path,
         payload: ByteArray,
         digest: String = sha256(payload),
+        residentBytes: Triple<Long, Long, Long>? = null,
     ): ByteArray =
         encode(
             NativeArtifactDownloadResult(
@@ -224,6 +273,9 @@ class NativeExtensionArtifactTransportTest {
                 path = path.toAbsolutePath().toString(),
                 size = payload.size.toLong(),
                 sha256 = digest,
+                residentBytesAtStart = residentBytes?.first,
+                peakResidentBytes = residentBytes?.second,
+                residentBytesAtEnd = residentBytes?.third,
             ),
         )
 
