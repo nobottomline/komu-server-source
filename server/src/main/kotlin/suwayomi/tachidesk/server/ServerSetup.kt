@@ -272,13 +272,16 @@ fun applicationSetup() {
         val nativeArtifactStatus = NativeArtifactRuntimeProbe.probe()
         if (nativeArtifactStatus.available) {
             logger.info {
-                "Native extension artifact transport is available: abi=${nativeArtifactStatus.actualAbiVersion}"
+                "Native extension artifact transport is available: " +
+                    "abi=${nativeArtifactStatus.actualAbiVersion}, " +
+                    "temporaryRootVerified=${nativeArtifactStatus.temporaryRootVerified}"
             }
         } else {
             logger.warn {
                 "Native extension artifact transport is unavailable: " +
                     "expectedAbi=${nativeArtifactStatus.expectedAbiVersion}, " +
                     "actualAbi=${nativeArtifactStatus.actualAbiVersion}, " +
+                    "temporaryRootVerified=${nativeArtifactStatus.temporaryRootVerified}, " +
                     "failureType=${nativeArtifactStatus.failureType}"
             }
         }

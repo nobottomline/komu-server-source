@@ -40,7 +40,7 @@ internal class NativeExtensionArtifactTransport(
         }
     }
 
-    fun isAvailable(): Boolean = runCatching { bridge.abiVersion() == NATIVE_ARTIFACT_ABI_VERSION }.getOrDefault(false)
+    fun isAvailable(): Boolean = NativeArtifactRuntimeProbe.probe(bridge, expectedNativeRoot).available
 
     override suspend fun download(request: ExtensionArtifactTransport.Request): StagedArtifact {
         ExtensionArtifactInputPolicy.requireHttpsUrl(request.url)
@@ -216,18 +216,19 @@ internal class NativeExtensionArtifactTransport(
                 Thread(runnable, "komu-native-artifact-download").apply { isDaemon = true }
             }
         val SHA256_HEX = Regex("^[0-9a-f]{64}$")
-        const val NATIVE_TEMP_DIRECTORY = "komu-extension-artifacts-v1"
         const val PACKAGE_TOKEN_LENGTH = 16
-
-        fun defaultNativeTemporaryRoot(): Path {
-            val javaTemporaryRoot = requireNotNull(System.getProperty("java.io.tmpdir")) { "java.io.tmpdir is unavailable" }
-            return Path.of(javaTemporaryRoot).resolve(NATIVE_TEMP_DIRECTORY)
-        }
     }
+}
+
+internal fun defaultNativeTemporaryRoot(): Path {
+    val javaTemporaryRoot = requireNotNull(System.getProperty("java.io.tmpdir")) { "java.io.tmpdir is unavailable" }
+    return Path.of(javaTemporaryRoot).resolve(NATIVE_TEMP_DIRECTORY)
 }
 
 internal interface NativeArtifactBridge {
     fun abiVersion(): Int
+
+    fun temporaryRootMatches(expectedPath: ByteArray): Boolean
 
     fun prepare(operationID: ByteArray): Boolean
 
@@ -243,6 +244,8 @@ internal interface NativeArtifactBridge {
 internal object JniNativeArtifactBridge : NativeArtifactBridge {
     override fun abiVersion(): Int = NativeArtifactDownload.abiVersion()
 
+    override fun temporaryRootMatches(expectedPath: ByteArray): Boolean = NativeArtifactDownload.temporaryRootMatches(expectedPath)
+
     override fun prepare(operationID: ByteArray): Boolean = NativeArtifactDownload.prepare(operationID)
 
     override fun downloadToTemporaryFile(
@@ -255,6 +258,7 @@ internal object JniNativeArtifactBridge : NativeArtifactBridge {
 }
 
 internal const val NATIVE_ARTIFACT_ABI_VERSION = 2
+internal const val NATIVE_TEMP_DIRECTORY = "komu-extension-artifacts-v1"
 
 @Serializable
 internal data class NativeArtifactDownloadResult(

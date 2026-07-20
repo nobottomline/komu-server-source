@@ -17,6 +17,9 @@ public final class NativeArtifactDownload {
 
     public static native int abiVersion();
 
+    /** Returns only whether native and JVM staging roots resolve to one directory identity. */
+    public static native boolean temporaryRootMatches(byte[] expectedPathUtf8);
+
     public static native boolean prepare(byte[] operationIdUtf8);
 
     public static native byte[] downloadToTemporaryFile(

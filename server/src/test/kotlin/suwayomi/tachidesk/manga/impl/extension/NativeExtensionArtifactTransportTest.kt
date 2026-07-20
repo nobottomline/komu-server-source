@@ -54,6 +54,18 @@ class NativeExtensionArtifactTransportTest {
 
         assertFailsWith<IllegalStateException> { runBlocking { transport(bridge).download(request()) } }
 
+        assertEquals(0, bridge.temporaryRootMatchCount)
+        assertEquals(0, bridge.prepareCount)
+        assertEquals(0, bridge.downloadCount)
+    }
+
+    @Test
+    fun `temporary root mismatch fails before preparing native operation`() {
+        val bridge = FakeNativeBridge(temporaryRootMatches = false, download = { error("download must not run") })
+
+        assertFailsWith<IllegalStateException> { runBlocking { transport(bridge).download(request()) } }
+
+        assertEquals(1, bridge.temporaryRootMatchCount)
         assertEquals(0, bridge.prepareCount)
         assertEquals(0, bridge.downloadCount)
     }
@@ -231,6 +243,7 @@ class NativeExtensionArtifactTransportTest {
 
     private class FakeNativeBridge(
         private val abiVersion: Int = 2,
+        private val temporaryRootMatches: Boolean = true,
         private val prepareResult: Boolean = true,
         private val download: (String) -> ByteArray,
         private val onCancel: () -> Unit = {},
@@ -239,8 +252,15 @@ class NativeExtensionArtifactTransportTest {
             private set
         var downloadCount = 0
             private set
+        var temporaryRootMatchCount = 0
+            private set
 
         override fun abiVersion(): Int = abiVersion
+
+        override fun temporaryRootMatches(expectedPath: ByteArray): Boolean {
+            temporaryRootMatchCount += 1
+            return temporaryRootMatches
+        }
 
         override fun prepare(operationID: ByteArray): Boolean {
             prepareCount += 1
