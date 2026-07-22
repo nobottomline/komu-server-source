@@ -5,6 +5,7 @@ import de.neonew.exposed.migrations.runMigrations
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.exposed.v1.core.DatabaseConfig
 import org.jetbrains.exposed.v1.core.ExperimentalKeywordApi
+import org.jetbrains.exposed.v1.core.Schema
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
@@ -18,19 +19,26 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionInfo
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionSource
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionStore
 import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
+import suwayomi.tachidesk.manga.model.table.ExtensionStoreEntryTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ServerConfig
+import suwayomi.tachidesk.server.serverConfig
 import suwayomi.tachidesk.test.ApplicationTest
 import java.nio.file.Files
 import java.nio.file.Path
+import java.sql.DriverManager
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
     @TempDir
@@ -301,6 +309,76 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
             }
         }
 
+    @Test
+    fun `activation holds store generation stable until its serializable commit completes`() =
+        runBlocking {
+            withFixtureDatabase {
+                val operation = prepareOperation()
+                val activationInsideCommit = CountDownLatch(1)
+                val allowActivationCommit = CountDownLatch(1)
+                val refreshAttemptingMutation = CountDownLatch(1)
+                val refreshCompleted = CountDownLatch(1)
+                val executor = Executors.newFixedThreadPool(2)
+
+                try {
+                    val activation =
+                        executor.submit<ExtensionJarMetadataWriter.Result> {
+                            ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
+                                val result =
+                                    ExtensionJarMetadataWriter.write(
+                                        this,
+                                        metadata,
+                                        ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                                    )
+                                activationInsideCommit.countDown()
+                                check(allowActivationCommit.await(10, TimeUnit.SECONDS)) {
+                                    "Timed out waiting to release authenticated activation"
+                                }
+                                result
+                            }
+                        }
+
+                    assertTrue(
+                        activationInsideCommit.await(10, TimeUnit.SECONDS),
+                        "Activation did not enter its serializable commit",
+                    )
+                    val refresh =
+                        executor.submit {
+                            transaction {
+                                refreshAttemptingMutation.countDown()
+                                ExtensionStoreEntryTable.deleteWhere {
+                                    ExtensionStoreEntryTable.pkgName eq TARGET_PKG
+                                }
+                            }
+                            refreshCompleted.countDown()
+                        }
+
+                    assertTrue(
+                        refreshAttemptingMutation.await(10, TimeUnit.SECONDS),
+                        "Concurrent store refresh did not reach its mutation boundary",
+                    )
+                    assertFalse(
+                        refreshCompleted.await(500, TimeUnit.MILLISECONDS),
+                        "Store generation mutation escaped the activation trust-row lock",
+                    )
+
+                    allowActivationCommit.countDown()
+                    val result = activation.get(10, TimeUnit.SECONDS)
+                    refresh.get(10, TimeUnit.SECONDS)
+
+                    assertTrue(result.extensionID > 0)
+                    assertTrue(refreshCompleted.await(1, TimeUnit.SECONDS))
+                    assertTrue(extensionInstalled())
+                    assertEquals("new", Files.readString(operation.active))
+                    assertFalse(markerPresent(operation.markerKey))
+                } finally {
+                    allowActivationCommit.countDown()
+                    executor.shutdownNow()
+                    assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS))
+                }
+            }
+        }
+
     private suspend fun prepareOperation(previousAtActivePath: Boolean = false): Operation {
         val store = store(SIGNING_KEY)
         insertStore(store)
@@ -363,19 +441,12 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
 
     private suspend fun withFixtureDatabase(block: suspend () -> Unit) {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
-        val fixtureDatabase =
-            Database.connect(
-                "jdbc:h2:mem:jar_activation_${UUID.randomUUID().toString().replace("-", "")};DB_CLOSE_DELAY=-1",
-                driver = "org.h2.Driver",
-                databaseConfig =
-                    DatabaseConfig {
-                        useNestedTransactions = true
-                        @OptIn(ExperimentalKeywordApi::class)
-                        preserveKeywordCasing = false
-                    },
-            )
+        val previousDatabaseType = serverConfig.databaseType.value
+        val postgres = PostgresFixture.fromEnvironment()
+        val fixtureDatabase = postgres?.connect() ?: connectH2Fixture()
         ExtensionsList.updateMap.clear()
         try {
+            if (postgres != null) serverConfig.databaseType.value = DatabaseType.POSTGRESQL
             runMigrations(
                 loadMigrationsFrom("suwayomi.tachidesk.server.database.migration", ServerConfig::class.java),
                 fixtureDatabase,
@@ -386,6 +457,79 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
             ExtensionsList.updateMap.clear()
             TransactionManager.closeAndUnregister(fixtureDatabase)
             TransactionManager.defaultDatabase = previousDefaultDatabase
+            serverConfig.databaseType.value = previousDatabaseType
+            postgres?.close()
+        }
+    }
+
+    private fun connectH2Fixture(): Database =
+        Database.connect(
+            "jdbc:h2:mem:jar_activation_${UUID.randomUUID().toString().replace("-", "")};DB_CLOSE_DELAY=-1",
+            driver = "org.h2.Driver",
+            databaseConfig = fixtureDatabaseConfig(),
+        )
+
+    private fun fixtureDatabaseConfig(defaultSchema: Schema? = null): DatabaseConfig =
+        DatabaseConfig {
+            useNestedTransactions = true
+            @OptIn(ExperimentalKeywordApi::class)
+            preserveKeywordCasing = false
+            this.defaultSchema = defaultSchema
+        }
+
+    private class PostgresFixture private constructor(
+        private val jdbcUrl: String,
+        private val username: String,
+        private val password: String,
+    ) : AutoCloseable {
+        private val schema = "komu_jar_activation_${UUID.randomUUID().toString().replace("-", "")}"
+
+        fun connect(): Database {
+            DriverManager.getConnection(jdbcUrl, username, password).use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute("CREATE SCHEMA \"$schema\"")
+                }
+            }
+            val separator = if ('?' in jdbcUrl) '&' else '?'
+            return Database.connect(
+                "$jdbcUrl${separator}currentSchema=$schema",
+                driver = "org.postgresql.Driver",
+                user = username,
+                password = password,
+                databaseConfig =
+                    DatabaseConfig {
+                        useNestedTransactions = true
+                        @OptIn(ExperimentalKeywordApi::class)
+                        preserveKeywordCasing = false
+                        defaultSchema = Schema(schema)
+                    },
+            )
+        }
+
+        override fun close() {
+            DriverManager.getConnection(jdbcUrl, username, password).use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute("DROP SCHEMA \"$schema\" CASCADE")
+                }
+            }
+        }
+
+        companion object {
+            fun fromEnvironment(): PostgresFixture? {
+                val jdbcUrl = System.getenv(POSTGRES_JDBC_URL_ENV)?.takeIf { it.isNotBlank() } ?: return null
+                require(jdbcUrl.startsWith("jdbc:postgresql://")) {
+                    "$POSTGRES_JDBC_URL_ENV must use a PostgreSQL JDBC URL"
+                }
+                val username =
+                    requireNotNull(System.getenv(POSTGRES_USERNAME_ENV)?.takeIf { it.isNotBlank() }) {
+                        "$POSTGRES_USERNAME_ENV is required with $POSTGRES_JDBC_URL_ENV"
+                    }
+                return PostgresFixture(
+                    jdbcUrl = jdbcUrl,
+                    username = username,
+                    password = System.getenv(POSTGRES_PASSWORD_ENV).orEmpty(),
+                )
+            }
         }
     }
 
@@ -501,5 +645,8 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
         const val DATABASE_IDENTITY = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         const val TARGET_PKG = "app.komu.fixture.target"
         const val SOURCE_ID = 201L
+        const val POSTGRES_JDBC_URL_ENV = "KOMU_TEST_POSTGRES_JDBC_URL"
+        const val POSTGRES_USERNAME_ENV = "KOMU_TEST_POSTGRES_USERNAME"
+        const val POSTGRES_PASSWORD_ENV = "KOMU_TEST_POSTGRES_PASSWORD"
     }
 }

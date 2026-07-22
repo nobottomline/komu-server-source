@@ -13,6 +13,7 @@ import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.vendors.ForUpdateOption
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
@@ -142,6 +143,10 @@ internal object ExtensionJarPreflightInputRepository {
             ExtensionStoreEntryTable
                 .selectAll()
                 .where { ExtensionStoreEntryTable.pkgName eq evidence.packageName }
+                // SERIALIZABLE alone gives PostgreSQL a stable snapshot: the second fence below
+                // would not observe a concurrent delete-and-replace. Lock the exact trust row so
+                // store reconciliation and activation have one explicit linearization point.
+                .forUpdate(ForUpdateOption.ForUpdate)
                 .toList()
         if (currentEntries.isEmpty()) throw StaleExtensionStoreSnapshotException(evidence.packageName)
         if (currentEntries.size > 1) {
