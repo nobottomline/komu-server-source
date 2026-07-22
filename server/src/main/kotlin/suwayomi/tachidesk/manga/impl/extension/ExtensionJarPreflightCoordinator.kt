@@ -51,7 +51,7 @@ internal class ExtensionJarPreflightCoordinator(
     }
 
     class PreparedCandidate internal constructor(
-        input: ExtensionJarPreflightInputSnapshot,
+        private val input: ExtensionJarPreflightInputSnapshot,
         private val candidate: ExtensionJarPreflightPipeline.ValidatedCandidate,
     ) : AutoCloseable {
         val ledgerEntryID: Long = input.ledgerEntryID
@@ -73,6 +73,22 @@ internal class ExtensionJarPreflightCoordinator(
 
         /** Future activation must call this again immediately before consuming the path. */
         fun assertIntegrity() = candidate.assertIntegrity()
+
+        /** Durable evidence handed to the activation journal before filesystem publication. */
+        internal fun journalTrustBinding() =
+            ExtensionActivationJournal.AuthenticatedStoreBinding(
+                packageName = input.expected.pkgName,
+                ledgerEntryID = input.ledgerEntryID,
+                storeSnapshotToken = input.storeSnapshotToken,
+                storeIndexUrl = input.expected.storeIndexUrl,
+                storeSigningKey = input.expectedSigningKey,
+                candidateSize = candidate.size,
+                candidateSha256 = candidate.sha256,
+                sourceIDs =
+                    candidate.sources
+                        .map { it.id }
+                        .sorted(),
+            )
 
         override fun close() = candidate.close()
     }

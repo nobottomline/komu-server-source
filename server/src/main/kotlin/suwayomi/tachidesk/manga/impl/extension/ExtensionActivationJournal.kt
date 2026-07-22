@@ -7,9 +7,12 @@ package suwayomi.tachidesk.manga.impl.extension
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.channels.FileChannel
+import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -49,6 +52,40 @@ internal class ExtensionActivationJournal(
         stagedArtifact: Path,
         activeArtifact: Path,
         previousArtifact: Path?,
+    ): Entry =
+        prepareInternal(
+            packageName,
+            databaseIdentity,
+            stagedArtifact,
+            activeArtifact,
+            previousArtifact,
+            storeTrustBinding = null,
+        )
+
+    fun prepareAuthenticated(
+        packageName: String,
+        databaseIdentity: String,
+        stagedArtifact: Path,
+        activeArtifact: Path,
+        previousArtifact: Path?,
+        storeTrustBinding: AuthenticatedStoreBinding,
+    ): Entry =
+        prepareInternal(
+            packageName,
+            databaseIdentity,
+            stagedArtifact,
+            activeArtifact,
+            previousArtifact,
+            storeTrustBinding,
+        )
+
+    private fun prepareInternal(
+        packageName: String,
+        databaseIdentity: String,
+        stagedArtifact: Path,
+        activeArtifact: Path,
+        previousArtifact: Path?,
+        storeTrustBinding: AuthenticatedStoreBinding?,
     ): Entry {
         require(PACKAGE_NAME.matches(packageName)) { "Invalid extension package name" }
         require(SHA256.matches(databaseIdentity)) { "Invalid database identity" }
@@ -58,20 +95,27 @@ internal class ExtensionActivationJournal(
         require(staged != active) { "Staged and active extension artifacts must differ" }
 
         val operationId = UUID.randomUUID().toString()
-        val replacesInPlace = previous == active
-        val rollback =
-            if (replacesInPlace) {
-                root.resolve(".${active.fileName}.rollback-$operationId.jar").also { backup ->
-                    Files.copy(active, backup, StandardCopyOption.COPY_ATTRIBUTES)
-                    forceFile(backup)
-                    forceDirectory(root)
-                }
-            } else {
-                null
-            }
-
-        val journalPath = journalRoot.resolve("$operationId.properties")
+        acquirePackageLease(packageName, operationId)
+        var entry: Entry? = null
         try {
+            if (loadAll().any { it.record.packageName == packageName }) {
+                throw PendingExtensionActivationException(packageName)
+            }
+            val candidateSize = Files.size(staged)
+            val candidateSha256 = sha256(staged)
+            storeTrustBinding?.let { binding ->
+                require(binding.packageName == packageName) { "Authenticated store package identity changed" }
+                require(binding.candidateSize == candidateSize) { "Authenticated artifact size changed before journaling" }
+                require(binding.candidateSha256 == candidateSha256) {
+                    "Authenticated artifact digest changed before journaling"
+                }
+            }
+            val rollback =
+                if (previous == active) {
+                    root.resolve(".${active.fileName}.rollback-$operationId.jar")
+                } else {
+                    null
+                }
             val record =
                 Record(
                     operationId = operationId,
@@ -83,17 +127,26 @@ internal class ExtensionActivationJournal(
                     activeName = active.fileName.toString(),
                     previousName = previous?.fileName?.toString(),
                     rollbackName = rollback?.fileName?.toString(),
-                    candidateSha256 = sha256(staged),
+                    candidateSha256 = candidateSha256,
                     previousSha256 = previous?.let(::sha256),
+                    storeTrustBinding = storeTrustBinding,
                 )
-            return Entry(journalPath, record).also(::persist)
+            entry = Entry(journalRoot.resolve("$operationId.properties"), record).also(::persist)
+
+            // The journal is durable before the backup is created. A crash in
+            // this interval is recoverable because PREPARED still sees the
+            // untouched previous digest and does not require the backup.
+            rollback?.let { backup ->
+                Files.copy(active, backup, StandardCopyOption.COPY_ATTRIBUTES, LinkOption.NOFOLLOW_LINKS)
+                forceFile(backup)
+                forceDirectory(root)
+            }
+            return checkNotNull(entry)
         } catch (failure: Throwable) {
-            // If the journal rename landed, recovery owns the backup. If it
-            // did not, the active old artifact is still untouched and this
-            // operation must not leak an unreferenced rollback copy.
-            if (!Files.exists(journalPath)) {
-                rollback?.let { runCatching { Files.deleteIfExists(it) } }
-                runCatching { forceDirectory(root) }
+            if (entry != null) {
+                runCatching { rollback(entry) }.onFailure(failure::addSuppressed)
+            } else {
+                runCatching { releasePackageLease(packageName, operationId) }.onFailure(failure::addSuppressed)
             }
             throw failure
         }
@@ -103,6 +156,7 @@ internal class ExtensionActivationJournal(
         entry: Entry,
         state: State,
     ): Entry {
+        requirePackageLease(entry)
         require(state.ordinal == entry.record.state.ordinal + 1) {
             "Invalid activation transition ${entry.record.state} -> $state"
         }
@@ -110,6 +164,7 @@ internal class ExtensionActivationJournal(
     }
 
     fun publish(entry: Entry) {
+        requirePackageLease(entry)
         val staged = artifact(entry.record.stagedName)
         val active = artifact(entry.record.activeName)
         require(sha256(staged) == entry.record.candidateSha256) { "Staged extension artifact changed before activation" }
@@ -119,6 +174,7 @@ internal class ExtensionActivationJournal(
     }
 
     fun rollback(entry: Entry) {
+        requirePackageLease(entry)
         val record = entry.record
         val active = artifact(record.activeName)
         val previous = record.previousName?.let(::artifact)
@@ -167,6 +223,7 @@ internal class ExtensionActivationJournal(
     }
 
     fun finalizeCommitted(entry: Entry) {
+        requirePackageLease(entry)
         val record = entry.record
         val active = artifact(record.activeName)
         require(isRegularFile(active)) { "Committed extension artifact is missing" }
@@ -187,6 +244,7 @@ internal class ExtensionActivationJournal(
     ): RecoveryReport {
         sweepTemporaryJournalFiles()
         val entries = loadAll()
+        reconcilePackageLeases(entries)
         require(entries.all { it.record.databaseIdentity == databaseIdentity }) {
             "Pending extension activation belongs to a different database configuration"
         }
@@ -214,8 +272,113 @@ internal class ExtensionActivationJournal(
         forceDirectory(journalRoot)
     }
 
+    /**
+     * Restores the one-pending-operation-per-package invariant before recovery.
+     * Version-1 journals predate lease files, so a missing lease is recreated.
+     * A lease without a journal is an interrupted pre-prepare operation and can
+     * be removed only during startup recovery, never by a competing installer.
+     */
+    private fun reconcilePackageLeases(entries: List<Entry>) {
+        val duplicatePackage =
+            entries
+                .groupingBy { it.record.packageName }
+                .eachCount()
+                .entries
+                .firstOrNull { it.value > 1 }
+        require(duplicatePackage == null) {
+            "Multiple pending extension activations exist for package ${duplicatePackage?.key}"
+        }
+
+        val expectedLeases = entries.associateBy { packageLeasePath(it.record.packageName) }
+        Files.list(journalRoot).use { paths ->
+            paths
+                .filter { isPackageLeasePath(it) && it !in expectedLeases }
+                .forEach(Files::deleteIfExists)
+        }
+        entries.forEach { entry ->
+            val leasePath = packageLeasePath(entry.record.packageName)
+            if (Files.exists(leasePath, LinkOption.NOFOLLOW_LINKS)) {
+                require(readPackageLease(leasePath) == PackageLease(entry.record.packageName, entry.record.operationId)) {
+                    "Extension activation lease does not match its journal"
+                }
+            } else {
+                acquirePackageLease(entry.record.packageName, entry.record.operationId)
+            }
+        }
+        forceDirectory(journalRoot)
+    }
+
+    private fun acquirePackageLease(
+        packageName: String,
+        operationId: String,
+    ) {
+        val leasePath = packageLeasePath(packageName)
+        val bytes = "$operationId\n$packageName\n".toByteArray(StandardCharsets.UTF_8)
+        try {
+            FileChannel
+                .open(
+                    leasePath,
+                    StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.WRITE,
+                    LinkOption.NOFOLLOW_LINKS,
+                ).use { channel ->
+                    val buffer = ByteBuffer.wrap(bytes)
+                    while (buffer.hasRemaining()) channel.write(buffer)
+                    channel.force(true)
+                }
+            forceDirectory(journalRoot)
+        } catch (_: FileAlreadyExistsException) {
+            throw PendingExtensionActivationException(packageName)
+        }
+    }
+
+    private fun releasePackageLease(
+        packageName: String,
+        operationId: String,
+    ) {
+        val leasePath = packageLeasePath(packageName)
+        if (!Files.exists(leasePath, LinkOption.NOFOLLOW_LINKS)) return
+        require(readPackageLease(leasePath) == PackageLease(packageName, operationId)) {
+            "Refusing to release a different extension activation lease"
+        }
+        Files.delete(leasePath)
+    }
+
+    private fun readPackageLease(path: Path): PackageLease {
+        require(isPackageLeasePath(path) && isRegularFile(path)) { "Invalid extension activation lease" }
+        val lines = Files.readAllLines(path, StandardCharsets.UTF_8)
+        require(lines.size == 2) { "Invalid extension activation lease contents" }
+        val operationId = lines[0]
+        val packageName = lines[1]
+        require(runCatching { UUID.fromString(operationId).toString() }.getOrNull() == operationId) {
+            "Invalid activation lease operation ID"
+        }
+        require(PACKAGE_NAME.matches(packageName)) { "Invalid activation lease package name" }
+        require(path == packageLeasePath(packageName)) { "Activation lease package/path mismatch" }
+        return PackageLease(packageName, operationId)
+    }
+
+    private fun requirePackageLease(entry: Entry) {
+        val leasePath = packageLeasePath(entry.record.packageName)
+        require(Files.exists(leasePath, LinkOption.NOFOLLOW_LINKS)) { "Extension activation lease is missing" }
+        require(readPackageLease(leasePath) == PackageLease(entry.record.packageName, entry.record.operationId)) {
+            "Extension activation lease does not match its journal"
+        }
+    }
+
+    private fun packageLeasePath(packageName: String): Path =
+        journalRoot.resolve("$LEASE_PREFIX${sha256(packageName.toByteArray(StandardCharsets.UTF_8))}$LEASE_SUFFIX")
+
+    private fun isPackageLeasePath(path: Path): Boolean {
+        if (path.toAbsolutePath().normalize().parent != journalRoot) return false
+        val name = path.fileName.toString()
+        return name.startsWith(LEASE_PREFIX) && name.endsWith(LEASE_SUFFIX)
+    }
+
     fun deleteJournal(entry: Entry) {
+        requirePackageLease(entry)
         Files.deleteIfExists(entry.path)
+        releasePackageLease(entry.record.packageName, entry.record.operationId)
         forceDirectory(journalRoot)
     }
 
@@ -311,6 +474,12 @@ internal class ExtensionActivationJournal(
         return digest.digest().joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
     }
 
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest
+            .getInstance("SHA-256")
+            .digest(bytes)
+            .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+
     private fun forceFile(path: Path) {
         FileChannel.open(path, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { it.force(true) }
     }
@@ -347,10 +516,11 @@ internal class ExtensionActivationJournal(
         val rollbackName: String?,
         val candidateSha256: String,
         val previousSha256: String?,
+        val storeTrustBinding: AuthenticatedStoreBinding?,
     ) {
         fun toProperties() =
             Properties().apply {
-                setProperty("formatVersion", FORMAT_VERSION)
+                setProperty("formatVersion", CURRENT_FORMAT_VERSION)
                 setProperty("operationId", operationId)
                 setProperty("packageName", packageName)
                 setProperty("databaseIdentity", databaseIdentity)
@@ -362,6 +532,17 @@ internal class ExtensionActivationJournal(
                 rollbackName?.let { setProperty("rollbackName", it) }
                 setProperty("candidateSha256", candidateSha256)
                 previousSha256?.let { setProperty("previousSha256", it) }
+                if (storeTrustBinding == null) {
+                    setProperty("trustMode", TRUST_MODE_LEGACY)
+                } else {
+                    setProperty("trustMode", TRUST_MODE_AUTHENTICATED_STORE)
+                    setProperty("ledgerEntryId", storeTrustBinding.ledgerEntryID.toString())
+                    setProperty("storeSnapshotToken", storeTrustBinding.storeSnapshotToken)
+                    setProperty("storeIndexUrl", storeTrustBinding.storeIndexUrl)
+                    setProperty("storeSigningKey", storeTrustBinding.storeSigningKey)
+                    setProperty("candidateSize", storeTrustBinding.candidateSize.toString())
+                    setProperty("sourceIds", storeTrustBinding.sourceIDs.joinToString(","))
+                }
             }
 
         companion object {
@@ -370,10 +551,57 @@ internal class ExtensionActivationJournal(
                     properties.getProperty(key)?.takeIf(String::isNotBlank)
                         ?: error("Missing activation journal property: $key")
 
-                require(required("formatVersion") == FORMAT_VERSION) { "Unsupported activation journal version" }
+                val formatVersion = required("formatVersion")
+                require(formatVersion in SUPPORTED_FORMAT_VERSIONS) { "Unsupported activation journal version" }
+                val packageName = required("packageName")
+                val candidateSha256 = required("candidateSha256")
+                val storeTrustBinding =
+                    when (formatVersion) {
+                        LEGACY_FORMAT_VERSION -> {
+                            require(TRUST_PROPERTY_KEYS.none(properties::containsKey)) {
+                                "Version-1 activation journal contains version-2 trust properties"
+                            }
+                            null
+                        }
+
+                        CURRENT_FORMAT_VERSION -> {
+                            when (required("trustMode")) {
+                                TRUST_MODE_LEGACY -> {
+                                    require(AUTHENTICATED_TRUST_PROPERTY_KEYS.none(properties::containsKey)) {
+                                        "Legacy activation journal contains authenticated trust properties"
+                                    }
+                                    null
+                                }
+
+                                TRUST_MODE_AUTHENTICATED_STORE -> {
+                                    AuthenticatedStoreBinding(
+                                        packageName = packageName,
+                                        ledgerEntryID = required("ledgerEntryId").toLong(),
+                                        storeSnapshotToken = required("storeSnapshotToken"),
+                                        storeIndexUrl = required("storeIndexUrl"),
+                                        storeSigningKey = required("storeSigningKey"),
+                                        candidateSize = required("candidateSize").toLong(),
+                                        candidateSha256 = candidateSha256,
+                                        sourceIDs =
+                                            required("sourceIds")
+                                                .split(',')
+                                                .map { it.toLong() },
+                                    )
+                                }
+
+                                else -> {
+                                    error("Unsupported activation journal trust mode")
+                                }
+                            }
+                        }
+
+                        else -> {
+                            error("Unsupported activation journal version")
+                        }
+                    }
                 return Record(
                     operationId = required("operationId"),
-                    packageName = required("packageName"),
+                    packageName = packageName,
                     databaseIdentity = required("databaseIdentity"),
                     markerKey = required("markerKey"),
                     state = State.valueOf(required("state")),
@@ -381,9 +609,42 @@ internal class ExtensionActivationJournal(
                     activeName = required("activeName"),
                     previousName = properties.getProperty("previousName")?.takeIf(String::isNotBlank),
                     rollbackName = properties.getProperty("rollbackName")?.takeIf(String::isNotBlank),
-                    candidateSha256 = required("candidateSha256"),
+                    candidateSha256 = candidateSha256,
                     previousSha256 = properties.getProperty("previousSha256")?.takeIf(String::isNotBlank),
+                    storeTrustBinding = storeTrustBinding,
                 )
+            }
+        }
+    }
+
+    /** Immutable provenance required before a store-delivered JAR may enter the activation journal. */
+    data class AuthenticatedStoreBinding(
+        val packageName: String,
+        val ledgerEntryID: Long,
+        val storeSnapshotToken: String,
+        val storeIndexUrl: String,
+        val storeSigningKey: String,
+        val candidateSize: Long,
+        val candidateSha256: String,
+        val sourceIDs: List<Long>,
+    ) {
+        init {
+            ExtensionArtifactInputPolicy.requirePackageName(packageName)
+            require(ledgerEntryID > 0) { "Invalid extension-store ledger entry ID" }
+            require(runCatching { UUID.fromString(storeSnapshotToken).toString() }.getOrNull() == storeSnapshotToken) {
+                "Invalid extension-store snapshot token"
+            }
+            ExtensionArtifactInputPolicy.requireHttpsUrl(storeIndexUrl)
+            require(SHA256.matches(storeSigningKey)) { "Invalid extension-store signing key" }
+            require(candidateSize in 1..StagedArtifact.DEFAULT_MAX_ARTIFACT_BYTES) {
+                "Invalid authenticated extension artifact size"
+            }
+            require(SHA256.matches(candidateSha256)) { "Invalid authenticated extension artifact digest" }
+            require(sourceIDs.isNotEmpty() && sourceIDs.size <= MAX_SOURCE_IDS) {
+                "Invalid authenticated extension source-ID count"
+            }
+            require(sourceIDs.all { it > 0 } && sourceIDs == sourceIDs.distinct().sorted()) {
+                "Authenticated extension source IDs must be positive, unique, and sorted"
             }
         }
     }
@@ -401,11 +662,30 @@ internal class ExtensionActivationJournal(
         val finalized: Int,
     )
 
+    private data class PackageLease(
+        val packageName: String,
+        val operationId: String,
+    )
+
     companion object {
         const val MARKER_PREFIX = "komu.extension.activation."
-        private const val FORMAT_VERSION = "1"
+        private const val LEGACY_FORMAT_VERSION = "1"
+        private const val CURRENT_FORMAT_VERSION = "2"
+        private val SUPPORTED_FORMAT_VERSIONS = setOf(LEGACY_FORMAT_VERSION, CURRENT_FORMAT_VERSION)
         private const val JOURNAL_DIRECTORY = ".activation-journal"
+        private const val LEASE_PREFIX = "lease-"
+        private const val LEASE_SUFFIX = ".lock"
+        private const val TRUST_MODE_LEGACY = "legacy"
+        private const val TRUST_MODE_AUTHENTICATED_STORE = "authenticated-store-jar"
+        private const val MAX_SOURCE_IDS = 10_000
+        private val AUTHENTICATED_TRUST_PROPERTY_KEYS =
+            setOf("ledgerEntryId", "storeSnapshotToken", "storeIndexUrl", "storeSigningKey", "candidateSize", "sourceIds")
+        private val TRUST_PROPERTY_KEYS = AUTHENTICATED_TRUST_PROPERTY_KEYS + "trustMode"
         private val PACKAGE_NAME = Regex("[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)+")
         private val SHA256 = Regex("[0-9a-f]{64}")
     }
 }
+
+internal class PendingExtensionActivationException(
+    packageName: String,
+) : IllegalStateException("Another extension activation is pending for package $packageName")

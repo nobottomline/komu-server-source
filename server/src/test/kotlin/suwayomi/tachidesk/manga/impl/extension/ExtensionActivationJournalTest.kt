@@ -8,10 +8,176 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+import java.util.Properties
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 
 class ExtensionActivationJournalTest {
     @TempDir
     lateinit var root: Path
+
+    @Test
+    fun `authenticated store binding survives durable round trip`() {
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        val binding = authenticatedBinding(staged)
+
+        val entry =
+            journal.prepareAuthenticated(
+                PACKAGE_NAME,
+                DATABASE_IDENTITY,
+                staged,
+                root.resolve("active.jar"),
+                previousArtifact = null,
+                storeTrustBinding = binding,
+            )
+
+        assertEquals(
+            binding,
+            journal
+                .loadAll()
+                .single()
+                .record.storeTrustBinding,
+        )
+        journal.rollback(entry)
+        assertTrue(journal.loadAll().isEmpty())
+    }
+
+    @Test
+    fun `journal rejects artifact changed after authenticated preflight without leaking lease`() {
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        val binding = authenticatedBinding(staged)
+        Files.writeString(staged, "bad")
+
+        assertThrows(IllegalArgumentException::class.java) {
+            journal.prepareAuthenticated(
+                PACKAGE_NAME,
+                DATABASE_IDENTITY,
+                staged,
+                root.resolve("active.jar"),
+                previousArtifact = null,
+                storeTrustBinding = binding,
+            )
+        }
+
+        assertTrue(journal.loadAll().isEmpty())
+        val replacement = write("replacement.jar", "new")
+        val entry = journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, replacement, root.resolve("active.jar"), null)
+        journal.rollback(entry)
+    }
+
+    @Test
+    fun `atomic package lease permits only one concurrent pending activation`() {
+        val first = write("first.jar", "first")
+        val second = write("second.jar", "second")
+        val journal = ExtensionActivationJournal(root)
+        val start = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val attempts =
+                listOf(first, second).map { staged ->
+                    executor.submit<ExtensionActivationJournal.Entry> {
+                        start.await()
+                        journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, root.resolve("active.jar"), null)
+                    }
+                }
+            start.countDown()
+
+            val results = attempts.map { runCatching { it.get() } }
+            assertEquals(1, results.count { it.isSuccess })
+            assertEquals(1, results.count { it.exceptionOrNull()?.cause is PendingExtensionActivationException })
+            assertEquals(1, journal.loadAll().size)
+
+            journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+            assertTrue(journal.loadAll().isEmpty())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `pending journal cannot be bypassed when its lease file disappears`() {
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, root.resolve("active.jar"), null)
+        Files.delete(singleLeaseFile())
+        val competing = write("competing.jar", "other")
+
+        assertThrows(PendingExtensionActivationException::class.java) {
+            journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, competing, root.resolve("active.jar"), null)
+        }
+
+        assertEquals(1, journal.loadAll().size)
+        assertTrue(Files.exists(competing))
+        val report = journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+        assertEquals(1, report.rolledBack)
+        assertTrue(journal.loadAll().isEmpty())
+    }
+
+    @Test
+    fun `mismatched package lease blocks artifact mutation`() {
+        val active = write("active.jar", "old")
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        val entry = journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, active, active)
+        Files.writeString(
+            singleLeaseFile(),
+            "00000000-0000-0000-0000-000000000000\n$PACKAGE_NAME\n",
+            StandardOpenOption.TRUNCATE_EXISTING,
+        )
+
+        assertThrows(IllegalArgumentException::class.java) { journal.rollback(entry) }
+
+        assertEquals("old", Files.readString(active))
+        assertEquals("new", Files.readString(staged))
+        assertEquals(1, journal.loadAll().size)
+    }
+
+    @Test
+    fun `version one journal remains recoverable and receives a startup lease`() {
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        val entry = journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, root.resolve("active.jar"), null)
+        val properties = readProperties(entry.path)
+        properties.setProperty("formatVersion", "1")
+        properties.remove("trustMode")
+        writeProperties(entry.path, properties)
+
+        assertEquals(
+            null,
+            journal
+                .loadAll()
+                .single()
+                .record.storeTrustBinding,
+        )
+        val report = journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+
+        assertEquals(1, report.rolledBack)
+        assertTrue(journal.loadAll().isEmpty())
+    }
+
+    @Test
+    fun `partial authenticated binding is rejected fail closed`() {
+        val staged = write("candidate.jar", "new")
+        val journal = ExtensionActivationJournal(root)
+        val entry =
+            journal.prepareAuthenticated(
+                PACKAGE_NAME,
+                DATABASE_IDENTITY,
+                staged,
+                root.resolve("active.jar"),
+                previousArtifact = null,
+                storeTrustBinding = authenticatedBinding(staged),
+            )
+        val properties = readProperties(entry.path)
+        properties.remove("storeSigningKey")
+        writeProperties(entry.path, properties)
+
+        assertThrows(IllegalStateException::class.java) { journal.loadAll() }
+        assertTrue(Files.exists(staged))
+    }
 
     @Test
     fun `prepared operation without database marker is discarded`() {
@@ -125,6 +291,37 @@ class ExtensionActivationJournalTest {
         name: String,
         contents: String,
     ): Path = root.resolve(name).also { Files.writeString(it, contents) }
+
+    private fun authenticatedBinding(staged: Path) =
+        ExtensionActivationJournal.AuthenticatedStoreBinding(
+            packageName = PACKAGE_NAME,
+            ledgerEntryID = 42,
+            storeSnapshotToken = "123e4567-e89b-12d3-a456-426614174000",
+            storeIndexUrl = "https://repo.invalid/index.json",
+            storeSigningKey = "a".repeat(64),
+            candidateSize = Files.size(staged),
+            candidateSha256 = StagedArtifact.sha256(staged, StagedArtifact.DEFAULT_MAX_ARTIFACT_BYTES),
+            sourceIDs = listOf(101, 202),
+        )
+
+    private fun readProperties(path: Path) =
+        Properties().apply {
+            Files.newInputStream(path).use(::load)
+        }
+
+    private fun writeProperties(
+        path: Path,
+        properties: Properties,
+    ) {
+        Files
+            .newOutputStream(path, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)
+            .use { properties.store(it, null) }
+    }
+
+    private fun singleLeaseFile(): Path =
+        Files
+            .list(root.resolve(".activation-journal"))
+            .use { paths -> paths.filter { it.fileName.toString().endsWith(".lock") }.toList().single() }
 
     private companion object {
         const val PACKAGE_NAME = "app.komu.fixture"

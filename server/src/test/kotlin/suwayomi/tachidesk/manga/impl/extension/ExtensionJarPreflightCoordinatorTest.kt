@@ -31,6 +31,19 @@ class ExtensionJarPreflightCoordinatorTest {
             assertEquals(SNAPSHOT_TOKEN, prepared.storeSnapshotToken)
             assertEquals(PACKAGE_NAME, prepared.expected.pkgName)
             assertEquals(listOf(SOURCE_ID), prepared.sources.map { it.id })
+            assertEquals(
+                ExtensionActivationJournal.AuthenticatedStoreBinding(
+                    packageName = PACKAGE_NAME,
+                    ledgerEntryID = ENTRY_ID,
+                    storeSnapshotToken = SNAPSHOT_TOKEN,
+                    storeIndexUrl = STORE_URL,
+                    storeSigningKey = SIGNING_KEY,
+                    candidateSize = 9,
+                    candidateSha256 = CANDIDATE_SHA256,
+                    sourceIDs = listOf(SOURCE_ID),
+                ),
+                prepared.journalTrustBinding(),
+            )
             prepared.assertIntegrity()
             assertTrue(Files.isRegularFile(prepared.path))
             prepared.close()
