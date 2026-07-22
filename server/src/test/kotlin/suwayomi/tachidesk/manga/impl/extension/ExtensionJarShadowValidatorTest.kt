@@ -107,6 +107,45 @@ class ExtensionJarShadowValidatorTest {
         }
     }
 
+    @Test
+    fun `source name exceeding installed schema is rejected before execution`() {
+        val expected = extensionInfo(listOf(source(SOURCE_ID).copy(name = "n".repeat(129))))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            ExtensionJarShadowValidator.validateExpected(expected)
+        }
+    }
+
+    @Test
+    fun `source home URL exceeding installed base-url schema is rejected before execution`() {
+        val expected = extensionInfo(listOf(source(SOURCE_ID).copy(homeUrl = "h".repeat(2049))))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            ExtensionJarShadowValidator.validateExpected(expected)
+        }
+    }
+
+    @Test
+    fun `aggregate source languages exceeding persistence schema are rejected`() {
+        val sources =
+            (1L..256L).map { id ->
+                source(id).copy(
+                    name = "Source $id",
+                    lang = "l${id.toString().padStart(30, 'x')}",
+                )
+            }
+        val expected = extensionInfo(sources).copy(lang = "all")
+        val result =
+            ExtensionJarShadowValidator.Result(
+                sources.map { ExtensionJarShadowValidator.SourceMetadata(it.id, it.name, it.lang) },
+                extensionLanguage = "all",
+            )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            ExtensionJarShadowValidator.validateResult(result, expected, emptyMap())
+        }
+    }
+
     private fun compileFixture(
         sourceIDs: List<Long>,
         catalogue: Boolean = true,

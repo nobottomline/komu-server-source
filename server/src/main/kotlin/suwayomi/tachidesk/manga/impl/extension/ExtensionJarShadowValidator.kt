@@ -100,6 +100,15 @@ internal object ExtensionJarShadowValidator {
         val computedLanguage = extensionLanguage(sources)
         check(result.extensionLanguage == computedLanguage) { "Extension probe returned inconsistent language metadata" }
         check(computedLanguage == expected.lang) { "Extension candidate language does not match store metadata" }
+        require(
+            sources
+                .map { it.lang }
+                .distinct()
+                .joinToString(",")
+                .length <= MAX_SOURCE_LANGS_LENGTH,
+        ) {
+            "Extension source languages exceed the persistence limit"
+        }
         return Result(sources, computedLanguage)
     }
 
@@ -163,8 +172,9 @@ internal object ExtensionJarShadowValidator {
     }
 
     internal const val MAX_SOURCES = 256
-    private const val MAX_SOURCE_NAME_LENGTH = 256
+    private const val MAX_SOURCE_NAME_LENGTH = 128
     private const val MAX_SOURCE_LANGUAGE_LENGTH = 32
-    private const val MAX_SOURCE_URL_LENGTH = 4096
+    private const val MAX_SOURCE_URL_LENGTH = 2048
     private const val MAX_SOURCE_MESSAGE_LENGTH = 4096
+    private const val MAX_SOURCE_LANGS_LENGTH = 4096
 }

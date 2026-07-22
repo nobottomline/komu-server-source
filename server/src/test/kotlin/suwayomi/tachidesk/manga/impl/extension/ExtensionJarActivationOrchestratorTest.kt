@@ -24,6 +24,8 @@ import suwayomi.tachidesk.manga.model.dataclass.ExtensionSource
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionStore
 import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
+import suwayomi.tachidesk.manga.model.table.ExtensionTable
+import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ServerConfig
 import suwayomi.tachidesk.test.ApplicationTest
 import java.nio.file.Files
@@ -41,13 +43,13 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 val operation = prepareOperation()
 
                 val result =
-                    ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
-                        assertEquals(TARGET_PKG, metadata.artifact.packageName)
-                        assertEquals(SOURCE_ID, metadata.sources.single().id)
-                        "committed"
-                    }
+                    ExtensionJarActivationOrchestrator.activate(
+                        operation.candidate,
+                        ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                    )
 
-                assertEquals("committed", result)
+                assertTrue(result.extensionID > 0)
+                assertEquals(listOf(SOURCE_ID), result.installedSourceIDs)
                 assertEquals("new", Files.readString(operation.active))
                 assertFalse(Files.exists(operation.staged))
                 assertTrue(
@@ -56,6 +58,8 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                         .isEmpty(),
                 )
                 assertFalse(markerPresent(operation.markerKey))
+                assertTrue(extensionInstalled())
+                assertEquals(listOf(SOURCE_ID), installedSourceIDs())
             }
         }
 
@@ -66,7 +70,12 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 val operation = prepareOperation()
 
                 assertThrows(IllegalStateException::class.java) {
-                    ExtensionJarActivationOrchestrator.activate(operation.candidate) {
+                    ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
+                        ExtensionJarMetadataWriter.write(
+                            this,
+                            metadata,
+                            ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                        )
                         throw IllegalStateException("metadata rejected")
                     }
                 }
@@ -79,6 +88,8 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                         .isEmpty(),
                 )
                 assertFalse(markerPresent(operation.markerKey))
+                assertFalse(extensionInstalled(), "metadata writer changes must roll back with its transaction")
+                assertTrue(installedSourceIDs().isEmpty())
             }
         }
 
@@ -89,7 +100,12 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 val operation = prepareOperation(previousAtActivePath = true)
 
                 assertThrows(IllegalStateException::class.java) {
-                    ExtensionJarActivationOrchestrator.activate(operation.candidate) {
+                    ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
+                        ExtensionJarMetadataWriter.write(
+                            this,
+                            metadata,
+                            ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                        )
                         throw IllegalStateException("metadata rejected")
                     }
                 }
@@ -142,12 +158,18 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 val lease = singleLease(operation.candidate.entry.path.parent)
 
                 val result =
-                    ExtensionJarActivationOrchestrator.activate(operation.candidate) {
+                    ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
+                        val writeResult =
+                            ExtensionJarMetadataWriter.write(
+                                this,
+                                metadata,
+                                ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                            )
                         Files.delete(lease)
-                        "committed"
+                        writeResult
                     }
 
-                assertEquals("committed", result)
+                assertTrue(result.extensionID > 0)
                 assertEquals("new", Files.readString(operation.active))
                 assertEquals(
                     ExtensionActivationJournal.State.FILE_VISIBLE,
@@ -173,6 +195,7 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 )
                 assertFalse(markerPresent(operation.markerKey))
                 assertEquals("new", Files.readString(operation.active))
+                assertTrue(extensionInstalled())
             }
         }
 
@@ -184,7 +207,12 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
 
                 val failure =
                     assertThrows(IllegalArgumentException::class.java) {
-                        ExtensionJarActivationOrchestrator.activate(operation.candidate) {
+                        ExtensionJarActivationOrchestrator.activate(operation.candidate) { metadata ->
+                            ExtensionJarMetadataWriter.write(
+                                this,
+                                metadata,
+                                ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                            )
                             Files.writeString(operation.active, "tampered")
                         }
                     }
@@ -199,6 +227,8 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                         .record.state,
                 )
                 assertFalse(markerPresent(operation.markerKey), "failed transaction marker must roll back")
+                assertFalse(extensionInstalled())
+                assertTrue(installedSourceIDs().isEmpty())
             }
         }
 
@@ -342,6 +372,28 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 .selectAll()
                 .where { ExtensionActivationMarkerTable.markerKey eq markerKey }
                 .any()
+        }
+
+    private fun extensionInstalled(): Boolean =
+        transaction {
+            ExtensionTable
+                .selectAll()
+                .where { ExtensionTable.pkgName eq TARGET_PKG }
+                .single()[ExtensionTable.isInstalled]
+        }
+
+    private fun installedSourceIDs(): List<Long> =
+        transaction {
+            val extensionID =
+                ExtensionTable
+                    .selectAll()
+                    .where { ExtensionTable.pkgName eq TARGET_PKG }
+                    .single()[ExtensionTable.id]
+            SourceTable
+                .selectAll()
+                .where { SourceTable.extension eq extensionID }
+                .map { it[SourceTable.id].value }
+                .sorted()
         }
 
     private fun removeMarker(markerKey: String) {

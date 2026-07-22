@@ -27,6 +27,16 @@ import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 internal object ExtensionJarActivationOrchestrator {
     private val logger = KotlinLogging.logger {}
 
+    /** Canonical authenticated persistence path for future guarded production wiring. */
+    fun activate(
+        candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
+        policy: ExtensionJarMetadataWriter.ExistingArtifactPolicy,
+    ): ExtensionJarMetadataWriter.Result =
+        activate(candidate) { metadata ->
+            ExtensionJarMetadataWriter.write(this, metadata, policy)
+        }
+
+    /** Low-level orchestration seam retained for failure injection and non-production integration tests. */
     fun <T> activate(
         candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
         commitMetadata: JdbcTransaction.(metadata: ActivationMetadata) -> T,
@@ -135,6 +145,7 @@ internal object ExtensionJarActivationOrchestrator {
             sources = java.util.List.copyOf(sources.map { it.copy() }),
             extensionLanguage = extensionLanguage,
             finalUrl = finalUrl,
+            activeJarName = entry.record.activeName,
         )
 
     private fun requireAuthenticated(
@@ -192,5 +203,6 @@ internal object ExtensionJarActivationOrchestrator {
         val sources: List<ExtensionJarShadowValidator.SourceMetadata>,
         val extensionLanguage: String,
         val finalUrl: String,
+        val activeJarName: String,
     )
 }
