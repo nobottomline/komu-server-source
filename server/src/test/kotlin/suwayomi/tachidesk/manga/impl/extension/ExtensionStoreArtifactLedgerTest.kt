@@ -33,6 +33,89 @@ import java.util.UUID
 
 class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
     @Test
+    fun `automatic direct jar ownership fails closed for duplicate packages across stores`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = store(STORE_A, "a".repeat(64))
+                val storeB = store(STORE_B, "b".repeat(64))
+                insertStore(storeA)
+                insertStore(storeB)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(
+                        extension(storeA, 2, listOf(source(201, "A2"))),
+                        extension(storeB, 3, listOf(source(301, "B3"))),
+                    ),
+                    listOf(storeA, storeB),
+                )
+
+                val failure =
+                    assertThrows(AmbiguousExtensionStoreOwnershipException::class.java) {
+                        ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                    }
+                assertTrue(failure.message.orEmpty().contains("2 stores"))
+                assertEquals(2, ExtensionJarPreflightInputRepository.read(TARGET_PKG, STORE_A).expected.versionCode)
+                assertEquals(3, ExtensionJarPreflightInputRepository.read(TARGET_PKG, STORE_B).expected.versionCode)
+            }
+        }
+
+    @Test
+    fun `postflight fence rejects stale generations and newly occupied source ids`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = store(STORE_A, "a".repeat(64))
+                insertStore(storeA)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(storeA, 2, listOf(source(201, "A2")))),
+                    listOf(storeA),
+                )
+
+                val snapshot = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                ExtensionJarPreflightInputRepository.verifyStillCurrent(snapshot, setOf(201))
+
+                insertInstalledExtension(OTHER_PKG, versionCode = 1, sourceID = 201)
+                assertThrows(IllegalStateException::class.java) {
+                    ExtensionJarPreflightInputRepository.verifyStillCurrent(snapshot, setOf(201))
+                }
+
+                transaction {
+                    SourceTable.deleteWhere { SourceTable.id eq 201L }
+                }
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(storeA, 3, listOf(source(301, "A3")))),
+                    listOf(storeA),
+                )
+                assertThrows(StaleExtensionStoreSnapshotException::class.java) {
+                    ExtensionJarPreflightInputRepository.verifyStillCurrent(snapshot, setOf(201))
+                }
+            }
+        }
+
+    @Test
+    fun `postflight fence rejects ownership that becomes ambiguous while jar is inspected`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = store(STORE_A, "a".repeat(64))
+                val storeB = store(STORE_B, "b".repeat(64))
+                insertStore(storeA)
+                insertStore(storeB)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(storeA, 2, listOf(source(201, "A2")))),
+                    listOf(storeA),
+                )
+
+                val snapshot = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(storeB, 3, listOf(source(301, "B3")))),
+                    listOf(storeB),
+                )
+
+                assertThrows(AmbiguousExtensionStoreOwnershipException::class.java) {
+                    ExtensionJarPreflightInputRepository.verifyStillCurrent(snapshot, setOf(201))
+                }
+            }
+        }
+
+    @Test
     fun `ledger keeps active runtime separate and binds each store entry to its fetched signer`() =
         runBlocking {
             withFixtureDatabase {
