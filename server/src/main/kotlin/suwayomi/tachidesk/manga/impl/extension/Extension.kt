@@ -542,7 +542,7 @@ object Extension {
         val report =
             journal.recoverAll(
                 activationDatabaseIdentity(),
-                ::isActivationMarkerPresent,
+                ::activationMarkerOwner,
                 ::removeActivationMarker,
             )
 
@@ -565,6 +565,15 @@ object Extension {
     private fun isActivationMarkerPresent(markerKey: String): Boolean =
         transaction {
             ExtensionActivationMarkerTable.selectAll().where { ExtensionActivationMarkerTable.markerKey eq markerKey }.any()
+        }
+
+    private fun activationMarkerOwner(markerKey: String): String? =
+        transaction {
+            ExtensionActivationMarkerTable
+                .selectAll()
+                .where { ExtensionActivationMarkerTable.markerKey eq markerKey }
+                .singleOrNull()
+                ?.get(ExtensionActivationMarkerTable.packageName)
         }
 
     private fun removeActivationMarker(markerKey: String) {

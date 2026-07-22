@@ -229,7 +229,7 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
                 val report =
                     operation.candidate.journal.recoverAll(
                         DATABASE_IDENTITY,
-                        ::markerPresent,
+                        { markerKey -> TARGET_PKG.takeIf { markerPresent(markerKey) } },
                         ::removeMarker,
                     )
 

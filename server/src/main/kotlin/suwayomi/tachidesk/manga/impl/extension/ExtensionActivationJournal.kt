@@ -239,7 +239,7 @@ internal class ExtensionActivationJournal(
 
     fun recoverAll(
         databaseIdentity: String,
-        isDatabaseCommitted: (markerKey: String) -> Boolean,
+        databaseMarkerOwner: (markerKey: String) -> String?,
         removeDatabaseMarker: (markerKey: String) -> Unit,
     ): RecoveryReport {
         sweepTemporaryJournalFiles()
@@ -251,7 +251,11 @@ internal class ExtensionActivationJournal(
         var rolledBack = 0
         var finalized = 0
         entries.forEach { entry ->
-            if (isDatabaseCommitted(entry.record.markerKey)) {
+            val markerOwner = databaseMarkerOwner(entry.record.markerKey)
+            if (markerOwner != null) {
+                require(markerOwner == entry.record.packageName) {
+                    "Extension activation marker belongs to a different package"
+                }
                 finalizeCommitted(entry)
                 removeDatabaseMarker(entry.record.markerKey)
                 finalized++

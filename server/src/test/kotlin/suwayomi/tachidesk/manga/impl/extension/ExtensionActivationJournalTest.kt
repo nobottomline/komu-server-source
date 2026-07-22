@@ -90,7 +90,7 @@ class ExtensionActivationJournalTest {
             assertEquals(1, results.count { it.exceptionOrNull()?.cause is PendingExtensionActivationException })
             assertEquals(1, journal.loadAll().size)
 
-            journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+            journal.recoverAll(DATABASE_IDENTITY, { null }, {})
             assertTrue(journal.loadAll().isEmpty())
         } finally {
             executor.shutdownNow()
@@ -111,7 +111,7 @@ class ExtensionActivationJournalTest {
 
         assertEquals(1, journal.loadAll().size)
         assertTrue(Files.exists(competing))
-        val report = journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+        val report = journal.recoverAll(DATABASE_IDENTITY, { null }, {})
         assertEquals(1, report.rolledBack)
         assertTrue(journal.loadAll().isEmpty())
     }
@@ -152,7 +152,7 @@ class ExtensionActivationJournalTest {
                 .single()
                 .record.storeTrustBinding,
         )
-        val report = journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+        val report = journal.recoverAll(DATABASE_IDENTITY, { null }, {})
 
         assertEquals(1, report.rolledBack)
         assertTrue(journal.loadAll().isEmpty())
@@ -186,7 +186,7 @@ class ExtensionActivationJournalTest {
         val journal = ExtensionActivationJournal(root)
         journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, old, old)
 
-        val report = journal.recoverAll(DATABASE_IDENTITY, { false }, {})
+        val report = journal.recoverAll(DATABASE_IDENTITY, { null }, {})
 
         assertEquals(1, report.rolledBack)
         assertEquals("old", Files.readString(old))
@@ -203,7 +203,7 @@ class ExtensionActivationJournalTest {
         entry = journal.transition(entry, ExtensionActivationJournal.State.FILE_SWAP_PENDING)
         journal.publish(entry)
 
-        ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { false }, {})
+        ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { null }, {})
 
         assertEquals("old", Files.readString(active))
         assertTrue(journal.loadAll().isEmpty())
@@ -224,7 +224,7 @@ class ExtensionActivationJournalTest {
         val report =
             ExtensionActivationJournal(root).recoverAll(
                 databaseIdentity = DATABASE_IDENTITY,
-                isDatabaseCommitted = markers::contains,
+                databaseMarkerOwner = { markerKey -> PACKAGE_NAME.takeIf { markerKey in markers } },
                 removeDatabaseMarker = markers::remove,
             )
 
@@ -246,7 +246,7 @@ class ExtensionActivationJournalTest {
         journal.publish(entry)
         journal.transition(entry, ExtensionActivationJournal.State.FILE_VISIBLE)
 
-        ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { false }, {})
+        ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { null }, {})
 
         assertEquals("old", Files.readString(previous))
         assertFalse(Files.exists(active))
@@ -264,7 +264,7 @@ class ExtensionActivationJournalTest {
         Files.writeString(active, "tampered")
 
         assertThrows(IllegalStateException::class.java) {
-            ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { false }, {})
+            ExtensionActivationJournal(root).recoverAll(DATABASE_IDENTITY, { null }, {})
         }
 
         assertEquals("tampered", Files.readString(active))
@@ -279,7 +279,7 @@ class ExtensionActivationJournalTest {
         journal.prepare(PACKAGE_NAME, DATABASE_IDENTITY, staged, active, active)
 
         assertThrows(IllegalArgumentException::class.java) {
-            ExtensionActivationJournal(root).recoverAll(OTHER_DATABASE_IDENTITY, { false }, {})
+            ExtensionActivationJournal(root).recoverAll(OTHER_DATABASE_IDENTITY, { null }, {})
         }
 
         assertEquals("old", Files.readString(active))
