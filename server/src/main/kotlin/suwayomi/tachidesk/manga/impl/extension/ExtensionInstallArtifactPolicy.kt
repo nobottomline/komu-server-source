@@ -10,10 +10,9 @@ package suwayomi.tachidesk.manga.impl.extension
 /**
  * Fail-closed artifact selection for the Komu reconciliation line.
  *
- * Upstream direct JAR installation executes repository bytes without binding
- * them to the store signing identity. JAR execution remains a compile-time
- * disabled capability until the Komu verifier, bounded transport and
- * pre-activation pipeline have been ported to this upstream base.
+ * Published direct JARs are available only under an exact process-start
+ * opt-in. External JAR uploads remain outside this capability because they do
+ * not have an authenticated store identity.
  */
 internal object ExtensionInstallArtifactPolicy {
     enum class Kind {
@@ -29,26 +28,35 @@ internal object ExtensionInstallArtifactPolicy {
     fun selectPublishedArtifact(
         apkUrl: String?,
         jarUrl: String?,
+        directJarEnabled: Boolean = publishedDirectJarEnabled(),
     ): Selection {
         val usableApkUrl = apkUrl?.takeIf(String::isNotBlank)
         val usableJarUrl = jarUrl?.takeIf(String::isNotBlank)
 
         return when {
-            DIRECT_JAR_EXECUTION_ENABLED && usableJarUrl != null -> Selection(Kind.DIRECT_JAR, usableJarUrl)
+            directJarEnabled && usableJarUrl != null -> Selection(Kind.DIRECT_JAR, usableJarUrl)
             usableApkUrl != null -> Selection(Kind.APK, usableApkUrl)
             usableJarUrl != null -> throw DirectJarInstallationDisabledException()
             else -> throw IllegalArgumentException("Extension store record has no usable artifact URL")
         }
     }
 
-    fun requireExternalJarExecution() {
-        if (!DIRECT_JAR_EXECUTION_ENABLED) throw DirectJarInstallationDisabledException()
+    fun requireExternalJarExecution(): Nothing =
+        throw DirectJarInstallationDisabledException("External JAR uploads are not authenticated by an extension store")
+
+    internal fun publishedDirectJarEnabled(environment: Map<String, String> = System.getenv()): Boolean {
+        val mode = environment[PUBLISHED_DIRECT_JAR_MODE] ?: return false
+        require(mode == PUBLISHED_DIRECT_JAR_MODE_VALUE) { "Unsupported published direct-JAR mode" }
+        return true
     }
 
-    private const val DIRECT_JAR_EXECUTION_ENABLED = false
+    internal const val PUBLISHED_DIRECT_JAR_MODE = "KOMU_PUBLISHED_DIRECT_JAR_MODE"
+    internal const val PUBLISHED_DIRECT_JAR_MODE_VALUE = "authenticated-v1"
 }
 
-internal class DirectJarInstallationDisabledException :
-    IllegalStateException(
-        "Direct JAR installation is disabled until signer verification and pre-activation validation are available",
-    )
+internal class DirectJarInstallationDisabledException(
+    message: String =
+        "Published direct JAR installation requires " +
+            "${ExtensionInstallArtifactPolicy.PUBLISHED_DIRECT_JAR_MODE}=" +
+            ExtensionInstallArtifactPolicy.PUBLISHED_DIRECT_JAR_MODE_VALUE,
+) : IllegalStateException(message)

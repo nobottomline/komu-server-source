@@ -94,17 +94,17 @@ object Extension {
         return savePath
     }
 
-    suspend fun installExtension(pkgName: String): String = installPublishedExtension(pkgName, forceReinstall = false)
+    suspend fun installExtension(pkgName: String): String = installPublishedExtension(pkgName, PublishedInstallOperation.INSTALL)
 
     private suspend fun installPublishedExtension(
         pkgName: String,
-        forceReinstall: Boolean,
+        operation: PublishedInstallOperation,
     ): String {
         logger.debug { "Installing $pkgName" }
         val extension =
             transaction {
                 ExtensionTable
-                    .select(ExtensionTable.apkUrl, ExtensionTable.jarUrl)
+                    .select(ExtensionTable.apkUrl, ExtensionTable.jarUrl, ExtensionTable.isInstalled)
                     .where { ExtensionTable.pkgName eq pkgName }
                     .firstOrNull()
             } ?: throw NullPointerException("Could not find extension for $pkgName")
@@ -114,15 +114,14 @@ object Extension {
 
         return when (selectedArtifact.kind) {
             ExtensionInstallArtifactPolicy.Kind.DIRECT_JAR -> {
-                installExtension(forceReinstall, InstallOrigin.PUBLISHED_STORE) {
-                    val jar = fetchExtensionFile(selectedArtifact.url)
-                    val manifest = extractAndParseAndroidManifest(jar)
-                    ExtensionPackage.Jar(jar, manifest)
+                if (operation == PublishedInstallOperation.INSTALL && extension[ExtensionTable.isInstalled]) {
+                    return pkgName
                 }
+                installAuthenticatedPublishedJar(pkgName, operation.jarIntent)
             }
 
             ExtensionInstallArtifactPolicy.Kind.APK -> {
-                installExtension(forceReinstall, InstallOrigin.PUBLISHED_STORE) {
+                installExtension(operation.forceReinstall, InstallOrigin.PUBLISHED_STORE) {
                     val apk = fetchExtensionFile(selectedArtifact.url)
                     val packageInfo = getPackageInfo(apk)
                     ExtensionPackage.Apk(apk, packageInfo)
@@ -130,6 +129,27 @@ object Extension {
             }
         }
     }
+
+    private suspend fun installAuthenticatedPublishedJar(
+        pkgName: String,
+        intent: ExtensionJarInstallationCoordinator.Intent,
+    ): String =
+        installMutex.withLock {
+            val extensionsRoot = Path(applicationDirs.extensionsRoot).toAbsolutePath().normalize()
+            extensionsRoot.createDirectories()
+            val outcome =
+                ExtensionJarInstallationCoordinator(
+                    extensionsRoot = extensionsRoot,
+                    databaseIdentity = activationDatabaseIdentity(),
+                ).execute(pkgName, intent)
+            if (!outcome.postCommit.isComplete) {
+                logger.warn {
+                    "Authenticated direct-JAR commit completed with " +
+                        "${outcome.postCommit.failures.size} deferred runtime effect failure(s) for $pkgName"
+                }
+            }
+            pkgName
+        }
 
     private fun copyToExtensionsRoot(
         inputStream: InputStream,
@@ -797,12 +817,12 @@ object Extension {
                 (state[ExtensionTable.apkUrl] != null || state[ExtensionTable.jarUrl] != null),
         ) { "Custom extension $pkgName has no published store artifact" }
 
-        return installPublishedExtension(pkgName, forceReinstall = true)
+        return installPublishedExtension(pkgName, PublishedInstallOperation.REPLACE_CUSTOM)
     }
 
     suspend fun updateExtension(pkgName: String): String {
         check(ExtensionsList.updateMap.containsKey(pkgName)) { "No update is available for $pkgName" }
-        return installPublishedExtension(pkgName, forceReinstall = true)
+        return installPublishedExtension(pkgName, PublishedInstallOperation.UPGRADE)
     }
 
     suspend fun getExtensionIcon(pkgName: String): Pair<InputStream, String> {
@@ -832,5 +852,14 @@ object Extension {
     enum class InstallOrigin {
         PUBLISHED_STORE,
         EXTERNAL_UPLOAD,
+    }
+
+    private enum class PublishedInstallOperation(
+        val forceReinstall: Boolean,
+        val jarIntent: ExtensionJarInstallationCoordinator.Intent,
+    ) {
+        INSTALL(false, ExtensionJarInstallationCoordinator.Intent.INSTALL),
+        UPGRADE(true, ExtensionJarInstallationCoordinator.Intent.UPGRADE),
+        REPLACE_CUSTOM(true, ExtensionJarInstallationCoordinator.Intent.REPLACE_CUSTOM),
     }
 }

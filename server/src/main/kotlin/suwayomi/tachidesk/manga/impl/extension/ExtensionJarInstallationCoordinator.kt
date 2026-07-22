@@ -15,8 +15,9 @@ import java.nio.file.Path
 /**
  * Composes authenticated direct-JAR preflight, durable handoff, activation, and post-commit effects.
  *
- * This coordinator is deliberately not referenced by a production route. The caller must supply the
- * exact extension root and database identity already used by startup recovery.
+ * Existing authenticated extension routes may call this coordinator only after
+ * an explicit runtime capability opt-in. The caller supplies the exact
+ * extension root and database identity already used by startup recovery.
  */
 internal class ExtensionJarInstallationCoordinator(
     extensionsRoot: Path,

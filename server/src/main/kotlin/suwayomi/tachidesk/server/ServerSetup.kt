@@ -43,6 +43,7 @@ import suwayomi.tachidesk.i18n.LocalizationHelper
 import suwayomi.tachidesk.manga.impl.backup.proto.ProtoBackupExport
 import suwayomi.tachidesk.manga.impl.download.DownloadManager
 import suwayomi.tachidesk.manga.impl.extension.Extension
+import suwayomi.tachidesk.manga.impl.extension.ExtensionInstallArtifactPolicy
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
 import suwayomi.tachidesk.manga.impl.extension.NativeArtifactRuntimeProbe
 import suwayomi.tachidesk.manga.impl.extension.NativeArtifactTransportDiagnostic
@@ -269,6 +270,10 @@ fun applicationSetup() {
     setupLogLevelUpdating(serverConfig.debugLogsEnabled, listOf(BASE_LOGGER_NAME))
 
     logger.info { "Running Suwayomi-Server ${BuildConfig.VERSION}" }
+
+    if (ExtensionInstallArtifactPolicy.publishedDirectJarEnabled()) {
+        logger.warn { "Authenticated published direct-JAR installation is explicitly enabled" }
+    }
 
     if (EmbeddedRuntimePlatform.isIOS()) {
         val nativeArtifactStatus = NativeArtifactRuntimeProbe.probe()

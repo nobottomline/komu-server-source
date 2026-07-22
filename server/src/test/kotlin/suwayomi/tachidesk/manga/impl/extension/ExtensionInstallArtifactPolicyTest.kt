@@ -11,6 +11,7 @@ class ExtensionInstallArtifactPolicyTest {
             ExtensionInstallArtifactPolicy.selectPublishedArtifact(
                 apkUrl = APK_URL,
                 jarUrl = JAR_URL,
+                directJarEnabled = false,
             )
 
         assertEquals(ExtensionInstallArtifactPolicy.Kind.APK, selection.kind)
@@ -23,6 +24,7 @@ class ExtensionInstallArtifactPolicyTest {
             ExtensionInstallArtifactPolicy.selectPublishedArtifact(
                 apkUrl = APK_URL,
                 jarUrl = null,
+                directJarEnabled = false,
             )
 
         assertEquals(ExtensionInstallArtifactPolicy.Kind.APK, selection.kind)
@@ -35,6 +37,39 @@ class ExtensionInstallArtifactPolicyTest {
             ExtensionInstallArtifactPolicy.selectPublishedArtifact(
                 apkUrl = null,
                 jarUrl = JAR_URL,
+                directJarEnabled = false,
+            )
+        }
+    }
+
+    @Test
+    fun `exact opt-in selects published JAR ahead of compatibility APK`() {
+        val selection =
+            ExtensionInstallArtifactPolicy.selectPublishedArtifact(
+                apkUrl = APK_URL,
+                jarUrl = JAR_URL,
+                directJarEnabled = true,
+            )
+
+        assertEquals(ExtensionInstallArtifactPolicy.Kind.DIRECT_JAR, selection.kind)
+        assertEquals(JAR_URL, selection.url)
+    }
+
+    @Test
+    fun `published mode is absent by default and rejects unsupported values`() {
+        assertEquals(false, ExtensionInstallArtifactPolicy.publishedDirectJarEnabled(emptyMap()))
+        assertEquals(
+            true,
+            ExtensionInstallArtifactPolicy.publishedDirectJarEnabled(
+                mapOf(
+                    ExtensionInstallArtifactPolicy.PUBLISHED_DIRECT_JAR_MODE to
+                        ExtensionInstallArtifactPolicy.PUBLISHED_DIRECT_JAR_MODE_VALUE,
+                ),
+            ),
+        )
+        assertFailsWith<IllegalArgumentException> {
+            ExtensionInstallArtifactPolicy.publishedDirectJarEnabled(
+                mapOf(ExtensionInstallArtifactPolicy.PUBLISHED_DIRECT_JAR_MODE to "true"),
             )
         }
     }
@@ -52,6 +87,7 @@ class ExtensionInstallArtifactPolicyTest {
             ExtensionInstallArtifactPolicy.selectPublishedArtifact(
                 apkUrl = " ",
                 jarUrl = "",
+                directJarEnabled = false,
             )
         }
     }

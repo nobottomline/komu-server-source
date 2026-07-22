@@ -29,8 +29,11 @@ import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
+import suwayomi.tachidesk.server.ApplicationDirs
 import suwayomi.tachidesk.server.ServerConfig
 import suwayomi.tachidesk.test.ApplicationTest
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.UUID
@@ -128,6 +131,47 @@ class ExtensionJarInstallationRealArtifactTest : ApplicationTest() {
             assertTrue(Files.list(extensionsRoot).use { it.toList() }.isEmpty())
         }
 
+    @Test
+    fun `published install entrypoint routes pinned JAR through authenticated coordinator`() =
+        runBlocking {
+            assumeTrue(
+                System.getenv(PinnedKeiyoushiRealArtifact.NETWORK_ENVIRONMENT) == "1",
+                "Pinned Keiyoushi network fixture is not enabled",
+            )
+            assumeTrue(
+                ExtensionInstallArtifactPolicy.publishedDirectJarEnabled(),
+                "Published direct-JAR mode is not enabled",
+            )
+            val fixture = PinnedKeiyoushiRealArtifact.load()
+            val applicationExtensionsRoot =
+                Path.of(Injekt.get<ApplicationDirs>().extensionsRoot).toAbsolutePath().normalize()
+            Files.createDirectories(applicationExtensionsRoot)
+            val active = applicationExtensionsRoot.resolve("${PinnedKeiyoushiRealArtifact.PACKAGE_NAME}.jar")
+
+            PackageTools.closeExtensionClassLoader(active)
+            GetSource.unregisterSource(PinnedKeiyoushiRealArtifact.SOURCE_ID)
+            Files.deleteIfExists(active)
+            try {
+                withFixtureDatabase {
+                    seedStore(fixture)
+
+                    assertEquals(
+                        PinnedKeiyoushiRealArtifact.PACKAGE_NAME,
+                        Extension.installExtension(PinnedKeiyoushiRealArtifact.PACKAGE_NAME),
+                    )
+
+                    assertCommittedArtifact(active)
+                    assertCommittedDatabase()
+                    assertNoRecoveryResidue(applicationExtensionsRoot)
+                    assertSourceIdentity(loadPinnedSource(active, installedClassName()))
+                }
+            } finally {
+                PackageTools.closeExtensionClassLoader(active)
+                GetSource.unregisterSource(PinnedKeiyoushiRealArtifact.SOURCE_ID)
+                Files.deleteIfExists(active)
+            }
+        }
+
     private fun coordinator(transport: CopyingPinnedTransport) =
         ExtensionJarInstallationCoordinator(
             extensionsRoot = extensionsRoot,
@@ -201,8 +245,8 @@ class ExtensionJarInstallationRealArtifactTest : ApplicationTest() {
         assertEquals(PinnedKeiyoushiRealArtifact.SOURCE_HOME_URL, (source as HttpSource).baseUrl)
     }
 
-    private fun assertNoRecoveryResidue() {
-        assertTrue(ExtensionActivationJournal(extensionsRoot).loadAll().isEmpty())
+    private fun assertNoRecoveryResidue(root: Path = extensionsRoot) {
+        assertTrue(ExtensionActivationJournal(root).loadAll().isEmpty())
         assertTrue(
             transaction {
                 ExtensionActivationMarkerTable.selectAll().none()
