@@ -20,8 +20,8 @@ import java.util.UUID
  * Database half of authenticated JAR publication.
  *
  * The caller must already have made [activeArtifact] visible through an authenticated activation
- * journal. Filesystem ownership transfer deliberately remains outside this boundary until the
- * final activation orchestrator is wired.
+ * journal. [ExtensionJarActivationOrchestrator] owns the cross-resource ordering; this object owns
+ * only the exact serializable metadata-and-marker transaction.
  */
 internal object ExtensionJarPublishAuthorization {
     fun <T> commit(
