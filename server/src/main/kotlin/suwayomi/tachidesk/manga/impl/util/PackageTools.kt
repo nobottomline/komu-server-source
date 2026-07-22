@@ -26,6 +26,7 @@ import xyz.nulldev.androidcompat.pm.toPackageInfo
 import java.net.URL
 import java.net.URLClassLoader
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
@@ -147,7 +148,16 @@ object PackageTools {
         }
     }
 
-    val jarLoaderMap = mutableMapOf<String, URLClassLoader>()
+    val jarLoaderMap = ConcurrentHashMap<String, URLClassLoader>()
+
+    /** Closes one exact cached loader and retains it for retry when close fails. */
+    fun closeExtensionClassLoader(jar: Path): Boolean =
+        ExtensionRuntimeRegistry.withLock {
+            val key = jar.toAbsolutePath().normalize().toString()
+            val loader = jarLoaderMap[key] ?: return@withLock false
+            loader.close()
+            jarLoaderMap.remove(key, loader)
+        }
 
     /**
      * loads the extension main class called [className] from the jar located at [jarPath]
@@ -156,18 +166,20 @@ object PackageTools {
     fun loadExtensionSources(
         jar: Path,
         className: String,
-    ): Any {
-        try {
-            logger.debug { "loading jar with path: ${jar.absolutePathString()}" }
-            val classLoader = jarLoaderMap[jar.absolutePathString()] ?: ChildFirstURLClassLoader(arrayOf<URL>(jar.toUri().toURL()))
-            val classToLoad = Class.forName(className, false, classLoader)
+    ): Any =
+        ExtensionRuntimeRegistry.withLock {
+            try {
+                val key = jar.toAbsolutePath().normalize().toString()
+                logger.debug { "loading jar with path: $key" }
+                val classLoader = jarLoaderMap[key] ?: ChildFirstURLClassLoader(arrayOf<URL>(jar.toUri().toURL()))
+                val classToLoad = Class.forName(className, false, classLoader)
 
-            jarLoaderMap[jar.absolutePathString()] = classLoader
+                jarLoaderMap[key] = classLoader
 
-            return classToLoad.getDeclaredConstructor().newInstance()
-        } catch (e: Exception) {
-            logger.error(e) { "Failed to load jar with path: ${jar.absolutePathString()}" }
-            throw e
+                classToLoad.getDeclaredConstructor().newInstance()
+            } catch (e: Exception) {
+                logger.error(e) { "Failed to load jar with path: ${jar.absolutePathString()}" }
+                throw e
+            }
         }
-    }
 }

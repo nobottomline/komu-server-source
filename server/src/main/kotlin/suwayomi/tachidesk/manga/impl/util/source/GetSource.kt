@@ -14,6 +14,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import suwayomi.tachidesk.manga.impl.util.ExtensionRuntimeRegistry
 import suwayomi.tachidesk.manga.impl.util.PackageTools.loadExtensionSources
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
@@ -29,7 +30,12 @@ object GetSource {
     private val sourceCache = ConcurrentHashMap<Long, Source>()
     private val applicationDirs: ApplicationDirs by injectLazy()
 
-    private fun getSource(sourceId: Long): Source? {
+    private fun getSource(sourceId: Long): Source? =
+        ExtensionRuntimeRegistry.withLock {
+            getSourceLocked(sourceId)
+        }
+
+    private fun getSourceLocked(sourceId: Long): Source? {
         val cachedResult: Source? = sourceCache[sourceId]
         if (cachedResult != null) {
             return cachedResult
@@ -74,16 +80,22 @@ object GetSource {
     fun getSourceOrStub(sourceId: Long): Source = getSourceOrNull(sourceId) ?: StubSource(sourceId)
 
     fun registerSource(sourcePair: Pair<Long, Source>) {
-        sourceCache += sourcePair
+        ExtensionRuntimeRegistry.withLock {
+            sourceCache += sourcePair
+        }
     }
 
     fun unregisterSource(sourceId: Long) {
-        sourceCache.remove(sourceId)
+        ExtensionRuntimeRegistry.withLock {
+            sourceCache.remove(sourceId)
+        }
     }
 
     fun unregisterAllSources() {
-        (sourceCache - 0L).forEach { (id, _) ->
-            sourceCache.remove(id)
+        ExtensionRuntimeRegistry.withLock {
+            (sourceCache - 0L).forEach { (id, _) ->
+                sourceCache.remove(id)
+            }
         }
     }
 }

@@ -94,6 +94,44 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
         }
 
     @Test
+    fun `runtime hook failure after commit cannot roll back authenticated activation`() =
+        runBlocking {
+            withFixtureDatabase {
+                val operation = prepareOperation()
+                var hookCalled = false
+
+                val result =
+                    ExtensionJarActivationOrchestrator.activate(
+                        operation.candidate,
+                        ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                    ) {
+                        hookCalled = true
+                        assertTrue(markerPresent(operation.markerKey), "commit marker must exist before runtime effects")
+                        assertEquals("new", Files.readString(operation.active))
+                        assertEquals(
+                            ExtensionActivationJournal.State.FILE_VISIBLE,
+                            operation.candidate.journal
+                                .loadAll()
+                                .single()
+                                .record.state,
+                        )
+                        throw IllegalStateException("runtime cleanup rejected")
+                    }
+
+                assertTrue(hookCalled)
+                assertTrue(result.extensionID > 0)
+                assertTrue(extensionInstalled())
+                assertEquals("new", Files.readString(operation.active))
+                assertTrue(
+                    operation.candidate.journal
+                        .loadAll()
+                        .isEmpty(),
+                )
+                assertFalse(markerPresent(operation.markerKey))
+            }
+        }
+
+    @Test
     fun `metadata failure restores same-path old-good artifact and rolls back marker`() =
         runBlocking {
             withFixtureDatabase {

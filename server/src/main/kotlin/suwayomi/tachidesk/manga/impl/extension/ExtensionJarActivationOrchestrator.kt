@@ -31,15 +31,30 @@ internal object ExtensionJarActivationOrchestrator {
     fun activate(
         candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
         policy: ExtensionJarMetadataWriter.ExistingArtifactPolicy,
+    ): ExtensionJarMetadataWriter.Result = activate(candidate, policy) {}
+
+    /** Runs non-durable runtime effects after DB commit but before retired artifact cleanup. */
+    fun activate(
+        candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
+        policy: ExtensionJarMetadataWriter.ExistingArtifactPolicy,
+        afterDatabaseCommit: (ExtensionJarMetadataWriter.Result) -> Unit,
     ): ExtensionJarMetadataWriter.Result =
-        activate(candidate) { metadata ->
-            ExtensionJarMetadataWriter.write(this, metadata, policy)
-        }
+        activateInternal(
+            candidate = candidate,
+            commitMetadata = { metadata -> ExtensionJarMetadataWriter.write(this, metadata, policy) },
+            afterDatabaseCommit = afterDatabaseCommit,
+        )
 
     /** Low-level orchestration seam retained for failure injection and non-production integration tests. */
     fun <T> activate(
         candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
         commitMetadata: JdbcTransaction.(metadata: ActivationMetadata) -> T,
+    ): T = activateInternal(candidate, commitMetadata) {}
+
+    private fun <T> activateInternal(
+        candidate: ExtensionJarPreflightCoordinator.JournaledCandidate,
+        commitMetadata: JdbcTransaction.(metadata: ActivationMetadata) -> T,
+        afterDatabaseCommit: (T) -> Unit,
     ): T {
         val journal = candidate.journal
         var entry = candidate.entry
@@ -60,6 +75,13 @@ internal object ExtensionJarActivationOrchestrator {
                         it[packageName] = metadata.expected.pkgName
                     }
                     committedMetadata
+                }
+
+            runCatching { afterDatabaseCommit(result) }
+                .onFailure { failure ->
+                    logger.warn(failure) {
+                        "Authenticated extension ${entry.record.packageName} committed; runtime effects reported failure"
+                    }
                 }
 
             // The transaction marker is authoritative from this point. Cleanup is retryable
