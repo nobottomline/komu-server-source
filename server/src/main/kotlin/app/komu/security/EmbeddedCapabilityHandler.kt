@@ -5,6 +5,7 @@ import org.eclipse.jetty.io.Content
 import org.eclipse.jetty.server.Handler
 import org.eclipse.jetty.server.Request
 import org.eclipse.jetty.server.Response
+import org.eclipse.jetty.server.Server
 import org.eclipse.jetty.util.Callback
 
 /**
@@ -32,7 +33,26 @@ internal class EmbeddedCapabilityHandler(
         return true
     }
 
-    private companion object {
-        const val UNAUTHORIZED_BODY = "Unauthorized"
+    companion object {
+        private const val UNAUTHORIZED_BODY = "Unauthorized"
+
+        /**
+         * Installs the capability check above every handler already supplied by
+         * Javalin/Jetty. Javalin can then attach its servlet to the preserved
+         * inner wrapper while this boundary remains the server root.
+         */
+        fun installAsServerRoot(
+            server: Server,
+            isAuthorized: (String?) -> Boolean,
+        ) {
+            check(server.handler !is EmbeddedCapabilityHandler) {
+                "Embedded capability boundary was already installed"
+            }
+            val existingRoot = server.handler
+            server.handler =
+                EmbeddedCapabilityHandler(isAuthorized).apply {
+                    handler = existingRoot
+                }
+        }
     }
 }

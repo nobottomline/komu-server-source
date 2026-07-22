@@ -1,13 +1,7 @@
 package app.komu.security
 
-import org.eclipse.jetty.http.HttpHeader
-import org.eclipse.jetty.io.Content
-import org.eclipse.jetty.server.Handler
-import org.eclipse.jetty.server.Request
-import org.eclipse.jetty.server.Response
-import org.eclipse.jetty.server.Server
+import io.javalin.Javalin
 import org.eclipse.jetty.server.ServerConnector
-import org.eclipse.jetty.util.Callback
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -50,34 +44,22 @@ class EmbeddedSessionCapabilityTest {
     @Test
     fun `jetty boundary returns the same generic 401 before any endpoint`() {
         val capability = SessionCapability.fromBootstrapToken(token)
-        val server = Server()
-        val connector =
-            ServerConnector(server).apply {
-                host = "127.0.0.1"
-                port = 0
-            }
-        server.addConnector(connector)
-
-        val terminal =
-            object : Handler.Abstract() {
-                override fun handle(
-                    request: Request,
-                    response: Response,
-                    callback: Callback,
-                ): Boolean {
-                    response.status = 200
-                    response.headers.put(HttpHeader.CONTENT_TYPE, "text/plain; charset=utf-8")
-                    Content.Sink.write(response, true, "protected-content", callback)
-                    return true
+        val server =
+            Javalin.start { config ->
+                config.jetty.modifyServer { jetty ->
+                    jetty.addConnector(
+                        ServerConnector(jetty).apply {
+                            host = "127.0.0.1"
+                            port = 0
+                        },
+                    )
+                    EmbeddedCapabilityHandler.installAsServerRoot(jetty, capability::matches)
                 }
+                config.routes.get("/api/v1/private") { context -> context.result("protected-content") }
             }
-        val boundary = EmbeddedCapabilityHandler(capability::matches)
-        boundary.handler = terminal
-        server.handler = boundary
-        server.start()
 
         try {
-            val endpoint = URI("http://127.0.0.1:${connector.localPort}/api/v1/private")
+            val endpoint = URI("http://127.0.0.1:${server.port()}/api/v1/private")
             val client = HttpClient.newHttpClient()
 
             val missing = client.send(request(endpoint), HttpResponse.BodyHandlers.ofString())
@@ -100,7 +82,6 @@ class EmbeddedSessionCapabilityTest {
             assertEquals("protected-content", authorized.body())
         } finally {
             server.stop()
-            server.join()
         }
     }
 

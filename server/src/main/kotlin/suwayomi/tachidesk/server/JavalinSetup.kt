@@ -84,13 +84,10 @@ object JavalinSetup {
                 config.jetty.modifyServer { server ->
                     if (EmbeddedSessionCapability.isRequired) {
                         EmbeddedSessionCapability.requireInstalled()
-                        check(server.handler == null) {
-                            "Embedded capability boundary must be the outermost Jetty handler"
-                        }
-                        server.handler =
-                            EmbeddedCapabilityHandler(
-                                EmbeddedSessionCapability::isAuthorized,
-                            )
+                        EmbeddedCapabilityHandler.installAsServerRoot(
+                            server,
+                            EmbeddedSessionCapability::isAuthorized,
+                        )
                     }
                     if (!connectorAdded) {
                         val connector =
