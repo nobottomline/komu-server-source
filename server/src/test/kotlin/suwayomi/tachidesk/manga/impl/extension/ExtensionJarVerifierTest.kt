@@ -25,7 +25,7 @@ class ExtensionJarVerifierTest {
         val jarPath = createUnsignedJar("example/Unsigned.class")
 
         assertFailsWith<SecurityException> {
-            ExtensionJarVerifier.verify(jarPath, KEIYOUSHI_SIGNING_KEY)
+            ExtensionJarVerifier.verify(jarPath, PinnedKeiyoushiRealArtifact.SIGNING_KEY)
         }
     }
 
@@ -46,7 +46,7 @@ class ExtensionJarVerifierTest {
         }
 
         assertFailsWith<IllegalArgumentException> {
-            ExtensionJarVerifier.verify(jarPath, KEIYOUSHI_SIGNING_KEY)
+            ExtensionJarVerifier.verify(jarPath, PinnedKeiyoushiRealArtifact.SIGNING_KEY)
         }
     }
 
@@ -55,7 +55,7 @@ class ExtensionJarVerifierTest {
         val jarPath = createUnsignedJar("example/../Escaped.class")
 
         assertFailsWith<IllegalArgumentException> {
-            ExtensionJarVerifier.verify(jarPath, KEIYOUSHI_SIGNING_KEY)
+            ExtensionJarVerifier.verify(jarPath, PinnedKeiyoushiRealArtifact.SIGNING_KEY)
         }
     }
 
@@ -68,7 +68,7 @@ class ExtensionJarVerifierTest {
         }
 
         assertFailsWith<IllegalArgumentException> {
-            ExtensionJarVerifier.verify(jarPath, KEIYOUSHI_SIGNING_KEY)
+            ExtensionJarVerifier.verify(jarPath, PinnedKeiyoushiRealArtifact.SIGNING_KEY)
         }
     }
 
@@ -80,24 +80,24 @@ class ExtensionJarVerifierTest {
             .onFailure { assumeTrue(false, "Symbolic links are unavailable: ${it.message}") }
 
         assertFailsWith<IllegalArgumentException> {
-            ExtensionJarVerifier.verify(link, KEIYOUSHI_SIGNING_KEY)
+            ExtensionJarVerifier.verify(link, PinnedKeiyoushiRealArtifact.SIGNING_KEY)
         }
     }
 
     @Test
     fun `signed Keiyoushi repository jar verifies against pinned store key`() {
-        val jarPath = findKeiyoushiJar()
+        val jarPath = PinnedKeiyoushiRealArtifact.load().jar
 
-        val result = ExtensionJarVerifier.verify(jarPath, KEIYOUSHI_SIGNING_KEY.uppercase())
+        val result = ExtensionJarVerifier.verify(jarPath, PinnedKeiyoushiRealArtifact.SIGNING_KEY.uppercase())
 
-        assertEquals(KEIYOUSHI_SIGNING_KEY, result.signerFingerprint)
+        assertEquals(PinnedKeiyoushiRealArtifact.SIGNING_KEY, result.signerFingerprint)
         assertTrue(result.verifiedEntries > 10)
         assertTrue(result.uncompressedBytes > 0)
     }
 
     @Test
     fun `signed Keiyoushi repository jar is rejected for another key`() {
-        val jarPath = findKeiyoushiJar()
+        val jarPath = PinnedKeiyoushiRealArtifact.load().jar
 
         assertFailsWith<SecurityException> {
             ExtensionJarVerifier.verify(jarPath, "0".repeat(64))
@@ -106,10 +106,11 @@ class ExtensionJarVerifierTest {
 
     @Test
     fun `authenticated entry result is an immutable defensive snapshot`() {
+        val jarPath = PinnedKeiyoushiRealArtifact.load().jar
         val authenticated =
             ExtensionJarVerifier.verifyAndRead(
-                jarPath = findKeiyoushiJar(),
-                expectedSigningKey = KEIYOUSHI_SIGNING_KEY,
+                jarPath = jarPath,
+                expectedSigningKey = PinnedKeiyoushiRealArtifact.SIGNING_KEY,
                 entryName = "AndroidManifest.xml",
                 entrySizeLimit = ExtensionJarManifestParser.MAX_MANIFEST_BYTES.toLong(),
             )
@@ -135,29 +136,7 @@ class ExtensionJarVerifierTest {
         return jarPath
     }
 
-    private fun findKeiyoushiJar(): Path {
-        val repoDirectory =
-            System.getProperty("komu.keiyoushiRepoDir")
-                ?: System.getenv("KOMU_KEIYOUSHI_REPO_DIR")
-        assumeTrue(!repoDirectory.isNullOrBlank(), "Keiyoushi repository path is not configured")
-
-        val jarDirectory = Path.of(repoDirectory).resolve("jar")
-        assumeTrue(Files.isDirectory(jarDirectory), "Keiyoushi repository has no JAR directory")
-        val jarPath =
-            Files.list(jarDirectory).use { paths ->
-                paths
-                    .filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".jar") }
-                    .sorted()
-                    .findFirst()
-                    .orElse(null)
-            }
-        assumeTrue(jarPath != null, "Keiyoushi repository has no signed JAR fixture")
-        return jarPath
-    }
-
     private companion object {
-        const val KEIYOUSHI_SIGNING_KEY =
-            "9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2"
         const val MAX_ARCHIVE_BYTES = 32L * 1024L * 1024L
     }
 }
