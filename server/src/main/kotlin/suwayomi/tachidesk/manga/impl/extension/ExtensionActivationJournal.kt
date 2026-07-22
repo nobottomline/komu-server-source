@@ -366,6 +366,12 @@ internal class ExtensionActivationJournal(
         }
     }
 
+    /** Fences a cross-component handoff against a stale in-memory entry or lost package lease. */
+    fun requireCurrentOwnership(entry: Entry) {
+        requirePackageLease(entry)
+        require(load(entry.path).record == entry.record) { "Extension activation journal changed during handoff" }
+    }
+
     private fun packageLeasePath(packageName: String): Path =
         journalRoot.resolve("$LEASE_PREFIX${sha256(packageName.toByteArray(StandardCharsets.UTF_8))}$LEASE_SUFFIX")
 

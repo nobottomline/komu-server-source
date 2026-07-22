@@ -19,19 +19,26 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionInfo
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionSource
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionStore
+import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreEntryTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ServerConfig
 import suwayomi.tachidesk.test.ApplicationTest
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.UUID
 
 class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
+    @TempDir
+    lateinit var temporaryDirectory: Path
+
     @Test
     fun `automatic direct jar ownership fails closed for duplicate packages across stores`() =
         runBlocking {
@@ -254,6 +261,189 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
             }
         }
 
+    @Test
+    fun `publish authorization atomically commits metadata with the expected marker`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+
+                val result =
+                    ExtensionJarPublishAuthorization.commit(publication.entry) { markerKey ->
+                        ExtensionActivationMarkerTable.insert {
+                            it[ExtensionActivationMarkerTable.markerKey] = markerKey
+                            it[packageName] = TARGET_PKG
+                        }
+                        "committed"
+                    }
+
+                assertEquals("committed", result)
+                assertTrue(markerPresent(expectedMarker))
+            }
+        }
+
+    @Test
+    fun `publish authorization requires one visible authenticated journal operation`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val preparedEntry =
+                    publication.entry.copy(
+                        record = publication.entry.record.copy(state = ExtensionActivationJournal.State.PREPARED),
+                    )
+                val legacyEntry =
+                    publication.entry.copy(
+                        record = publication.entry.record.copy(storeTrustBinding = null),
+                    )
+
+                assertThrows(IllegalStateException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(preparedEntry) { error("callback must not run") }
+                }
+                assertThrows(SecurityException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(legacyEntry) { error("callback must not run") }
+                }
+            }
+        }
+
+    @Test
+    fun `publish authorization rejects a visible journal that lost its package lease`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val lease =
+                    Files.list(publication.entry.path.parent).use { paths ->
+                        paths
+                            .filter { it.fileName.toString().endsWith(".lock") }
+                            .findFirst()
+                            .orElseThrow()
+                    }
+                Files.delete(lease)
+                var callbackCalled = false
+
+                assertThrows(IllegalArgumentException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) {
+                        callbackCalled = true
+                    }
+                }
+                assertFalse(callbackCalled)
+            }
+        }
+
+    @Test
+    fun `publish authorization rolls back callback writes when expected marker is missing`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+
+                assertThrows(IllegalStateException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) {
+                        ExtensionActivationMarkerTable.insert {
+                            it[markerKey] = OTHER_MARKER_KEY
+                            it[packageName] = TARGET_PKG
+                        }
+                    }
+                }
+
+                assertFalse(markerPresent(expectedMarker))
+                assertFalse(markerPresent(OTHER_MARKER_KEY), "the entire metadata callback transaction must roll back")
+            }
+        }
+
+    @Test
+    fun `publish authorization rejects an expected marker owned by another package`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+
+                assertThrows(IllegalStateException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) { markerKey ->
+                        ExtensionActivationMarkerTable.insert {
+                            it[ExtensionActivationMarkerTable.markerKey] = markerKey
+                            it[packageName] = OTHER_PKG
+                        }
+                    }
+                }
+
+                assertFalse(markerPresent(expectedMarker), "a marker for the wrong package must be rolled back")
+            }
+        }
+
+    @Test
+    fun `publish authorization rejects a stale store generation before metadata callback`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+                val storeA = store(STORE_A, "a".repeat(64))
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(storeA, 3, listOf(source(301, "A3")))),
+                    listOf(storeA),
+                )
+                var callbackCalled = false
+
+                assertThrows(StaleExtensionStoreSnapshotException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) {
+                        callbackCalled = true
+                    }
+                }
+
+                assertFalse(callbackCalled)
+                assertFalse(markerPresent(expectedMarker))
+            }
+        }
+
+    @Test
+    fun `publish authorization rejects newly occupied source ids`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+                insertInstalledExtension(OTHER_PKG, versionCode = 1, sourceID = 201)
+
+                assertThrows(IllegalStateException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) { markerKey ->
+                        ExtensionActivationMarkerTable.insert {
+                            it[ExtensionActivationMarkerTable.markerKey] = markerKey
+                            it[packageName] = TARGET_PKG
+                        }
+                    }
+                }
+
+                assertFalse(markerPresent(expectedMarker))
+            }
+        }
+
+    @Test
+    fun `publish authorization rolls back metadata if active bytes change during callback`() =
+        runBlocking {
+            withFixtureDatabase {
+                val snapshot = prepareUniqueStoreSnapshot()
+                val publication = prepareVisiblePublication(snapshot, "authenticated candidate")
+                val expectedMarker = publication.entry.record.markerKey
+
+                assertThrows(IllegalArgumentException::class.java) {
+                    ExtensionJarPublishAuthorization.commit(publication.entry) { markerKey ->
+                        ExtensionActivationMarkerTable.insert {
+                            it[ExtensionActivationMarkerTable.markerKey] = markerKey
+                            it[packageName] = TARGET_PKG
+                        }
+                        Files.writeString(publication.activeArtifact, "tampered")
+                    }
+                }
+
+                assertFalse(markerPresent(expectedMarker), "integrity failure must roll back the metadata marker")
+            }
+        }
+
     private suspend fun withFixtureDatabase(block: suspend () -> Unit) {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
         val fixtureDatabase =
@@ -296,6 +486,71 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
             }
         }
     }
+
+    private suspend fun prepareUniqueStoreSnapshot(): ExtensionJarPreflightInputSnapshot {
+        val storeA = store(STORE_A, "a".repeat(64))
+        insertStore(storeA)
+        ExtensionsList.reconcileExtensionDatabase(
+            listOf(extension(storeA, 2, listOf(source(201, "A2")))),
+            listOf(storeA),
+        )
+        return ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+    }
+
+    private fun prepareVisiblePublication(
+        snapshot: ExtensionJarPreflightInputSnapshot,
+        content: String,
+    ): VisiblePublication {
+        val extensionsRoot = temporaryDirectory.resolve(UUID.randomUUID().toString())
+        Files.createDirectories(extensionsRoot)
+        val stagedArtifact = Files.writeString(extensionsRoot.resolve("candidate.jar"), content)
+        val activeArtifact = extensionsRoot.resolve("active.jar")
+        val binding = authenticatedBinding(snapshot, stagedArtifact)
+        val journal = ExtensionActivationJournal(extensionsRoot)
+        var entry =
+            journal.prepareAuthenticated(
+                packageName = snapshot.expected.pkgName,
+                databaseIdentity = "c".repeat(64),
+                stagedArtifact = stagedArtifact,
+                activeArtifact = activeArtifact,
+                previousArtifact = null,
+                storeTrustBinding = binding,
+            )
+        entry = journal.transition(entry, ExtensionActivationJournal.State.FILE_SWAP_PENDING)
+        journal.publish(entry)
+        entry = journal.transition(entry, ExtensionActivationJournal.State.FILE_VISIBLE)
+        return VisiblePublication(entry, activeArtifact)
+    }
+
+    private fun authenticatedBinding(
+        snapshot: ExtensionJarPreflightInputSnapshot,
+        activeArtifact: Path,
+    ) = ExtensionActivationJournal.AuthenticatedStoreBinding(
+        packageName = snapshot.expected.pkgName,
+        ledgerEntryID = snapshot.ledgerEntryID,
+        storeSnapshotToken = snapshot.storeSnapshotToken,
+        storeIndexUrl = snapshot.expected.storeIndexUrl,
+        storeSigningKey = snapshot.expectedSigningKey,
+        candidateSize = Files.size(activeArtifact),
+        candidateSha256 = StagedArtifact.sha256(activeArtifact, StagedArtifact.DEFAULT_MAX_ARTIFACT_BYTES),
+        sourceIDs =
+            snapshot.expected.sources
+                .map { it.id }
+                .sorted(),
+    )
+
+    private fun markerPresent(markerKey: String): Boolean =
+        transaction {
+            ExtensionActivationMarkerTable
+                .selectAll()
+                .where { ExtensionActivationMarkerTable.markerKey eq markerKey }
+                .any()
+        }
+
+    private data class VisiblePublication(
+        val entry: ExtensionActivationJournal.Entry,
+        val activeArtifact: Path,
+    )
 
     private fun insertInstalledExtension(
         packageName: String,
@@ -376,5 +631,6 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
         const val TARGET_PKG = "app.komu.fixture.target"
         const val OTHER_PKG = "app.komu.fixture.other"
         const val B_ONLY_PKG = "app.komu.fixture.storeb"
+        const val OTHER_MARKER_KEY = "komu.extension.activation.123e4567-e89b-12d3-a456-426614174002"
     }
 }

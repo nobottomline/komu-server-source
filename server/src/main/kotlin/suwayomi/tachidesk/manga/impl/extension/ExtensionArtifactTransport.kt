@@ -66,14 +66,7 @@ internal class StagedArtifact internal constructor(
     private val closed = AtomicBoolean(false)
 
     fun assertIntegrity(maximumBytes: Long = DEFAULT_MAX_ARTIFACT_BYTES) {
-        require(maximumBytes in 1..DEFAULT_MAX_ARTIFACT_BYTES) { "Artifact integrity limit is invalid" }
-        require(size in 1..maximumBytes) { "Staged extension artifact has an invalid recorded size" }
-        require(SHA256_HEX.matches(sha256)) { "Staged extension artifact has an invalid recorded digest" }
-        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) { "Staged extension artifact is not a regular file" }
-        require(Files.size(path) == size) { "Staged extension artifact size changed" }
-        if (sha256(path, maximumBytes) != sha256) {
-            throw SecurityException("Staged extension artifact digest changed")
-        }
+        assertIntegrity(path, size, sha256, maximumBytes)
     }
 
     override fun close() {
@@ -83,6 +76,22 @@ internal class StagedArtifact internal constructor(
     companion object {
         const val DEFAULT_MAX_ARTIFACT_BYTES = 32L * 1024L * 1024L
         private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
+
+        internal fun assertIntegrity(
+            path: Path,
+            expectedSize: Long,
+            expectedSha256: String,
+            maximumBytes: Long = DEFAULT_MAX_ARTIFACT_BYTES,
+        ) {
+            require(maximumBytes in 1..DEFAULT_MAX_ARTIFACT_BYTES) { "Artifact integrity limit is invalid" }
+            require(expectedSize in 1..maximumBytes) { "Extension artifact has an invalid recorded size" }
+            require(SHA256_HEX.matches(expectedSha256)) { "Extension artifact has an invalid recorded digest" }
+            require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) { "Extension artifact is not a regular file" }
+            require(Files.size(path) == expectedSize) { "Extension artifact size changed" }
+            if (sha256(path, maximumBytes) != expectedSha256) {
+                throw SecurityException("Extension artifact digest changed")
+            }
+        }
 
         internal fun sha256(
             path: Path,

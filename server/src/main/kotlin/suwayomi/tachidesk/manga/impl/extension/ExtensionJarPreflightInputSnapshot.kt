@@ -107,36 +107,66 @@ internal object ExtensionJarPreflightInputRepository {
         require(candidateSourceIDs.isNotEmpty()) { "Validated extension candidate has no source IDs" }
 
         transaction(transactionIsolation = Connection.TRANSACTION_REPEATABLE_READ) {
-            val currentEntries =
-                ExtensionStoreEntryTable
-                    .selectAll()
-                    .where { ExtensionStoreEntryTable.pkgName eq input.expected.pkgName }
-                    .toList()
-            if (currentEntries.isEmpty()) throw StaleExtensionStoreSnapshotException(input.expected.pkgName)
-            if (currentEntries.size > 1) {
-                throw AmbiguousExtensionStoreOwnershipException(input.expected.pkgName, currentEntries.size)
-            }
-            val entry = currentEntries.single()
-            val isSameGeneration =
-                entry[ExtensionStoreEntryTable.id].value == input.ledgerEntryID &&
-                    entry[ExtensionStoreEntryTable.pkgName] == input.expected.pkgName &&
-                    entry[ExtensionStoreEntryTable.storeIndexUrl] == input.expected.storeIndexUrl &&
-                    entry[ExtensionStoreEntryTable.snapshotToken] == input.storeSnapshotToken &&
-                    entry[ExtensionStoreEntryTable.signingKey].lowercase() == input.expectedSigningKey
-            if (!isSameGeneration) throw StaleExtensionStoreSnapshotException(input.expected.pkgName)
+            verifyStillCurrent(
+                StoreGenerationEvidence(
+                    packageName = input.expected.pkgName,
+                    ledgerEntryID = input.ledgerEntryID,
+                    storeSnapshotToken = input.storeSnapshotToken,
+                    storeIndexUrl = input.expected.storeIndexUrl,
+                    storeSigningKey = input.expectedSigningKey,
+                    sourceIDs = candidateSourceIDs,
+                ),
+            )
+        }
+    }
 
-            val currentOwners =
-                SourceTable
-                    .innerJoin(ExtensionTable)
-                    .select(SourceTable.id, ExtensionTable.pkgName)
-                    .where {
-                        (SourceTable.id inList candidateSourceIDs.toList()) and
-                            (ExtensionTable.isInstalled eq true)
-                    }.associate { row -> row[SourceTable.id].value to row[ExtensionTable.pkgName] }
-            currentOwners.forEach { (sourceID, owner) ->
-                check(owner == input.expected.pkgName) {
-                    "Extension candidate source ID $sourceID became owned by installed package $owner"
-                }
+    /** Revalidates a journal-bound store generation without opening a nested transaction. */
+    fun verifyStillCurrent(
+        transaction: JdbcTransaction,
+        binding: ExtensionActivationJournal.AuthenticatedStoreBinding,
+    ) {
+        transaction.verifyStillCurrent(
+            StoreGenerationEvidence(
+                packageName = binding.packageName,
+                ledgerEntryID = binding.ledgerEntryID,
+                storeSnapshotToken = binding.storeSnapshotToken,
+                storeIndexUrl = binding.storeIndexUrl,
+                storeSigningKey = binding.storeSigningKey,
+                sourceIDs = binding.sourceIDs.toSet(),
+            ),
+        )
+    }
+
+    private fun JdbcTransaction.verifyStillCurrent(evidence: StoreGenerationEvidence) {
+        val currentEntries =
+            ExtensionStoreEntryTable
+                .selectAll()
+                .where { ExtensionStoreEntryTable.pkgName eq evidence.packageName }
+                .toList()
+        if (currentEntries.isEmpty()) throw StaleExtensionStoreSnapshotException(evidence.packageName)
+        if (currentEntries.size > 1) {
+            throw AmbiguousExtensionStoreOwnershipException(evidence.packageName, currentEntries.size)
+        }
+        val entry = currentEntries.single()
+        val isSameGeneration =
+            entry[ExtensionStoreEntryTable.id].value == evidence.ledgerEntryID &&
+                entry[ExtensionStoreEntryTable.pkgName] == evidence.packageName &&
+                entry[ExtensionStoreEntryTable.storeIndexUrl] == evidence.storeIndexUrl &&
+                entry[ExtensionStoreEntryTable.snapshotToken] == evidence.storeSnapshotToken &&
+                entry[ExtensionStoreEntryTable.signingKey].lowercase() == evidence.storeSigningKey
+        if (!isSameGeneration) throw StaleExtensionStoreSnapshotException(evidence.packageName)
+
+        val currentOwners =
+            SourceTable
+                .innerJoin(ExtensionTable)
+                .select(SourceTable.id, ExtensionTable.pkgName)
+                .where {
+                    (SourceTable.id inList evidence.sourceIDs.toList()) and
+                        (ExtensionTable.isInstalled eq true)
+                }.associate { row -> row[SourceTable.id].value to row[ExtensionTable.pkgName] }
+        currentOwners.forEach { (sourceID, owner) ->
+            check(owner == evidence.packageName) {
+                "Extension candidate source ID $sourceID became owned by installed package $owner"
             }
         }
     }
@@ -204,6 +234,15 @@ internal object ExtensionJarPreflightInputRepository {
     ): ContentWarning =
         ContentWarning.entries.getOrNull(ordinal)
             ?: throw IllegalStateException("Invalid content-warning value $ordinal in $owner")
+
+    private data class StoreGenerationEvidence(
+        val packageName: String,
+        val ledgerEntryID: Long,
+        val storeSnapshotToken: String,
+        val storeIndexUrl: String,
+        val storeSigningKey: String,
+        val sourceIDs: Set<Long>,
+    )
 }
 
 internal class AmbiguousExtensionStoreOwnershipException(
