@@ -9,6 +9,7 @@ package suwayomi.tachidesk.server
 
 import app.komu.security.EmbeddedCapabilityHandler
 import app.komu.security.EmbeddedSessionCapability
+import app.komu.network.controller.KomuRepoController
 import gg.jte.ContentType
 import gg.jte.TemplateEngine
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -134,6 +135,7 @@ object JavalinSetup {
                         path("v1/") {
                             GlobalAPI.defineEndpoints()
                             MangaAPI.defineEndpoints()
+                            KomuRepoController.register()
                         }
 
                         OpdsAPI.defineEndpoints()
