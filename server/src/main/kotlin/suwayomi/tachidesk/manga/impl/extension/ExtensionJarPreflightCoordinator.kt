@@ -54,12 +54,19 @@ internal class ExtensionJarPreflightCoordinator(
         private val input: ExtensionJarPreflightInputSnapshot,
         private val candidate: ExtensionJarPreflightPipeline.ValidatedCandidate,
     ) : AutoCloseable {
+        private val ownershipLock = Any()
+        private var ownershipState = OwnershipState.OWNED
+
         val ledgerEntryID: Long = input.ledgerEntryID
         val storeSnapshotToken: String = input.storeSnapshotToken
         val expected: ExtensionInfo
             get() = candidate.expected
         val path: Path
-            get() = candidate.path
+            get() =
+                synchronized(ownershipLock) {
+                    requireOwned()
+                    candidate.path
+                }
         val size: Long
             get() = candidate.size
         val sha256: String
@@ -71,11 +78,90 @@ internal class ExtensionJarPreflightCoordinator(
         val extensionLanguage: String
             get() = candidate.extensionLanguage
 
-        /** Future activation must call this again immediately before consuming the path. */
-        fun assertIntegrity() = candidate.assertIntegrity()
+        /** Activation must call this again immediately before consuming the still-owned path. */
+        fun assertIntegrity() =
+            synchronized(ownershipLock) {
+                requireOwned()
+                candidate.assertIntegrity()
+            }
 
         /** Durable evidence handed to the activation journal before filesystem publication. */
         internal fun journalTrustBinding() =
+            synchronized(ownershipLock) {
+                requireOwned()
+                createJournalTrustBinding()
+            }
+
+        /**
+         * Atomically transfers cleanup responsibility to a durable authenticated journal.
+         *
+         * Before this returns, [close] owns cleanup. After it returns, [JournaledCandidate.journal]
+         * is the only artifact owner and [close] is intentionally a no-op.
+         */
+        fun transferToJournal(
+            databaseIdentity: String,
+            activeArtifact: Path,
+            previousArtifact: Path?,
+        ): JournaledCandidate =
+            synchronized(ownershipLock) {
+                requireOwned()
+                var journal: ExtensionActivationJournal? = null
+                try {
+                    candidate.assertIntegrity()
+                    val active = activeArtifact.toAbsolutePath().normalize()
+                    val extensionsRoot = requireNotNull(active.parent) { "Active extension artifact has no parent" }
+                    val activationJournal = ExtensionActivationJournal(extensionsRoot)
+                    journal = activationJournal
+                    val entry =
+                        activationJournal.prepareAuthenticated(
+                            packageName = input.expected.pkgName,
+                            databaseIdentity = databaseIdentity,
+                            stagedArtifact = candidate.path,
+                            activeArtifact = active,
+                            previousArtifact = previousArtifact,
+                            storeTrustBinding = createJournalTrustBinding(),
+                        )
+                    ownershipState = OwnershipState.TRANSFERRED
+                    JournaledCandidate(
+                        journal = activationJournal,
+                        entry = entry,
+                        expected = candidate.expected,
+                        metadata = candidate.metadata,
+                        sources = candidate.sources,
+                        extensionLanguage = candidate.extensionLanguage,
+                        finalUrl = candidate.finalUrl,
+                    )
+                } catch (failure: Throwable) {
+                    val journalMayOwnCandidate = journal?.let(::journalMayOwnCandidate) ?: false
+                    if (journalMayOwnCandidate) {
+                        // A durable record (or an unreadable journal directory) is authoritative.
+                        // Startup recovery must decide cleanup; preflight must not delete its file.
+                        ownershipState = OwnershipState.TRANSFERRED
+                    } else {
+                        ownershipState = OwnershipState.CLOSED
+                        try {
+                            candidate.close()
+                        } catch (cleanupFailure: Throwable) {
+                            failure.addSuppressed(cleanupFailure)
+                        }
+                    }
+                    throw failure
+                }
+            }
+
+        private fun journalMayOwnCandidate(journal: ExtensionActivationJournal): Boolean =
+            runCatching {
+                journal.loadAll().any { entry ->
+                    entry.record.packageName == input.expected.pkgName &&
+                        entry.record.stagedName == candidate.path.fileName.toString() &&
+                        entry.record.candidateSha256 == candidate.sha256
+                }
+            }.getOrElse {
+                // Unknown durable state is not permission to delete executable bytes.
+                true
+            }
+
+        private fun createJournalTrustBinding() =
             ExtensionActivationJournal.AuthenticatedStoreBinding(
                 packageName = input.expected.pkgName,
                 ledgerEntryID = input.ledgerEntryID,
@@ -90,6 +176,40 @@ internal class ExtensionJarPreflightCoordinator(
                         .sorted(),
             )
 
-        override fun close() = candidate.close()
+        private fun requireOwned() {
+            check(ownershipState == OwnershipState.OWNED) {
+                "Prepared extension candidate is no longer owned by the preflight operation"
+            }
+        }
+
+        override fun close() {
+            val shouldClose =
+                synchronized(ownershipLock) {
+                    if (ownershipState == OwnershipState.OWNED) {
+                        ownershipState = OwnershipState.CLOSED
+                        true
+                    } else {
+                        false
+                    }
+                }
+            if (shouldClose) candidate.close()
+        }
+
+        private enum class OwnershipState {
+            OWNED,
+            TRANSFERRED,
+            CLOSED,
+        }
     }
+
+    /** Immutable handoff: journal owns the path; metadata remains available to the future DB callback. */
+    class JournaledCandidate internal constructor(
+        internal val journal: ExtensionActivationJournal,
+        val entry: ExtensionActivationJournal.Entry,
+        val expected: ExtensionInfo,
+        val metadata: ExtensionJarArtifactInspector.Metadata,
+        val sources: List<ExtensionJarShadowValidator.SourceMetadata>,
+        val extensionLanguage: String,
+        val finalUrl: String,
+    )
 }

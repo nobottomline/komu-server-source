@@ -102,6 +102,140 @@ class ExtensionJarPreflightCoordinatorTest {
         assertFalse(Files.exists(transport.lastPath))
     }
 
+    @Test
+    fun `successful journal handoff transfers cleanup ownership exactly once`() =
+        runBlocking {
+            val events = mutableListOf<String>()
+            val transport = FakeTransport(events, temporaryDirectory)
+            val prepared = coordinator(events, transport).prepare(PACKAGE_NAME, temporaryDirectory)
+            val stagedPath = prepared.path
+            val activePath = temporaryDirectory.resolve("active.jar")
+            val trustBinding = prepared.journalTrustBinding()
+
+            val journaled =
+                prepared.transferToJournal(
+                    databaseIdentity = DATABASE_IDENTITY,
+                    activeArtifact = activePath,
+                    previousArtifact = null,
+                )
+
+            assertEquals(ExtensionActivationJournal.State.PREPARED, journaled.entry.record.state)
+            assertEquals(trustBinding, journaled.entry.record.storeTrustBinding)
+            assertEquals(prepared.expected, journaled.expected)
+            assertEquals(artifactMetadata(), journaled.metadata)
+            assertEquals(listOf(SOURCE_ID), journaled.sources.map { it.id })
+            assertEquals("all", journaled.extensionLanguage)
+            assertEquals(JAR_URL, journaled.finalUrl)
+            assertTrue(Files.exists(stagedPath))
+
+            prepared.close()
+            prepared.close()
+            assertTrue(Files.exists(stagedPath), "preflight close must not delete journal-owned staging")
+            assertThrows(IllegalStateException::class.java) { prepared.path }
+            assertThrows(IllegalStateException::class.java) { prepared.assertIntegrity() }
+            assertThrows(IllegalStateException::class.java) { prepared.journalTrustBinding() }
+            assertThrows(IllegalStateException::class.java) {
+                prepared.transferToJournal(DATABASE_IDENTITY, activePath, null)
+            }
+
+            journaled.journal.rollback(journaled.entry)
+            assertFalse(Files.exists(stagedPath), "journal rollback is the sole cleanup owner after handoff")
+            assertTrue(journaled.journal.loadAll().isEmpty())
+        }
+
+    @Test
+    fun `failed journal handoff closes candidate and cannot be retried`() =
+        runBlocking {
+            val events = mutableListOf<String>()
+            val transport = FakeTransport(events, temporaryDirectory)
+            val prepared = coordinator(events, transport).prepare(PACKAGE_NAME, temporaryDirectory)
+            val stagedPath = prepared.path
+            val foreignRoot = temporaryDirectory.resolve("different-extension-root")
+
+            assertThrows(IllegalArgumentException::class.java) {
+                prepared.transferToJournal(
+                    databaseIdentity = DATABASE_IDENTITY,
+                    activeArtifact = foreignRoot.resolve("active.jar"),
+                    previousArtifact = null,
+                )
+            }
+
+            assertFalse(Files.exists(stagedPath))
+            prepared.close()
+            assertThrows(IllegalStateException::class.java) {
+                prepared.transferToJournal(DATABASE_IDENTITY, temporaryDirectory.resolve("active.jar"), null)
+            }
+            assertTrue(ExtensionActivationJournal(foreignRoot).loadAll().isEmpty())
+        }
+
+    @Test
+    fun `close before handoff deletes staging and permanently consumes ownership`() =
+        runBlocking {
+            val events = mutableListOf<String>()
+            val transport = FakeTransport(events, temporaryDirectory)
+            val prepared = coordinator(events, transport).prepare(PACKAGE_NAME, temporaryDirectory)
+            val stagedPath = prepared.path
+
+            prepared.close()
+            prepared.close()
+
+            assertFalse(Files.exists(stagedPath))
+            assertThrows(IllegalStateException::class.java) { prepared.path }
+            assertThrows(IllegalStateException::class.java) {
+                prepared.transferToJournal(DATABASE_IDENTITY, temporaryDirectory.resolve("active.jar"), null)
+            }
+            assertFalse(Files.exists(stagedPath))
+        }
+
+    @Test
+    fun `mutation immediately before journal handoff fails closed and deletes staging`() =
+        runBlocking {
+            val events = mutableListOf<String>()
+            val transport = FakeTransport(events, temporaryDirectory)
+            val prepared = coordinator(events, transport).prepare(PACKAGE_NAME, temporaryDirectory)
+            val stagedPath = prepared.path
+            Files.writeString(stagedPath, "tampered!")
+
+            assertThrows(SecurityException::class.java) {
+                prepared.transferToJournal(DATABASE_IDENTITY, temporaryDirectory.resolve("active.jar"), null)
+            }
+
+            assertFalse(Files.exists(stagedPath))
+        }
+
+    @Test
+    fun `durable journal reference remains cleanup authority when handoff reports failure`() =
+        runBlocking {
+            val events = mutableListOf<String>()
+            val transport = FakeTransport(events, temporaryDirectory)
+            val prepared = coordinator(events, transport).prepare(PACKAGE_NAME, temporaryDirectory)
+            val stagedPath = prepared.path
+            val journal = ExtensionActivationJournal(temporaryDirectory)
+            val existingEntry =
+                journal.prepareAuthenticated(
+                    packageName = PACKAGE_NAME,
+                    databaseIdentity = DATABASE_IDENTITY,
+                    stagedArtifact = stagedPath,
+                    activeArtifact = temporaryDirectory.resolve("active.jar"),
+                    previousArtifact = null,
+                    storeTrustBinding = prepared.journalTrustBinding(),
+                )
+
+            assertThrows(PendingExtensionActivationException::class.java) {
+                prepared.transferToJournal(
+                    databaseIdentity = DATABASE_IDENTITY,
+                    activeArtifact = temporaryDirectory.resolve("other-active.jar"),
+                    previousArtifact = null,
+                )
+            }
+
+            prepared.close()
+            assertTrue(Files.exists(stagedPath), "durable journal reference must prevent preflight deletion")
+            assertThrows(IllegalStateException::class.java) { prepared.path }
+            journal.rollback(existingEntry)
+            assertFalse(Files.exists(stagedPath))
+        }
+
     private fun coordinator(
         events: MutableList<String>,
         transport: ExtensionArtifactTransport,
@@ -170,6 +304,7 @@ class ExtensionJarPreflightCoordinatorTest {
         const val JAR_URL = "https://cdn.invalid/fixture.jar"
         const val SIGNING_KEY = "9add655a78e96c4ec7a53ef89dccb557cb5d767489fac5e785d671a5a75d4da2"
         const val CANDIDATE_SHA256 = "dda18a0e21ae47c53b4309434cbc02ae8bf764fa83a6defbb719431242722aa7"
+        const val DATABASE_IDENTITY = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
         fun snapshot() =
             ExtensionJarPreflightInputSnapshot(
