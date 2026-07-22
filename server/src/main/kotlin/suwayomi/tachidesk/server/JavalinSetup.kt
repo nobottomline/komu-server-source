@@ -7,6 +7,8 @@ package suwayomi.tachidesk.server
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.security.EmbeddedCapabilityHandler
+import app.komu.security.EmbeddedSessionCapability
 import gg.jte.ContentType
 import gg.jte.TemplateEngine
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -60,6 +62,10 @@ object JavalinSetup {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** Listener retained for the native iOS background/foreground bridge. */
+    @Volatile
+    private var serverConnector: ServerConnector? = null
+
     fun <T> future(block: suspend CoroutineScope.() -> T): CompletableFuture<T> = scope.future(block = block)
 
     fun javalinSetup() {
@@ -76,6 +82,16 @@ object JavalinSetup {
 
                 var connectorAdded = false
                 config.jetty.modifyServer { server ->
+                    if (EmbeddedSessionCapability.isRequired) {
+                        EmbeddedSessionCapability.requireInstalled()
+                        check(server.handler == null) {
+                            "Embedded capability boundary must be the outermost Jetty handler"
+                        }
+                        server.handler =
+                            EmbeddedCapabilityHandler(
+                                EmbeddedSessionCapability::isAuthorized,
+                            )
+                    }
                     if (!connectorAdded) {
                         val connector =
                             ServerConnector(server).apply {
@@ -83,6 +99,7 @@ object JavalinSetup {
                                 port = serverConfig.port.value
                             }
                         server.addConnector(connector)
+                        serverConnector = connector
 
                         serverConfig.subscribeTo(
                             combine(
@@ -105,10 +122,12 @@ object JavalinSetup {
                     }
                 }
 
-                config.bundledPlugins.enableCors { cors ->
-                    cors.addRule {
-                        it.allowCredentials = true
-                        it.reflectClientOrigin = true
+                if (!EmbeddedSessionCapability.isRequired) {
+                    config.bundledPlugins.enableCors { cors ->
+                        cors.addRule {
+                            it.allowCredentials = true
+                            it.reflectClientOrigin = true
+                        }
                     }
                 }
 
@@ -157,6 +176,34 @@ object JavalinSetup {
                 app.stop()
             },
         )
+    }
+
+    /** Stops the listener without tearing down the JVM, routes, or database. */
+    @Synchronized
+    fun javalinStopSocket() {
+        val connector = serverConnector ?: return
+        try {
+            if (!connector.isStopped) {
+                connector.stop()
+                logger.info { "javalinStopSocket: connector stopped" }
+            }
+        } catch (error: Throwable) {
+            logger.error(error) { "javalinStopSocket failed" }
+        }
+    }
+
+    /** Restarts the retained listener after the iOS app returns to foreground. */
+    @Synchronized
+    fun javalinStartSocket() {
+        val connector = serverConnector ?: return
+        try {
+            if (!connector.isStarted) {
+                connector.start()
+                logger.info { "javalinStartSocket: connector started" }
+            }
+        } catch (error: Throwable) {
+            logger.error(error) { "javalinStartSocket failed" }
+        }
     }
 
     fun RoutesConfig.defineCore() {

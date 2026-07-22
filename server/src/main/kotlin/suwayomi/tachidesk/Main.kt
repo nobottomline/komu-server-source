@@ -7,10 +7,24 @@ package suwayomi.tachidesk
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.security.EmbeddedSessionCapability
 import suwayomi.tachidesk.server.JavalinSetup.javalinSetup
+import suwayomi.tachidesk.server.JavalinSetup.javalinStartSocket
+import suwayomi.tachidesk.server.JavalinSetup.javalinStopSocket
 import suwayomi.tachidesk.server.applicationSetup
 
-fun main() {
+fun main(args: Array<String>) {
+    EmbeddedSessionCapability.initialize(args)
     applicationSetup()
     javalinSetup()
+}
+
+/** Re-opens only Jetty's listener when the iOS host returns to foreground. */
+fun startSocket() {
+    javalinStartSocket()
+}
+
+/** Closes only Jetty's listener before the iOS process is suspended. */
+fun stopSocket() {
+    javalinStopSocket()
 }
