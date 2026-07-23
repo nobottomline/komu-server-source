@@ -7,9 +7,9 @@ package suwayomi.tachidesk.server
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.network.controller.KomuRepoController
 import app.komu.security.EmbeddedCapabilityHandler
 import app.komu.security.EmbeddedSessionCapability
-import app.komu.network.controller.KomuRepoController
 import gg.jte.ContentType
 import gg.jte.TemplateEngine
 import io.github.oshai.kotlinlogging.KotlinLogging
