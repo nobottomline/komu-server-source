@@ -1,236 +1,313 @@
 package suwayomi.tachidesk.server.database
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.NetworkHelper
 import io.github.oshai.kotlinlogging.KotlinLogging
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
+import org.h2.tools.RunScript
 import java.net.URLClassLoader
+import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.sql.Connection
+import java.sql.Driver
+import java.sql.DriverManager
+import java.util.Properties
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
-import kotlin.io.path.bufferedReader
-import kotlin.io.path.bufferedWriter
 import kotlin.io.path.copyTo
 import kotlin.io.path.createDirectories
-import kotlin.io.path.deleteExisting
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.div
 import kotlin.io.path.exists
-import kotlin.io.path.name
 import kotlin.io.path.notExists
-import kotlin.io.path.outputStream
 
+/**
+ * Offline H2 file-format migration for the embedded product.
+ *
+ * H2 requires an export with the old driver followed by an import with the
+ * new driver. The old driver is packaged as a pinned inert resource; the
+ * active server H2 dependency performs the import. No executable migration
+ * tool or first-launch network download is required.
+ */
 object H2Migration {
     private val logger = KotlinLogging.logger {}
 
-    private val client by lazy {
-        Injekt.get<NetworkHelper>().client
-    }
-
-    private const val TOOL_VERSION = "1.8"
-
-    private const val TOOL_URL =
-        "https://manticore-projects.com/download/H2MigrationTool-$TOOL_VERSION/H2MigrationTool-$TOOL_VERSION-all.jar"
-
-    private const val MAVEN_BASE =
-        "https://repo1.maven.org/maven2/com/h2database/h2"
+    private const val SUPPORTED_OLD_VERSION = "1.4.200"
+    private const val SUPPORTED_NEW_VERSION = "2.4.240"
+    private const val LEGACY_DRIVER_RESOURCE = "/h2-migration/h2-1.4.200.bin"
+    private const val LEGACY_DRIVER_SHA256 = "3ad9ac4b6aae9cd9d3ac1c447465e1ed06019b851b893dd6a8d76ddb6d85bca6"
+    private const val LEGACY_DRIVER_FILE = "h2-1.4.200.bin"
 
     fun migrate(
         rootDir: String,
         h2Old: String,
         h2New: String,
     ) {
-        val dbBase = "$rootDir/database"
+        require(h2Old == SUPPORTED_OLD_VERSION && h2New == SUPPORTED_NEW_VERSION) {
+            "Unsupported embedded H2 migration $h2Old -> $h2New"
+        }
+
+        val dbBase = Path(rootDir, "database")
         val mvStore = Path("$dbBase.mv.db")
         if (mvStore.notExists()) {
             logger.info { "No H2 database found. Skipping migration." }
             return
         }
 
-        val script = Path("$dbBase.${h2Old.substringAfterLast('.')}.sql")
-        script.deleteIfExists()
-
-        val modifiedScript = Path("$dbBase.${h2Old.substringAfterLast('.')}.modified.sql")
-        modifiedScript.deleteIfExists()
-
-        // Backup original database.
-        val backup = Path("$dbBase.mv.db.${h2Old.substringAfterLast('.')}.backup")
-        mvStore.copyTo(backup, overwrite = true)
-        logger.info { "Created backup: ${backup.absolutePathString()}" }
-
-        val toolsDir = Path(rootDir) / "bin" / "h2-migration-tools"
-        val libsDir = toolsDir / "h2libs"
-        libsDir.createDirectories()
-
-        // Download migration tool
-        val migrationJar =
-            toolsDir.resolve("H2MigrationTool-$TOOL_VERSION-all.jar")
-        downloadIfNeeded(
-            TOOL_URL,
-            migrationJar,
-        )
-        downloadIfNeeded(
-            "$MAVEN_BASE/$h2Old/h2-$h2Old.jar",
-            libsDir.resolve("h2-$h2Old.bin"),
-        )
-        downloadIfNeeded(
-            "$MAVEN_BASE/$h2New/h2-$h2New.jar",
-            libsDir.resolve("h2-$h2New.bin"),
-        )
-
-        // Delete attempted migration if failed previously
-        val newDatabase = Path(rootDir, "database.${h2New.substringAfterLast('.')}.mv.db")
-        newDatabase.deleteIfExists()
-
-        val modifiedNewDatabase = Path(rootDir, "database.${h2Old.substringAfterLast('.')}.modified.${h2New.substringAfterLast('.')}.mv.db")
-        modifiedNewDatabase.deleteIfExists()
-
-        runMigrationTool(
-            migrationJar = migrationJar,
-            libsDir = libsDir,
-            mvStore = mvStore,
-            script = script,
-            modifiedScript = modifiedScript,
-            h2Old = h2Old,
-            h2New = h2New,
-        )
-
-        // Move database to proper path
-        if (modifiedNewDatabase.exists()) {
-            modifiedNewDatabase.copyTo(mvStore, overwrite = true)
-            modifiedNewDatabase.deleteExisting()
-            newDatabase.deleteIfExists()
-        } else {
-            newDatabase.copyTo(mvStore, overwrite = true)
-            newDatabase.deleteExisting()
-        }
-
-        logger.info { "H2 migration completed successfully." }
-    }
-
-    private fun downloadIfNeeded(
-        url: String,
-        output: Path,
-    ) {
-        if (output.exists()) {
-            logger.debug { "Already downloaded: ${output.name}" }
+        if (opensWithCurrentDriver(dbBase)) {
+            logger.info {
+                "H2 database already uses the current format. " +
+                    "Skipping repeated $h2Old -> $h2New migration."
+            }
             return
         }
 
-        client
-            .newCall(GET(url))
-            .execute()
-            .use { response ->
+        val toolsDir = Path(rootDir) / "bin" / "h2-migration-tools"
+        toolsDir.createDirectories()
+        val legacyDriver = toolsDir.resolve(LEGACY_DRIVER_FILE)
 
-                if (!response.isSuccessful) {
-                    throw RuntimeException(
-                        "Failed to download $url " +
-                            "(HTTP ${response.code})",
-                    )
-                }
+        try {
+            materializeLegacyDriver(legacyDriver)
+            verifyLegacyDatabase(legacyDriver, dbBase)
 
-                val tmp = output.resolveSibling(output.name + ".tmp")
-                tmp.outputStream().use { out ->
-                    response.body.byteStream().copyTo(out)
-                }
-                tmp.copyTo(output)
-                tmp.deleteExisting()
+            val backup = Path("$dbBase.mv.db.${h2Old.substringAfterLast('.')}.backup")
+            if (backup.notExists()) {
+                mvStore.copyTo(backup)
+                logger.info { "Created immutable H2 rollback backup: ${backup.absolutePathString()}" }
+            } else {
+                logger.info { "Preserving existing H2 rollback backup: ${backup.absolutePathString()}" }
             }
 
-        logger.info { "Saved: ${output.absolutePathString()}" }
+            val script = Path("$dbBase.${h2Old.substringAfterLast('.')}.sql")
+            val candidateBase = Path("$dbBase.${h2New.substringAfterLast('.')}")
+            val candidateStore = Path("$candidateBase.mv.db")
+            script.deleteIfExists()
+            candidateStore.deleteIfExists()
+
+            exportWithLegacyDriver(
+                legacyDriver = legacyDriver,
+                dbBase = dbBase,
+                script = script,
+            )
+            normalizeKnownLegacyTypes(script)
+            importWithCurrentDriver(
+                candidateBase = candidateBase,
+                script = script,
+            )
+            check(opensWithCurrentDriver(candidateBase)) {
+                "Migrated H2 candidate cannot be opened with $h2New"
+            }
+
+            replaceDatabaseAtomically(
+                candidateStore = candidateStore,
+                destinationStore = mvStore,
+            )
+            logger.info { "H2 migration $h2Old -> $h2New completed successfully." }
+        } finally {
+            legacyDriver.deleteIfExists()
+        }
     }
 
-    private fun runMigrationTool(
-        migrationJar: Path,
-        libsDir: Path,
-        mvStore: Path,
-        script: Path,
-        modifiedScript: Path,
-        h2Old: String,
-        h2New: String,
+    private fun materializeLegacyDriver(destination: Path) {
+        val temporary = destination.resolveSibling("$LEGACY_DRIVER_FILE.tmp")
+        temporary.deleteIfExists()
+
+        try {
+            val resource =
+                requireNotNull(H2Migration::class.java.getResourceAsStream(LEGACY_DRIVER_RESOURCE)) {
+                    "Missing embedded legacy H2 driver resource $LEGACY_DRIVER_RESOURCE"
+                }
+            resource.use { input ->
+                Files.copy(input, temporary, StandardCopyOption.REPLACE_EXISTING)
+            }
+
+            check(sha256(temporary) == LEGACY_DRIVER_SHA256) {
+                "Embedded legacy H2 driver failed SHA-256 verification"
+            }
+            moveReplacing(temporary, destination)
+        } finally {
+            temporary.deleteIfExists()
+        }
+    }
+
+    private fun verifyLegacyDatabase(
+        legacyDriver: Path,
+        dbBase: Path,
     ) {
-        URLClassLoader(
-            arrayOf(migrationJar.toUri().toURL()),
-            javaClass.classLoader,
-        ).use { classLoader ->
-            val clazz =
-                classLoader.loadClass("com.manticore.h2.H2MigrationTool")
-
-            val main =
-                clazz.getMethod("main", Array<String>::class.java)
-
-            try {
-                main.invoke(
-                    null,
-                    arrayOf(
-                        // h2 driver dir
-                        "-l",
-                        libsDir.absolutePathString(),
-                        // from version
-                        "-f",
-                        h2Old,
-                        // to version
-                        "-t",
-                        h2New,
-                        // user
-                        "-u",
-                        "",
-                        // password
-                        "-p",
-                        "",
-                        // database.mv.db
-                        "-d",
-                        mvStore.absolutePathString(),
-                        // database backup in SQL
-                        "-s",
-                        script.absolutePathString(),
-                    ),
-                )
-            } catch (e: Exception) {
-                // Modify raw .sql file as needed for compatibility
-                if (e.stackTraceToString().contains("Unknown data type: \"DATETIME\"; SQL statement:") && script.exists()) {
-                    script.bufferedReader().use { reader ->
-                        modifiedScript.bufferedWriter().use { writer ->
-                            reader.forEachLine { line ->
-                                writer.write(
-                                    line.replace(
-                                        "    \"EXECUTED_AT\" DATETIME(9) NOT NULL",
-                                        "    \"EXECUTED_AT\" TIMESTAMP(9) NOT NULL",
-                                    ),
-                                )
-                                writer.newLine()
-                            }
-                        }
+        withLegacyConnection(legacyDriver, legacyReadOnlyUrl(dbBase)) { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT 1").use { rows ->
+                    check(rows.next() && rows.getInt(1) == 1) {
+                        "Legacy H2 verification query failed"
                     }
-
-                    main.invoke(
-                        null,
-                        arrayOf(
-                            // h2 driver dir
-                            "-l",
-                            libsDir.absolutePathString(),
-                            // from version
-                            "-f",
-                            h2Old,
-                            // to version
-                            "-t",
-                            h2New,
-                            // user
-                            "-u",
-                            "",
-                            // password
-                            "-p",
-                            "",
-                            // database.mv.db
-                            "-d",
-                            modifiedScript.absolutePathString(),
-                        ),
-                    )
-                } else {
-                    throw e
                 }
             }
         }
     }
+
+    private fun exportWithLegacyDriver(
+        legacyDriver: Path,
+        dbBase: Path,
+        script: Path,
+    ) {
+        URLClassLoader(
+            arrayOf(legacyDriver.toUri().toURL()),
+            ClassLoader.getPlatformClassLoader(),
+        ).use { classLoader ->
+            val scriptTool =
+                classLoader
+                    .loadClass("org.h2.tools.Script")
+                    .getDeclaredConstructor()
+                    .newInstance()
+            val runTool =
+                scriptTool.javaClass.getMethod(
+                    "runTool",
+                    Array<String>::class.java,
+                )
+            runTool.invoke(
+                scriptTool,
+                arrayOf(
+                    "-url",
+                    legacyReadOnlyUrl(dbBase),
+                    "-user",
+                    "",
+                    "-password",
+                    "",
+                    "-script",
+                    script.absolutePathString(),
+                ),
+            )
+        }
+    }
+
+    private fun normalizeKnownLegacyTypes(script: Path) {
+        val normalized = script.resolveSibling("${script.fileName}.normalized.tmp")
+        normalized.deleteIfExists()
+        Files.newBufferedReader(script, StandardCharsets.UTF_8).use { reader ->
+            Files.newBufferedWriter(normalized, StandardCharsets.UTF_8).use { writer ->
+                reader.forEachLine { line ->
+                    writer.write(
+                        line.replace(
+                            "\"EXECUTED_AT\" DATETIME(9) NOT NULL",
+                            "\"EXECUTED_AT\" TIMESTAMP(9) NOT NULL",
+                        ),
+                    )
+                    writer.newLine()
+                }
+            }
+        }
+        moveReplacing(normalized, script)
+    }
+
+    private fun importWithCurrentDriver(
+        candidateBase: Path,
+        script: Path,
+    ) {
+        RunScript.execute(
+            currentUrl(candidateBase),
+            "",
+            "",
+            script.absolutePathString(),
+            StandardCharsets.UTF_8,
+            false,
+        )
+    }
+
+    private fun opensWithCurrentDriver(dbBase: Path): Boolean =
+        runCatching {
+            DriverManager
+                .getConnection(currentReadOnlyUrl(dbBase), "", "")
+                .use { connection ->
+                    connection.createStatement().use { statement ->
+                        statement.executeQuery("SELECT 1").use { rows ->
+                            check(rows.next() && rows.getInt(1) == 1)
+                        }
+                    }
+                }
+        }.isSuccess
+
+    private fun <T> withLegacyConnection(
+        legacyDriver: Path,
+        url: String,
+        block: (Connection) -> T,
+    ): T =
+        URLClassLoader(
+            arrayOf(legacyDriver.toUri().toURL()),
+            ClassLoader.getPlatformClassLoader(),
+        ).use { classLoader ->
+            val driver =
+                classLoader
+                    .loadClass("org.h2.Driver")
+                    .getDeclaredConstructor()
+                    .newInstance() as Driver
+            val connection =
+                requireNotNull(driver.connect(url, Properties())) {
+                    "Legacy H2 driver rejected its own JDBC URL"
+                }
+            connection.use(block)
+        }
+
+    private fun replaceDatabaseAtomically(
+        candidateStore: Path,
+        destinationStore: Path,
+    ) {
+        check(candidateStore.exists()) {
+            "H2 migration did not produce ${candidateStore.absolutePathString()}"
+        }
+        try {
+            Files.move(
+                candidateStore,
+                destinationStore,
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            logger.warn {
+                "Atomic H2 replacement is unavailable; using same-directory replace with rollback backup"
+            }
+            Files.move(
+                candidateStore,
+                destinationStore,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        }
+    }
+
+    private fun moveReplacing(
+        source: Path,
+        destination: Path,
+    ) {
+        try {
+            Files.move(
+                source,
+                destination,
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(source, destination, StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    private fun sha256(path: Path): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        Files.newInputStream(path).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) {
+                    break
+                }
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+    }
+
+    private fun legacyReadOnlyUrl(dbBase: Path): String = "jdbc:h2:${dbBase.absolutePathString()};ACCESS_MODE_DATA=r;IFEXISTS=TRUE"
+
+    private fun currentReadOnlyUrl(dbBase: Path): String = "${currentUrl(dbBase)};ACCESS_MODE_DATA=r;IFEXISTS=TRUE"
+
+    private fun currentUrl(dbBase: Path): String = "jdbc:h2:${dbBase.absolutePathString()}"
 }

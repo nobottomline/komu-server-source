@@ -1,6 +1,7 @@
 import de.undercouch.gradle.tasks.download.Download
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import suwayomi.gradle.VerifyJavaArtifactTask
+import java.security.MessageDigest
 import java.time.Instant
 
 plugins {
@@ -33,6 +34,13 @@ plugins {
     )
 }
 
+val legacyH2Migration =
+    configurations.create("legacyH2Migration") {
+        isCanBeConsumed = false
+        isCanBeResolved = true
+        isTransitive = false
+    }
+
 dependencies {
     // Shared
     implementation(libs.bundles.shared)
@@ -56,6 +64,7 @@ dependencies {
     implementation(libs.postgres)
     implementation(libs.h2)
     implementation(libs.hikaricp)
+    add(legacyH2Migration.name, "com.h2database:h2:1.4.200")
 
     // Exposed Migrations
     implementation(libs.exposed.migrations)
@@ -166,6 +175,29 @@ buildConfig {
 
 tasks {
     val packagedServer = named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar")
+    val legacyH2Sha256 = "3ad9ac4b6aae9cd9d3ac1c447465e1ed06019b851b893dd6a8d76ddb6d85bca6"
+    val verifyLegacyH2MigrationArtifact =
+        register("verifyLegacyH2MigrationArtifact") {
+            inputs.files(legacyH2Migration)
+            doLast {
+                val artifact = legacyH2Migration.singleFile
+                val digest = MessageDigest.getInstance("SHA-256")
+                artifact.inputStream().use { input ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) {
+                            break
+                        }
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                val actual = digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+                check(actual == legacyH2Sha256) {
+                    "Unexpected SHA-256 for pinned H2 1.4.200 migration artifact"
+                }
+            }
+        }
 
     shadowJar {
         isZip64 = true
@@ -228,6 +260,11 @@ tasks {
     named<Copy>("processResources") {
         duplicatesStrategy = DuplicatesStrategy.INCLUDE
         mustRunAfter("downloadWebUI")
+        dependsOn(verifyLegacyH2MigrationArtifact)
+        from(legacyH2Migration) {
+            into("h2-migration")
+            rename { "h2-1.4.200.bin" }
+        }
     }
 
     register<Download>("downloadWebUI") {
