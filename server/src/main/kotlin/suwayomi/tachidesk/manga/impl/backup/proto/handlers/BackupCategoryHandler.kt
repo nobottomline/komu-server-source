@@ -14,6 +14,7 @@ import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import suwayomi.tachidesk.manga.impl.Category
+import suwayomi.tachidesk.manga.impl.Category.DEFAULT_CATEGORY_ID
 import suwayomi.tachidesk.manga.impl.Category.modifyCategoriesMetas
 import suwayomi.tachidesk.manga.impl.backup.BackupFlags
 import suwayomi.tachidesk.manga.impl.backup.proto.models.BackupCategory
@@ -52,7 +53,15 @@ object BackupCategoryHandler {
         }
 
     fun restore(backupCategories: List<BackupCategory>): Map<Int, Int> {
-        val dbCategories = Category.getCategoryList()
+        // getCategoryList() hides the synthetic default category when the
+        // current library does not need it. A fresh restore starts with an
+        // empty library, so relying on that list alone would create a second
+        // "Default" row instead of mapping the backup entry to id 0.
+        val dbCategories =
+            (
+                listOfNotNull(Category.getCategoryById(DEFAULT_CATEGORY_ID)) +
+                    Category.getCategoryList()
+            ).distinctBy { it.id }
         val dbCategoriesByName = dbCategories.associateBy { it.name }
         val dbCategoriesByUid = dbCategories.associateBy { it.uid }
 
