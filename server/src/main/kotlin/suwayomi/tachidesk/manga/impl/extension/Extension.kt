@@ -22,13 +22,20 @@ import net.dongliu.apk.parser.ApkFile
 import net.dongliu.apk.parser.bean.Icon
 import okhttp3.CacheControl
 import org.apache.commons.compress.archivers.zip.ZipFile
+import org.jetbrains.exposed.v1.core.ResultRow
+import org.jetbrains.exposed.v1.core.dao.id.EntityID
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.statements.BatchUpdateStatement
+import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
+import org.jetbrains.exposed.v1.jdbc.upsert
 import suwayomi.tachidesk.manga.impl.util.AndroidManifestParser
 import suwayomi.tachidesk.manga.impl.util.PackageTools
 import suwayomi.tachidesk.manga.impl.util.PackageTools.EXTENSION_FEATURE
@@ -74,6 +81,7 @@ import kotlin.io.path.div
 import kotlin.io.path.exists
 import kotlin.io.path.inputStream
 import kotlin.io.path.isRegularFile
+import kotlin.io.path.isSameFileAs
 import kotlin.io.path.name
 import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.outputStream
@@ -214,6 +222,16 @@ object Extension {
         // operation-owned staging path and must never be the active JAR.
         abstract suspend fun prepareJar(stagedJar: Path)
 
+        fun getApkName(): String {
+            val apkNameWithVersion = file.nameWithoutExtension + "-v${metadata.versionName}" + ".apk"
+
+            return if (file.name.contains(metadata.versionName)) {
+                file.name.substringBeforeLast(".") + ".apk"
+            } else {
+                apkNameWithVersion
+            }
+        }
+
         class Apk(
             override val file: Path,
             val packageInfo: PackageInfo,
@@ -273,7 +291,7 @@ object Extension {
         ) : MetadataProvider {
             override fun getString(key: String): String? = bundle.getString(key)
 
-            override fun getInt(key: String): Int = bundle.getInt(key) ?: 0
+            override fun getInt(key: String): Int = bundle.getInt(key)
         }
 
         class FromManifest(
@@ -518,9 +536,9 @@ object Extension {
                 it[this.apkName] = apkName
                 it[this.isInstalled] = true
                 it[this.classFQName] = className
+                it[name] = extensionName
                 it[this.versionName] = versionName
                 it[this.versionCode] = versionCode.toLong()
-                it[name] = extensionName
                 it[extensionLib] = extensionLibVersion
                 it[lang] = extensionLang
                 it[this.contentWarning] = normalizedContentWarning.ordinal
@@ -533,8 +551,9 @@ object Extension {
             }
             val extensionId =
                 ExtensionTable
-                    .selectAll()
-                    .where { ExtensionTable.pkgName eq pkgName }
+                    .select(
+                        ExtensionTable.id,
+                    ).where { ExtensionTable.pkgName eq pkgName }
                     .first()[ExtensionTable.id]
                     .value
 
@@ -782,12 +801,8 @@ object Extension {
             }
 
         if (jarPath.exists()) {
-            // free up the file descriptor if exists
             PackageTools.jarLoaderMap.remove(jarPath.absolutePathString())?.close()
-
-            // clear all loaded sources
             sources.forEach { GetSource.unregisterSource(it) }
-
             jarPath.deleteExisting()
         }
     }

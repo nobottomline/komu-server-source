@@ -15,6 +15,8 @@ import com.googlecode.d2j.reader.MultiDexFileReader
 import com.googlecode.dex2jar.tools.BaksmaliBaseDexExceptionHandler
 import eu.kanade.tachiyomi.util.lang.Hash
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import net.dongliu.apk.parser.ApkFile
 import net.dongliu.apk.parser.ApkParsers
 import org.w3c.dom.Element

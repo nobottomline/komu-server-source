@@ -69,7 +69,7 @@ object GetSource {
         return sourceCache[sourceId]!!
     }
 
-    fun getSourceOrNull(sourceId: Long): Source? =
+    suspend fun getSourceOrNull(sourceId: Long): Source? =
         try {
             getSource(sourceId)
         } catch (e: Exception) {
@@ -77,7 +77,7 @@ object GetSource {
             null
         }
 
-    fun getSourceOrStub(sourceId: Long): Source = getSourceOrNull(sourceId) ?: StubSource(sourceId)
+    suspend fun getSourceOrStub(sourceId: Long): Source = getSourceOrNull(sourceId) ?: StubSource(sourceId)
 
     fun registerSource(sourcePair: Pair<Long, Source>) {
         ExtensionRuntimeRegistry.withLock {

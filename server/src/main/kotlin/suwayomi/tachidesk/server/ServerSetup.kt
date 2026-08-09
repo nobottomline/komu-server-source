@@ -14,6 +14,7 @@ import com.typesafe.config.ConfigException
 import com.typesafe.config.ConfigRenderOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
+import dorkbox.updates.Updates
 import eu.kanade.tachiyomi.App
 import eu.kanade.tachiyomi.createAppModule
 import eu.kanade.tachiyomi.network.NetworkHelper
@@ -187,6 +188,15 @@ fun migrateConfig(
         } catch (_: ConfigException) {
             // Ignore, no migration required
             return@forEach
+        }
+
+        try {
+            config.getValue(toConfigKey)
+            // An explicitly configured replacement is authoritative. This also
+            // makes partially completed/repeated migrations idempotent.
+            return@forEach
+        } catch (_: ConfigException) {
+            // No replacement value exists yet; migrate the deprecated value.
         }
 
         logger.debug { "Migrating config value: $configKey -> $toConfigKey" }
@@ -459,6 +469,7 @@ fun applicationSetup() {
     )
 
     // create system tray
+    Updates.ENABLE = false
     serverConfig.subscribeTo(
         serverConfig.systemTrayEnabled,
         { systemTrayEnabled ->

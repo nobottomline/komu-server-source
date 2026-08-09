@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import org.jetbrains.exposed.v1.core.DatabaseConfig
 import org.jetbrains.exposed.v1.core.ExperimentalKeywordApi
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -190,9 +191,30 @@ class ExtensionJarMetadataWriterTest : ApplicationTest() {
         }
 
     @Test
+    fun `database schema rejects duplicate package rows before writer`() =
+        runBlocking {
+            withFixtureDatabase {
+                insertExtension(versionCode = 1, installed = false)
+
+                assertThrows(ExposedSQLException::class.java) {
+                    insertExtension(versionCode = 1, installed = false)
+                }
+
+                transaction {
+                    assertEquals(1, ExtensionTable.selectAll().where { ExtensionTable.pkgName eq TARGET_PKG }.count())
+                    assertTrue(SourceTable.selectAll().toList().isEmpty())
+                }
+            }
+        }
+
+    @Test
     fun `duplicate package rows fail closed before any metadata mutation`() =
         runBlocking {
             withFixtureDatabase {
+                // M0065 makes this state unreachable in a healthy current DB.
+                // Drop only this fixture's constraint to retain defense-in-depth
+                // coverage for a corrupt or pre-M0065 database.
+                transaction { exec("ALTER TABLE extension DROP CONSTRAINT uc_pkg_name") }
                 insertExtension(versionCode = 1, installed = false)
                 insertExtension(versionCode = 1, installed = false)
 
