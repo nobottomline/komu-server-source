@@ -162,8 +162,18 @@ open class ConfigManager {
             "user config is out of date, updating... (missingSettings= $hasMissingSettings, outdatedSettings= $hasOutdatedSettings)"
         }
 
+        // Migrate the actual user document before rebuilding it from the
+        // latest reference file. Rebuilding first drops deprecated top-level
+        // keys (because they no longer exist in the reference) and also makes
+        // every replacement key look explicitly configured through its
+        // reference default. That combination silently lost values such as
+        // extensionRepos during extensionStores upgrades.
+        val migratedUserConfigDoc =
+            migrate(ConfigDocumentFactory.parseFile(userConfigFile), internalConfig)
+        val migratedUserConfig = ConfigFactory.parseString(migratedUserConfigDoc.render())
+
         var newUserConfigDoc: ConfigDocument = createConfigDocumentFromReference()
-        userConfig
+        migratedUserConfig
             .entrySet()
             .filter {
                 serverConfig.hasPath(
@@ -171,9 +181,6 @@ open class ConfigManager {
                 ) ||
                     it.key.count { c -> c == '.' } > 1
             }.forEach { newUserConfigDoc = newUserConfigDoc.withValue(it.key, it.value) }
-
-        newUserConfigDoc =
-            migrate(newUserConfigDoc, internalConfig)
 
         userConfigFile.writeText(newUserConfigDoc.render())
         getUserConfig().entrySet().forEach { internalConfig = internalConfig.withValue(it.key, it.value) }

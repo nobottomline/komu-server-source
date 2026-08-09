@@ -11,6 +11,7 @@ import android.os.Looper
 import ch.qos.logback.classic.Level
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigException
+import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigRenderOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
@@ -177,6 +178,14 @@ fun migrateConfig(
     config: Config,
 ): ConfigDocument {
     var updatedConfig = configDocument
+    // `config` is normally resolved with server-reference.conf as its
+    // fallback. A replacement key can therefore appear to exist even when it
+    // is absent from the user's server.conf, which used to suppress legacy
+    // migrations whenever the replacement had a reference default (notably
+    // extensionRepos -> extensionStores, whose default is an empty list).
+    // Presence and values for a user-config migration must come from the
+    // document being rewritten, never from its fallback layer.
+    val userConfig = ConfigFactory.parseString(configDocument.render())
 
     val settingsRequiringMigration = SettingsRegistry.getAll().filterValues { it.deprecated?.replaceWith != null }
     settingsRequiringMigration.forEach { (name, data) ->
@@ -184,14 +193,14 @@ fun migrateConfig(
         val toConfigKey = "server.${data.deprecated!!.replaceWith}"
 
         try {
-            config.getValue(configKey)
+            userConfig.getValue(configKey)
         } catch (_: ConfigException) {
             // Ignore, no migration required
             return@forEach
         }
 
         try {
-            config.getValue(toConfigKey)
+            userConfig.getValue(toConfigKey)
             // An explicitly configured replacement is authoritative. This also
             // makes partially completed/repeated migrations idempotent.
             return@forEach
@@ -203,7 +212,7 @@ fun migrateConfig(
 
         try {
             if (data.deprecated!!.migrateConfig != null) {
-                updatedConfig = data.deprecated!!.migrateConfig!!(config.getValue(configKey), updatedConfig)
+                updatedConfig = data.deprecated!!.migrateConfig!!(userConfig.getValue(configKey), updatedConfig)
                 return@forEach
             }
 
@@ -211,7 +220,7 @@ fun migrateConfig(
                 updatedConfig =
                     migrateConfigValue(
                         updatedConfig,
-                        config,
+                        userConfig,
                         configKey,
                         toConfigKey,
                         data.deprecated!!.migrateConfigValue!!,

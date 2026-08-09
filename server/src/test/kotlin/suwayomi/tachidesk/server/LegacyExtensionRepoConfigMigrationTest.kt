@@ -45,6 +45,24 @@ class LegacyExtensionRepoConfigMigrationTest {
     }
 
     @Test
+    fun `reference default does not suppress legacy extensionRepos migration`() {
+        val legacyUrl = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.min.json"
+        val source = "server.extensionRepos = [\"$legacyUrl\"]"
+        val userDocument = ConfigDocumentFactory.parseString(source)
+        val resolved =
+            ConfigFactory.parseString(source).withFallback(
+                ConfigFactory.parseString("server.extensionStores = []"),
+            )
+
+        val migrated = migrateConfig(userDocument, resolved).render()
+
+        assertEquals(
+            listOf(legacyUrl),
+            ConfigFactory.parseString(migrated).getStringList("server.extensionStores"),
+        )
+    }
+
+    @Test
     fun `existing extensionStores are not replaced when no legacy key exists`() {
         val storeUrl = "https://raw.githubusercontent.com/example/extensions/repo/index.pb"
         val source = "server.extensionStores = [\"$storeUrl\"]"
