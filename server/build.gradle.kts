@@ -163,7 +163,11 @@ buildConfig {
     buildConfigField("String", "VERSION", quoteWrap(getTachideskVersion()))
     buildConfigField("String", "REVISION", quoteWrap(getTachideskRevision()))
     buildConfigField("String", "BUILD_TYPE", quoteWrap(if (System.getenv("ProductBuildType") == "Stable") "Stable" else "Preview"))
-    buildConfigField("long", "BUILD_TIME", Instant.now().epochSecond.toString())
+    val buildTime =
+        System.getenv("SOURCE_DATE_EPOCH")
+            ?.toLongOrNull()
+            ?: Instant.now().epochSecond
+    buildConfigField("long", "BUILD_TIME", buildTime.toString())
 
     buildConfigField("String", "WEBUI_TAG", quoteWrap(webUIRevisionTag))
 
@@ -201,6 +205,8 @@ tasks {
 
     shadowJar {
         isZip64 = true
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
         manifest {
             attributes(
                 "Main-Class" to MainClass,
