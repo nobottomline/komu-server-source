@@ -12,6 +12,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'Suwayomi/Suwayomi-Server'
     runs-on: windows-latest # action can only be run on windows
     steps:
       - uses: actions/checkout@v7

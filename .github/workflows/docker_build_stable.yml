@@ -6,6 +6,7 @@ on:
   
 jobs:
   build_publish_docker_container:
+    if: github.repository == 'Suwayomi/Suwayomi-Server'
     runs-on: ubuntu-latest
 
     steps:         

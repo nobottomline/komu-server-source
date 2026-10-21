@@ -9,6 +9,7 @@ concurrency:
 
 jobs:
   check_wrapper:
+    if: github.repository == 'Suwayomi/Suwayomi-Server'
     name: Validate Gradle Wrapper
     runs-on: ubuntu-latest
 
@@ -20,6 +21,7 @@ jobs:
         uses: gradle/actions/wrapper-validation@v5
 
   build:
+    if: github.repository == 'Suwayomi/Suwayomi-Server'
     name: Build pull request
     needs: check_wrapper
     runs-on: ubuntu-latest
@@ -101,6 +103,7 @@ jobs:
         run: ./gradlew test --stacktrace
 
   check_docs:
+    if: github.repository == 'Suwayomi/Suwayomi-Server'
     name: Validate that all options are documented
     runs-on: ubuntu-latest
 

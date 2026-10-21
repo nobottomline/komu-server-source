@@ -81,3 +81,13 @@ shadow source ownership, activation recovery, complete-store outages, typed APK
 metadata, configuration precedence, and released 57/65 through schema 70.
 Java 17 archive verification passes for every target-visible class. Live
 Java 17 and embedded app qualification are recorded in the app repository.
+
+
+## Fork publication
+
+The fork runs its own Java 17 test and archive-verification workflow. Inherited
+upstream workflows are restricted to `Suwayomi/Suwayomi-Server`: a push or
+embedded release in this private fork must never publish upstream preview,
+Docker, wiki, or package-manager artifacts. Embedded release assets are the
+exact locally qualified bytes, identified by commit, size, and SHA-256 in the
+app's tracked artifact manifest.
