@@ -42,6 +42,40 @@ class ExtensionJarArtifactInspectorTest {
         }
     }
 
+    @Test
+    fun `API 1_6 fixed generated entry point is supported without accepting neighboring namespaces`() {
+        val packageName = PinnedKeiyoushiRealArtifact.PACKAGE_NAME
+        assertEquals(
+            "keiyoushi.source.Generated",
+            ExtensionJarArtifactInspector.resolveSourceClassName("keiyoushi.source.Generated", packageName, "1.6"),
+        )
+        listOf(
+            "keiyoushi.source.Other",
+            "keiyoushi.source.GeneratedExtra",
+            "keiyoushi.source.Generated.Nested",
+            "keiyoushi.source.Generated\$Nested",
+            "other.source.Generated",
+        ).forEach { sourceClass ->
+            assertFailsWith<SecurityException> {
+                ExtensionJarArtifactInspector.resolveSourceClassName(sourceClass, packageName, "1.6")
+            }
+        }
+        assertFailsWith<SecurityException> {
+            ExtensionJarArtifactInspector.resolveSourceClassName("keiyoushi.source.Generated", packageName, "1.4")
+        }
+    }
+
+    @Test
+    fun `legacy package-local source class resolution is preserved`() {
+        val packageName = PinnedKeiyoushiRealArtifact.PACKAGE_NAME
+        listOf(".ExtensionGenerated", "$packageName.ExtensionGenerated").forEach { sourceClass ->
+            assertEquals(
+                "$packageName.ExtensionGenerated",
+                ExtensionJarArtifactInspector.resolveSourceClassName(sourceClass, packageName, "1.4"),
+            )
+        }
+    }
+
     private fun assertTrueAuthenticated(metadata: ExtensionJarArtifactInspector.Metadata) {
         assertEquals(PinnedKeiyoushiRealArtifact.SIGNING_KEY, metadata.signature.signerFingerprint)
         assertEquals(

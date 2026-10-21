@@ -42,9 +42,13 @@ internal object ExtensionJarShadowValidator {
         ExtensionArtifactInputPolicy.requirePackageName(expected.pkgName)
         validateExpected(expected)
         require(artifact.packageName == expected.pkgName) { "Authenticated artifact package differs from store metadata" }
-        require(artifact.classFQName.startsWith("${expected.pkgName}.")) {
-            "Authenticated extension class escapes the expected package"
-        }
+        require(
+            ExtensionJarArtifactInspector.resolveSourceClassName(
+                artifact.classFQName,
+                expected.pkgName,
+                expected.extensionLib,
+            ) == artifact.classFQName,
+        ) { "Authenticated extension class differs from its resolved identity" }
 
         val sources =
             ChildFirstURLClassLoader(arrayOf(jarPath.toUri().toURL())).use { loader ->

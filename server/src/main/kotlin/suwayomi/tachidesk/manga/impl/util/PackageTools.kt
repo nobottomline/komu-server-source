@@ -19,17 +19,13 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import net.dongliu.apk.parser.ApkFile
 import net.dongliu.apk.parser.ApkParsers
-import org.w3c.dom.Element
-import org.w3c.dom.Node
 import suwayomi.tachidesk.server.ApplicationDirs
 import uy.kohesive.injekt.injectLazy
-import xyz.nulldev.androidcompat.pm.InstalledPackage.Companion.toList
 import xyz.nulldev.androidcompat.pm.toPackageInfo
 import java.net.URL
 import java.net.URLClassLoader
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
-import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.nameWithoutExtension
@@ -75,6 +71,7 @@ object PackageTools {
             .noCode(false)
             .skipExceptions(false)
             .dontSanitizeNames(true)
+            .computeFrames(true)
             .to(jarFile)
         if (handler.hasException()) {
             val rootPath = Path(applicationDirs.extensionsRoot)
@@ -99,36 +96,11 @@ object PackageTools {
     fun getPackageInfo(apkFile: Path): PackageInfo =
         ApkParsers.getMetaInfo(apkFile.toFile()).toPackageInfo(apkFile.toFile()).apply {
             ApkFile(apkFile.toFile()).use { parsed ->
-                val dbFactory = DocumentBuilderFactory.newInstance()
-                val dBuilder = dbFactory.newDocumentBuilder()
-                val doc =
-                    parsed.manifestXml.byteInputStream().use {
-                        dBuilder.parse(it)
-                    }
-
-                logger.trace { parsed.manifestXml }
-
                 applicationInfo.metaData =
                     Bundle().apply {
-                        val appTag = doc.getElementsByTagName("application").item(0)
-
-                        appTag
-                            ?.childNodes
-                            ?.toList()
-                            .orEmpty()
-                            .asSequence()
-                            .filter {
-                                it.nodeType == Node.ELEMENT_NODE
-                            }.map {
-                                it as Element
-                            }.filter {
-                                it.tagName == "meta-data"
-                            }.forEach {
-                                putString(
-                                    it.attributes.getNamedItem("android:name").nodeValue,
-                                    it.attributes.getNamedItem("android:value").nodeValue,
-                                )
-                            }
+                        ApkExtensionMetadata.parse(parsed.getFileData("AndroidManifest.xml")).forEach { (name, value) ->
+                            putString(name, value)
+                        }
                     }
 
                 signatures =

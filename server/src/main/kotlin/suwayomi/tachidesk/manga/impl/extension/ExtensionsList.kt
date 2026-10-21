@@ -105,22 +105,27 @@ object ExtensionsList {
 
     internal suspend fun reconcileExtensionDatabase(
         foundExtensions: List<ExtensionInfo>,
-        refreshedStores: List<ExtensionStore> = emptyList(),
+        refreshedStores: List<ExtensionStore>? = null,
     ) {
         updateExtensionDatabaseMutex.withLock {
             transaction {
                 val reconciliationExtensions: List<ExtensionInfo>
                 val authoritativeStoreUrls: Set<String>?
-                if (refreshedStores.isNotEmpty()) {
-                    ExtensionStoreArtifactLedger.replaceSuccessfulStores(
-                        transaction = this,
-                        foundExtensions = foundExtensions,
-                        refreshedStores = refreshedStores,
-                    )
+                if (refreshedStores != null) {
+                    if (refreshedStores.isNotEmpty()) {
+                        ExtensionStoreArtifactLedger.replaceSuccessfulStores(
+                            transaction = this,
+                            foundExtensions = foundExtensions,
+                            refreshedStores = refreshedStores,
+                        )
+                    } else {
+                        require(foundExtensions.isEmpty()) { "Extension entries require a successfully refreshed store" }
+                    }
+                    // An explicit empty refresh means no store was fetched successfully,
+                    // not that every configured store published an empty catalogue. Keep its last good ledger
+                    // and only authorize removals for stores actually refreshed this time.
                     reconciliationExtensions = ExtensionStoreArtifactLedger.readAll(this)
-                    authoritativeStoreUrls =
-                        reconciliationExtensions.mapTo(mutableSetOf()) { it.storeIndexUrl } +
-                        refreshedStores.map { it.indexUrl }
+                    authoritativeStoreUrls = refreshedStores.mapTo(mutableSetOf()) { it.indexUrl }
                 } else {
                     // Compatibility path for callers/tests that predate the durable store ledger.
                     reconciliationExtensions = foundExtensions
@@ -185,10 +190,12 @@ object ExtensionsList {
                         extensionsToInsert.add(it)
                     }
                 }
+
                 if (extensionsToUpdate.isNotEmpty()) {
                     val extensionsInstalled =
                         extensionsToUpdate
                             .groupBy { it.second[ExtensionTable.isInstalled] }
+
                     val installedExtensionsToUpdate = extensionsInstalled[true].orEmpty()
                     if (installedExtensionsToUpdate.isNotEmpty()) {
                         BatchUpdateStatement(ExtensionTable)
@@ -232,6 +239,7 @@ object ExtensionsList {
                             }.toExecutable()
                             .execute(this@transaction)
                     }
+
                     val extensionsToFullyUpdate = extensionsInstalled[false].orEmpty()
                     if (extensionsToFullyUpdate.isNotEmpty()) {
                         BatchUpdateStatement(ExtensionTable)
@@ -262,6 +270,7 @@ object ExtensionsList {
                             .execute(this@transaction)
                     }
                 }
+
                 if (extensionsToInsert.isNotEmpty()) {
                     ExtensionTable.batchInsert(extensionsToInsert) { foundExtension ->
                         this[ExtensionTable.repo] = foundExtension.storeIndexUrl
@@ -295,6 +304,7 @@ object ExtensionsList {
                     extensionsToDelete
                         .groupBy { it[ExtensionTable.isInstalled] }
                         .mapValues { (_, extensions) -> extensions.map { it[ExtensionTable.pkgName] } }
+
                 // not in the repo, so these extensions are obsolete
                 val obsoleteExtensions = extensionsToRemove[true].orEmpty()
                 if (obsoleteExtensions.isNotEmpty()) {
@@ -304,6 +314,7 @@ object ExtensionsList {
                         it[isObsolete] = true
                     }
                 }
+
                 // is not installed, so we can remove the record without a care
                 val removeExtensions = extensionsToRemove[false].orEmpty()
                 if (removeExtensions.isNotEmpty()) {

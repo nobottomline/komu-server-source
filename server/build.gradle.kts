@@ -227,7 +227,25 @@ tasks {
         // order-dependent once Shadow merges those dependencies together.
         exclude("module-info.class")
         exclude("META-INF/versions/**/module-info.class")
-        mergeServiceFiles()
+        // Keep one class/resource definition while allowing every service provider
+        // to reach Shadow's merger. OpenJ9 must not depend on duplicate ZIP order.
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        filesMatching("META-INF/services/**") {
+            duplicatesStrategy = DuplicatesStrategy.INCLUDE
+        }
+        mergeServiceFiles("META-INF/services")
+        failOnDuplicateEntries = true
+        dependencies {
+            // The deprecated GraalVM js-community POM chain declares `<type>pom</type>`
+            // dependencies, which puts literal .pom artifacts on the resolved classpath.
+            // Shadow 9 expands every classpath file with zipTree() and fails with
+            // "Cannot expand ZIP" on them (GradleUp/shadow#1716). Excluding the
+            // POM-only metapackages drops just those .pom files; the actual jars
+            // (js-language, truffle-runtime) are still shadowed and their
+            // META-INF/services files are still merged by mergeServiceFiles.
+            exclude(dependency("org.graalvm.js:js-community:.*"))
+            exclude(dependency("org.graalvm.js:js:.*"))
+        }
     }
 
     val verifyEmbeddedJava17Artifact =

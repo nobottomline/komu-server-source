@@ -34,6 +34,7 @@ import suwayomi.tachidesk.manga.impl.backup.proto.handlers.BackupMangaHandler
 import suwayomi.tachidesk.manga.impl.backup.proto.handlers.BackupSettingsHandler
 import suwayomi.tachidesk.manga.impl.backup.proto.handlers.BackupSourceHandler
 import suwayomi.tachidesk.manga.impl.backup.proto.models.Backup
+import suwayomi.tachidesk.manga.model.table.CategoryTable
 import suwayomi.tachidesk.manga.model.table.ChapterTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
 import java.io.InputStream
@@ -110,11 +111,23 @@ object ProtoBackupImport : ProtoBackupBase() {
         )
     }
 
-    @OptIn(DelicateCoroutinesApi::class)
     fun restore(
         sourceStream: InputStream,
         flags: BackupFlags,
-        isSync: Boolean = false,
+        syncMode: SyncRestoreMode = SyncRestoreMode.NONE,
+    ): String = queueRestore(flags, syncMode) { decode(sourceStream, syncMode) }
+
+    fun restore(
+        backup: Backup,
+        flags: BackupFlags,
+        syncMode: SyncRestoreMode = SyncRestoreMode.NONE,
+    ): String = queueRestore(flags, syncMode) { backup }
+
+    @OptIn(DelicateCoroutinesApi::class)
+    private fun queueRestore(
+        flags: BackupFlags,
+        syncMode: SyncRestoreMode,
+        load: () -> Backup,
     ): String {
         val restoreId = System.currentTimeMillis().toString()
 
@@ -123,7 +136,7 @@ object ProtoBackupImport : ProtoBackupBase() {
         updateRestoreState(restoreId, BackupRestoreState.Idle)
 
         GlobalScope.launch {
-            restoreLegacy(sourceStream, restoreId, flags, isSync)
+            runRestore(restoreId, flags, syncMode, load)
         }
 
         return restoreId
@@ -133,12 +146,19 @@ object ProtoBackupImport : ProtoBackupBase() {
         sourceStream: InputStream,
         restoreId: String = "legacy",
         flags: BackupFlags = BackupFlags.DEFAULT,
-        isSync: Boolean = false,
+        syncMode: SyncRestoreMode = SyncRestoreMode.NONE,
+    ): ValidationResult = runRestore(restoreId, flags, syncMode) { decode(sourceStream, syncMode) }
+
+    private suspend fun runRestore(
+        restoreId: String,
+        flags: BackupFlags,
+        syncMode: SyncRestoreMode,
+        load: () -> Backup,
     ): ValidationResult =
         backupMutex.withLock {
             try {
                 logger.info { "restore($restoreId): restoring..." }
-                performRestore(restoreId, sourceStream, flags, isSync)
+                performRestore(restoreId, load(), flags, syncMode)
             } catch (e: Exception) {
                 logger.error(e) { "restore($restoreId): failed due to" }
 
@@ -149,27 +169,59 @@ object ProtoBackupImport : ProtoBackupBase() {
                     emptyList(),
                     emptyList(),
                 )
+            } catch (e: OutOfMemoryError) {
+                logger.error { "restore($restoreId): out of memory" }
+
+                updateRestoreState(restoreId, BackupRestoreState.Failure)
+                ValidationResult(
+                    emptyList(),
+                    emptyList(),
+                    emptyList(),
+                    emptyList(),
+                )
             } finally {
+                if (syncMode.isSync) {
+                    clearSyncingFlags()
+                }
                 logger.info { "restore($restoreId): finished with state ${getRestoreState(restoreId)?.toStatus()?.state}" }
                 cleanupRestoreState(restoreId)
             }
         }
 
-    private fun performRestore(
-        id: String,
+    private fun clearSyncingFlags() {
+        transaction {
+            MangaTable.update({ MangaTable.isSyncing eq true }) {
+                it[isSyncing] = false
+            }
+            ChapterTable.update({ ChapterTable.isSyncing eq true }) {
+                it[isSyncing] = false
+            }
+            CategoryTable.update({ CategoryTable.isSyncing eq true }) {
+                it[isSyncing] = false
+            }
+        }
+    }
+
+    private fun decode(
         sourceStream: InputStream,
-        flags: BackupFlags,
-        isSync: Boolean,
-    ): ValidationResult {
-        val backupString =
+        syncMode: SyncRestoreMode,
+    ): Backup {
+        val bytes =
             sourceStream
                 .source()
                 .run {
-                    if (!isSync) gzip() else this
+                    if (!syncMode.isSync) gzip() else this
                 }.buffer()
                 .use { it.readByteArray() }
-        val backup = parser.decodeFromByteArray(Backup.serializer(), backupString)
+        return parser.decodeFromByteArray(Backup.serializer(), bytes)
+    }
 
+    private fun performRestore(
+        id: String,
+        backup: Backup,
+        flags: BackupFlags,
+        syncMode: SyncRestoreMode,
+    ): ValidationResult {
         val validationResult = validate(backup)
 
         val restoreCategories = if (flags.includeCategories) 1 else 0
@@ -190,7 +242,7 @@ object ProtoBackupImport : ProtoBackupBase() {
         val categoryMapping =
             if (flags.includeCategories) {
                 updateRestoreState(id, BackupRestoreState.RestoringCategories(restoreSettings + restoreCategories, restoreAmount))
-                BackupCategoryHandler.restore(backup.backupCategories)
+                BackupCategoryHandler.restore(backup.backupCategories, syncMode)
             } else {
                 emptyMap()
             }
@@ -226,6 +278,7 @@ object ProtoBackupImport : ProtoBackupBase() {
                     sourceMapping = sourceMapping,
                     errors = errors,
                     flags = flags,
+                    syncMode = syncMode,
                 )
             }
         }
@@ -242,17 +295,6 @@ object ProtoBackupImport : ProtoBackupBase() {
             - Missing Trackers:
                 ${validationResult.missingTrackers.joinToString("\n                    ")}
             """.trimIndent()
-        }
-
-        if (isSync) {
-            transaction {
-                MangaTable.update({ MangaTable.isSyncing eq true }) {
-                    it[isSyncing] = false
-                }
-                ChapterTable.update({ ChapterTable.isSyncing eq true }) {
-                    it[isSyncing] = false
-                }
-            }
         }
 
         updateRestoreState(id, BackupRestoreState.Success)

@@ -53,7 +53,7 @@ internal object ExtensionJarArtifactInspector {
                 ?.takeUnless { it == "0" }
                 ?: versionName.substringBeforeLast('.', missingDelimiterValue = "")
         val sourceClass = requireNotNull(metaData[METADATA_SOURCE_CLASS]) { "Extension JAR has no source class" }
-        val classFQName = sourceClass.toClassFQName(manifest.packageName)
+        val classFQName = resolveSourceClassName(sourceClass, manifest.packageName, extensionLib)
         val contentWarning = parseContentWarning(metaData)
         val extensionName =
             metaData[METADATA_NAME]
@@ -109,12 +109,21 @@ internal object ExtensionJarArtifactInspector {
         }
     }
 
-    private fun String.toClassFQName(packageName: String): String {
+    /** Resolves only package-local classes and the exact API 1.6 compiler entry point. */
+    internal fun resolveSourceClassName(
+        sourceClass: String,
+        packageName: String,
+        extensionLib: String,
+    ): String {
         require(PACKAGE_NAME_PATTERN.matches(packageName)) { "Extension packageName is invalid" }
         val candidate =
             when {
-                startsWith('.') -> packageName + this
-                startsWith("$packageName.") -> this
+                sourceClass.startsWith('.') -> packageName + sourceClass
+                sourceClass.startsWith("$packageName.") -> sourceClass
+                // Keiyoushi's compiler generates this fixed FQN independently of the
+                // extension package. Its bytes must still be authenticated in this JAR;
+                // shadow validation binds its produced source IDs to the store snapshot.
+                extensionLib == "1.6" && sourceClass == "keiyoushi.source.Generated" -> sourceClass
                 else -> throw SecurityException("Extension source class escapes its package namespace")
             }
         require(CLASS_NAME_PATTERN.matches(candidate)) { "Extension source class is not a valid JVM class name" }

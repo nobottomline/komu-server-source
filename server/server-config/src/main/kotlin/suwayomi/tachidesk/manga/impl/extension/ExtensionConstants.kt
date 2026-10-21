@@ -3,5 +3,5 @@ package suwayomi.tachidesk.manga.impl.extension
 val repoMatchRegex =
     (
         "https:\\/\\/(?>www\\.|raw\\.)?(github|githubusercontent)\\.com" +
-            "\\/([^\\/]+)\\/([^\\/]+)(?>(?>\\/tree|\\/blob)?\\/([^\\/\\n]*))?(?>\\/([^\\/\\n]*\\.json)?)?"
+            "\\/([^\\/]+)\\/([^\\/]+)(?>(?>\\/tree|\\/blob)?\\/([^\\/\\n]*))?(?>\\/([^\\/\\n]*\\.(?:json|pb))?)?"
     ).toRegex()

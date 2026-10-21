@@ -185,7 +185,14 @@ internal class ExtensionJarPreflightPipeline(
             "Authenticated JAR has an invalid decoded-content size"
         }
         require(CLASS_NAME_PATTERN.matches(metadata.classFQName)) { "Authenticated JAR source class name is invalid" }
-        requireIdentity(metadata.classFQName.startsWith("${expected.pkgName}."), "source class namespace")
+        requireIdentity(
+            ExtensionJarArtifactInspector.resolveSourceClassName(
+                metadata.classFQName,
+                expected.pkgName,
+                expected.extensionLib,
+            ) == metadata.classFQName,
+            "source class namespace",
+        )
         val classEntry = metadata.classFQName.replace('.', '/') + ".class"
         requireIdentity(classEntry in metadata.signature.verifiedEntryNames, "source class authentication")
     }

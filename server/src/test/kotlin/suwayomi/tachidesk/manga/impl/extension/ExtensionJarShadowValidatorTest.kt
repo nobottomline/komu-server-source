@@ -40,6 +40,28 @@ class ExtensionJarShadowValidatorTest {
     }
 
     @Test
+    fun `fixed generated factory remains bound to exact store source identities`() {
+        val className = "keiyoushi.source.Generated"
+        val jar = compileFixture(listOf(SOURCE_ID), className = className)
+        val metadata = artifactMetadata().copy(classFQName = className)
+        val expected = extensionInfo(listOf(source(SOURCE_ID)))
+
+        val result = ExtensionJarShadowValidator.validate(jar, metadata, expected, emptyMap())
+        assertEquals(listOf(ExtensionJarShadowValidator.SourceMetadata(SOURCE_ID, SOURCE_NAME, "all")), result.sources)
+        assertThrows(IllegalStateException::class.java) {
+            ExtensionJarShadowValidator.validate(
+                jar,
+                metadata,
+                expected.copy(sources = listOf(source(SOURCE_ID + 1))),
+                emptyMap(),
+            )
+        }
+        assertThrows(IllegalStateException::class.java) {
+            ExtensionJarShadowValidator.validate(jar, metadata, expected, mapOf(SOURCE_ID to "$PACKAGE_NAME.other"))
+        }
+    }
+
+    @Test
     fun `candidate duplicate source IDs are rejected`() {
         val jar = compileFixture(listOf(SOURCE_ID, SOURCE_ID))
 
@@ -149,13 +171,14 @@ class ExtensionJarShadowValidatorTest {
     private fun compileFixture(
         sourceIDs: List<Long>,
         catalogue: Boolean = true,
+        className: String = "$PACKAGE_NAME.ShadowFixtureFactory",
     ): Path {
         val sourceRoot = temporaryDirectory.resolve("java-${sourceIDs.size}-${System.nanoTime()}")
-        val sourcePath = sourceRoot.resolve("${PACKAGE_NAME.replace('.', '/')}/ShadowFixtureFactory.java")
+        val sourcePath = sourceRoot.resolve("${className.replace('.', '/')}.java")
         val classes = sourceRoot.resolve("classes")
         Files.createDirectories(sourcePath.parent)
         Files.createDirectories(classes)
-        Files.writeString(sourcePath, javaFixture(sourceIDs, catalogue))
+        Files.writeString(sourcePath, javaFixture(sourceIDs, catalogue, className))
 
         val compiler = requireNotNull(ToolProvider.getSystemJavaCompiler()) { "Tests require a JDK compiler" }
         val exitCode =
@@ -190,11 +213,12 @@ class ExtensionJarShadowValidatorTest {
     private fun javaFixture(
         sourceIDs: List<Long>,
         catalogue: Boolean,
+        className: String,
     ): String {
         val ids = sourceIDs.joinToString(", ") { "${it}L" }
         val interfaces = if (catalogue) "CatalogueSource.class" else "Source.class"
         return """
-            package $PACKAGE_NAME;
+            package ${className.substringBeforeLast('.')};
 
             import eu.kanade.tachiyomi.source.CatalogueSource;
             import eu.kanade.tachiyomi.source.Source;
@@ -203,7 +227,7 @@ class ExtensionJarShadowValidatorTest {
             import java.util.ArrayList;
             import java.util.List;
 
-            public final class ShadowFixtureFactory implements SourceFactory {
+            public final class ${className.substringAfterLast('.')} implements SourceFactory {
                 @Override public List<Source> createSources() {
                     long[] ids = new long[] { $ids };
                     List<Source> result = new ArrayList<>();

@@ -4,21 +4,24 @@ import de.neonew.exposed.migrations.loadMigrationsFrom
 import de.neonew.exposed.migrations.runMigrations
 import org.jetbrains.exposed.v1.core.DatabaseConfig
 import org.jetbrains.exposed.v1.core.ExperimentalKeywordApi
+import org.jetbrains.exposed.v1.exceptions.ExposedSQLException
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.server.ServerConfig
+import suwayomi.tachidesk.server.database.migration.M0067_PreventDuplicatedCategoryManga
 import suwayomi.tachidesk.test.ApplicationTest
 import java.util.UUID
 
 /** Protects the published Komu migration history from upstream number reuse. */
 class DatabaseMigrationLineTest : ApplicationTest() {
     @Test
-    fun `fresh database records the collision-safe ledger through version 64`() {
+    fun `fresh database records the collision-safe ledger through version 70`() {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
         val fixtureDatabase = createFixtureDatabase("komu_fresh")
 
@@ -48,7 +51,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
             runMigrations(migrations.filter { it.version <= 57 }, fixtureDatabase)
             insertReleasedKomuData(fixtureDatabase)
-            runMigrations(migrations.filter { it.version <= 64 }, fixtureDatabase)
+            runMigrations(migrations, fixtureDatabase)
 
             assertEquals(expectedLedger, readLedger(fixtureDatabase))
             assertEquals(
@@ -78,6 +81,183 @@ class DatabaseMigrationLineTest : ApplicationTest() {
         } finally {
             TransactionManager.closeAndUnregister(fixtureDatabase)
             TransactionManager.defaultDatabase = previousDefaultDatabase
+        }
+    }
+
+    @Test
+    fun `released Komu version 65 keeps data and repairs category links and dates once`() {
+        val previousDefaultDatabase = TransactionManager.defaultDatabase
+        val fixtureDatabase = createFixtureDatabase("komu_v65")
+
+        try {
+            val migrations = loadMigrationLine()
+            assertEquals((1..70).toList(), migrations.map { it.version }.sorted())
+            runMigrations(migrations.filter { it.version <= 65 }, fixtureDatabase)
+            insertReleasedKomuDataAt65(fixtureDatabase)
+            val publishedLedger = readLedger(fixtureDatabase)
+            val extensionBefore = readExtensionSnapshot(fixtureDatabase)
+            val metadataBefore = readMetadataSnapshot(fixtureDatabase)
+
+            runMigrations(migrations, fixtureDatabase)
+
+            assertEquals(publishedLedger, readLedger(fixtureDatabase).filterKeys { it <= 65 })
+            assertEquals(expectedLedger, readLedger(fixtureDatabase))
+            assertEquals(extensionBefore, readExtensionSnapshot(fixtureDatabase))
+            assertEquals(metadataBefore, readMetadataSnapshot(fixtureDatabase))
+            assertReleasedLibraryAfterUpgrade(fixtureDatabase)
+
+            // Re-entering the upgrade path must not reapply the timestamp multiplication
+            // or duplicate ledger rows, indexes, triggers, or constraints.
+            runMigrations(migrations, fixtureDatabase)
+            assertEquals(expectedLedger, readLedger(fixtureDatabase))
+            assertReleasedLibraryAfterUpgrade(fixtureDatabase)
+            assertEquals(expectedSyncYomiTriggers, readTriggers(fixtureDatabase))
+
+            assertThrows(ExposedSQLException::class.java) {
+                transaction(fixtureDatabase) {
+                    exec("INSERT INTO CATEGORYMANGA (MANGA, CATEGORY) VALUES (1001, 1001)")
+                }
+            }
+        } finally {
+            TransactionManager.closeAndUnregister(fixtureDatabase)
+            TransactionManager.defaultDatabase = previousDefaultDatabase
+        }
+    }
+
+    @Test
+    fun `interrupted H2 DDL resumes before the migration ledger is written`() {
+        val previousDefaultDatabase = TransactionManager.defaultDatabase
+        val migrations = loadMigrationLine()
+
+        // Each case starts from released schema 65 and simulates a separate
+        // termination boundary, including DDL committed without a ledger row.
+        for (interruptedVersion in 66..69) {
+            val fixtureDatabase = createFixtureDatabase("komu_interrupted_$interruptedVersion")
+            try {
+                runMigrations(migrations.filter { it.version <= 65 }, fixtureDatabase)
+                insertReleasedKomuDataAt65(fixtureDatabase)
+                runMigrations(migrations.filter { it.version < interruptedVersion }, fixtureDatabase)
+                transaction(fixtureDatabase) {
+                    when (interruptedVersion) {
+                        66 -> {
+                            exec("CREATE INDEX idx_categorymanga_category ON CATEGORYMANGA (CATEGORY)")
+                            exec("CREATE INDEX idx_categorymanga_manga ON CATEGORYMANGA (MANGA)")
+                        }
+
+                        67 -> M0067_PreventDuplicatedCategoryManga().run()
+
+                        68 ->
+                            exec(
+                                """
+                                CREATE TRIGGER delete_manga_category_update_version
+                                AFTER DELETE ON categorymanga
+                                FOR EACH ROW
+                                CALL "suwayomi.tachidesk.server.database.trigger.DeleteMangaCategoryUpdateVersionTrigger"
+                                """.trimIndent(),
+                            )
+
+                        69 -> {
+                            exec("ALTER TABLE category ADD COLUMN flags INT NOT NULL DEFAULT 0")
+                            exec("ALTER TABLE manga ADD COLUMN viewer INT NOT NULL DEFAULT 0")
+                        }
+
+                        else -> error("Unexpected interruption version: $interruptedVersion")
+                    }
+                }
+
+                assertEquals(interruptedVersion - 1, readLedger(fixtureDatabase).keys.maxOrNull())
+                runMigrations(migrations, fixtureDatabase)
+                assertEquals(expectedLedger, readLedger(fixtureDatabase))
+                assertReleasedLibraryAfterUpgrade(fixtureDatabase)
+                assertEquals(expectedSyncYomiTriggers, readTriggers(fixtureDatabase))
+            } finally {
+                TransactionManager.closeAndUnregister(fixtureDatabase)
+                TransactionManager.defaultDatabase = previousDefaultDatabase
+            }
+        }
+    }
+
+    private fun insertReleasedKomuDataAt65(database: Database) {
+        transaction(database) {
+            exec(
+                """
+                INSERT INTO EXTENSION (
+                    APK_NAME, REPO, NAME, PKG_NAME, VERSION_NAME, VERSION_CODE, LANG,
+                    IS_NSFW, IS_INSTALLED, BASE_URL, SOURCE_LANGS, IS_CUSTOM_PINNED,
+                    STORE_INDEX_URL, EXTENSION_LIB, CONTENT_WARNING
+                ) VALUES (
+                    'fixture.apk', 'https://repo.invalid/index.pb', 'Fixture',
+                    'app.komu.fixture', '1.6.7', 7, 'en', TRUE, TRUE,
+                    'https://fixture.invalid', 'en,ja', TRUE,
+                    'https://repo.invalid/index.pb', '1.6', 1
+                )
+                """.trimIndent(),
+            )
+            exec("INSERT INTO GLOBALMETA (META_KEY, \"VALUE\") VALUES ('fixture-key', 'fixture-value')")
+            exec(
+                """
+                INSERT INTO MANGA (ID, URL, TITLE, SOURCE, IN_LIBRARY, MEMO)
+                VALUES (1001, '/fixture', 'Preserved library manga', 999991, TRUE, '{"position":"saved"}')
+                """.trimIndent(),
+            )
+            exec("INSERT INTO CATEGORY (ID, NAME, SORT_ORDER) VALUES (1001, 'Preserved category', 1)")
+            exec("INSERT INTO CATEGORYMANGA (ID, MANGA, CATEGORY) VALUES (1001, 1001, 1001)")
+            exec("INSERT INTO CATEGORYMANGA (ID, MANGA, CATEGORY) VALUES (1002, 1001, 1001)")
+            exec(
+                """
+                INSERT INTO CHAPTER (
+                    ID, URL, NAME, MANGA, SOURCE_ORDER, DATE_UPLOAD, READ, BOOKMARK,
+                    LAST_PAGE_READ, LAST_READ_AT, MEMO, VERSION, IS_SYNCING, LAST_MODIFIED_AT
+                ) VALUES (
+                    2001, '/chapter/1', 'Seconds date', 1001, 0, 1700000000, TRUE, TRUE,
+                    7, 1700000100000, '{"reader":"saved"}', 11, TRUE, 1234
+                ), (
+                    2002, '/chapter/2', 'Milliseconds date', 1001, 1, 1700000000000, FALSE, FALSE,
+                    0, 0, '{}', 2, TRUE, 1235
+                ), (
+                    2003, '/chapter/3', 'Unknown date', 1001, 2, 0, FALSE, FALSE,
+                    0, 0, '{}', 3, TRUE, 1236
+                )
+                """.trimIndent(),
+            )
+        }
+    }
+
+    private fun assertReleasedLibraryAfterUpgrade(database: Database) {
+        transaction(database) {
+            exec("SELECT TITLE, IN_LIBRARY, MEMO FROM MANGA WHERE ID = 1001") { rows ->
+                assertTrue(rows.next())
+                assertEquals("Preserved library manga", rows.getString("TITLE"))
+                assertTrue(rows.getBoolean("IN_LIBRARY"))
+                assertEquals("{\"position\":\"saved\"}", rows.getString("MEMO"))
+            }
+            exec("SELECT NAME, SORT_ORDER, FLAGS FROM CATEGORY WHERE ID = 1001") { rows ->
+                assertTrue(rows.next())
+                assertEquals("Preserved category", rows.getString("NAME"))
+                assertEquals(1, rows.getInt("SORT_ORDER"))
+                assertEquals(0, rows.getInt("FLAGS"))
+            }
+            exec("SELECT ID FROM CATEGORYMANGA WHERE MANGA = 1001 AND CATEGORY = 1001") { rows ->
+                assertTrue(rows.next())
+                assertEquals(1001, rows.getInt("ID"))
+                assertTrue(!rows.next())
+            }
+            exec("SELECT * FROM CHAPTER WHERE ID BETWEEN 2001 AND 2003 ORDER BY ID") { rows ->
+                assertTrue(rows.next())
+                assertEquals(1700000000000L, rows.getLong("DATE_UPLOAD"))
+                assertTrue(rows.getBoolean("READ"))
+                assertTrue(rows.getBoolean("BOOKMARK"))
+                assertEquals(7, rows.getInt("LAST_PAGE_READ"))
+                assertEquals(1700000100000L, rows.getLong("LAST_READ_AT"))
+                assertEquals("{\"reader\":\"saved\"}", rows.getString("MEMO"))
+                assertEquals(11L, rows.getLong("VERSION"))
+                assertEquals(1234L, rows.getLong("LAST_MODIFIED_AT"))
+                assertTrue(rows.next())
+                assertEquals(1700000000000L, rows.getLong("DATE_UPLOAD"))
+                assertTrue(rows.next())
+                assertEquals(0L, rows.getLong("DATE_UPLOAD"))
+                assertTrue(!rows.next())
+            }
         }
     }
 
@@ -172,7 +352,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
         transaction(database) {
             exec(
                 "SELECT VERSION, NAME FROM MIGRATIONS " +
-                    "WHERE VERSION BETWEEN 55 AND 64 ORDER BY VERSION",
+                    "WHERE VERSION BETWEEN 55 AND 70 ORDER BY VERSION",
             ) { rows ->
                 buildMap {
                     while (rows.next()) {
@@ -283,6 +463,12 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 62 to "AddJarUrlToExtensionTable",
                 63 to "AddExtensionActivationMarker",
                 64 to "AddExtensionStoreArtifactLedger",
+                65 to "MakeExtensionPkgNameUnique",
+                66 to "CreateForeignKeyIndexes",
+                67 to "PreventDuplicatedCategoryManga",
+                68 to "FixSyncYomiTriggers",
+                69 to "AddSyncFlags",
+                70 to "FixSecondsFallbackUploadDate",
             )
 
         val expectedCompatibilityColumns =
@@ -311,6 +497,10 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
         val expectedTargetColumns =
             setOf(
+                "CATEGORY" to "FLAGS",
+                "MANGA" to "VIEWER",
+                "MANGA" to "VIEWER_FLAGS",
+                "MANGA" to "CHAPTER_FLAGS",
                 "MANGA" to "MEMO",
                 "CHAPTER" to "MEMO",
                 "EXTENSION" to "STORE_INDEX_URL",
@@ -342,6 +532,8 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 "INSERT_MANGA_CATEGORY_UPDATE_VERSION",
                 "INSERT_CATEGORY_UID",
                 "UPDATE_CATEGORY_VERSION",
+                "DELETE_MANGA_CATEGORY_UPDATE_VERSION",
+                "TRACKRECORD_UPDATE_MANGA_VERSION",
             )
     }
 }

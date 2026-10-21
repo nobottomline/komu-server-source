@@ -15,6 +15,14 @@ to new Komu numbers.
 | 60 | `M0060_AddNewExtensionApiFields` | upstream `M0057` (`2d535b44`) | expand-only semantic port |
 | 61 | `M0061_AddExtensionStore` | upstream `M0058` (`2d535b44`) | semantic port |
 | 62 | `M0062_AddJarUrlToExtensionTable` | upstream `M0059` (`d34a486d`) | semantic port |
+| 63 | `M0063_AddExtensionActivationMarker` | Komu | released activation journal |
+| 64 | `M0064_AddExtensionStoreArtifactLedger` | Komu | released artifact custody ledger |
+| 65 | `M0065_MakeExtensionPkgNameUnique` | upstream `M0060` | released package identity constraint |
+| 66 | `M0066_CreateForeignKeyIndexes` | upstream `M0061` (`fba61e1a`) | resumable index creation |
+| 67 | `M0067_PreventDuplicatedCategoryManga` | upstream `M0062` (`7dbf2ed4`) | deduplicate memberships, then enforce uniqueness |
+| 68 | `M0068_FixSyncYomiTriggers` | upstream `M0063` (`9eb779d1`) | sync trigger repair |
+| 69 | `M0069_AddSyncFlags` | upstream `M0064` (`ee547c03`) | preserve opaque reader/category flags |
+| 70 | `M0070_FixSecondsFallbackUploadDate` | upstream `M0065` (`dba836b2`) | repair seconds stored in a millisecond column |
 
 Rules:
 
@@ -36,3 +44,22 @@ Rules:
 7. No database produced by this reconciliation branch is considered
    production-compatible until the H2 upgrade fixture, fresh startup and
    embedded OpenJ9/iOS test all pass.
+
+
+## v2.4 reconciliation and interrupted H2 upgrades
+
+The August release already recorded Komu versions 61 through 65. The stable
+Suwayomi v2.4.2366 operations therefore append as 66 through 70; importing
+upstream class names unchanged would create duplicate migration numbers.
+
+H2 commits DDL before the migration ledger transaction completes. New indexes,
+columns, and the membership constraint permit replay after a process dies in
+that window. PostgreSQL retains transactional constraint creation. Existing
+published migrations retain their identities; upstream's interrupted SyncYomi
+creation repair remains at Komu version 59.
+
+`DatabaseMigrationLineTest` exercises fresh, released 57, and released 65
+ledgers through 70. It preserves installed/custom extension and source records,
+library/category state, chapter read/bookmark/page/memo values, and the old
+ledger; checks deduplication and one-time timestamp repair; and replays partial
+DDL at each new schema boundary before its ledger entry exists.

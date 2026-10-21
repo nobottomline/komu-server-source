@@ -262,6 +262,124 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
         }
 
     @Test
+    fun `total refresh failure preserves the last catalogue and installed update candidates`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = store(STORE_A, "a".repeat(64))
+                insertStore(storeA)
+                insertInstalledExtension(TARGET_PKG, versionCode = 1, sourceID = 101)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(
+                        extension(storeA, 2, listOf(source(101, "Installed source"))),
+                        extension(storeA, 3, listOf(source(301, "Available source")), B_ONLY_PKG),
+                    ),
+                    listOf(storeA),
+                )
+                val catalogue = ExtensionsList.extensionTableAsDataClass().sortedBy { it.pkgName }
+                val updateCandidates = ExtensionsList.updateMap.toMap()
+                val snapshot = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+
+                ExtensionsList.reconcileExtensionDatabase(emptyList(), emptyList())
+
+                assertEquals(catalogue, ExtensionsList.extensionTableAsDataClass().sortedBy { it.pkgName })
+                assertEquals(updateCandidates, ExtensionsList.updateMap.toMap())
+                val retainedSnapshot = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                assertEquals(snapshot.ledgerEntryID, retainedSnapshot.ledgerEntryID)
+                assertEquals(snapshot.storeSnapshotToken, retainedSnapshot.storeSnapshotToken)
+                assertEquals(snapshot.expectedSigningKey, retainedSnapshot.expectedSigningKey)
+                assertEquals(snapshot.expected, retainedSnapshot.expected)
+            }
+        }
+
+    @Test
+    fun `total refresh failure preserves configured rows before their first successful ledger snapshot`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = store(STORE_A, "a".repeat(64))
+                insertStore(storeA)
+                insertInstalledExtension(TARGET_PKG, versionCode = 1, sourceID = 101)
+                // Released databases can have catalogue rows before the ledger has fetched
+                // this store. Failed network requests cannot make those rows authoritative.
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(
+                        extension(storeA, 2, listOf(source(101, "Installed source"))),
+                        extension(storeA, 3, listOf(source(301, "Available source")), B_ONLY_PKG),
+                    ),
+                )
+                val catalogue = ExtensionsList.extensionTableAsDataClass().sortedBy { it.pkgName }
+                val updateCandidates = ExtensionsList.updateMap.toMap()
+
+                ExtensionsList.reconcileExtensionDatabase(emptyList(), emptyList())
+
+                assertEquals(catalogue, ExtensionsList.extensionTableAsDataClass().sortedBy { it.pkgName })
+                assertEquals(updateCandidates, ExtensionsList.updateMap.toMap())
+            }
+        }
+
+    @Test
+    fun `a successfully refreshed empty store removes its catalogue but retains installed runtime`() =
+        runBlocking {
+            withFixtureDatabase {
+                val storeA = prepareInstalledAndAvailableCatalogue()
+
+                ExtensionsList.reconcileExtensionDatabase(emptyList(), listOf(storeA))
+
+                assertOnlyObsoleteInstalledRuntimeRemains()
+                assertThrows(NoSuchElementException::class.java) {
+                    ExtensionJarPreflightInputRepository.read(TARGET_PKG, STORE_A)
+                }
+            }
+        }
+
+    @Test
+    fun `removing the final store still retires its catalogue during total network failure`() =
+        runBlocking {
+            withFixtureDatabase {
+                prepareInstalledAndAvailableCatalogue()
+                transaction {
+                    ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl eq STORE_A }
+                }
+
+                ExtensionsList.reconcileExtensionDatabase(emptyList(), emptyList())
+
+                assertOnlyObsoleteInstalledRuntimeRemains()
+                assertThrows(NoSuchElementException::class.java) {
+                    ExtensionJarPreflightInputRepository.read(TARGET_PKG, STORE_A)
+                }
+            }
+        }
+
+    private suspend fun prepareInstalledAndAvailableCatalogue(): ExtensionStore {
+        val storeA = store(STORE_A, "a".repeat(64))
+        insertStore(storeA)
+        insertInstalledExtension(TARGET_PKG, versionCode = 1, sourceID = 101)
+        ExtensionsList.reconcileExtensionDatabase(
+            listOf(
+                extension(storeA, 2, listOf(source(101, "Installed source"))),
+                extension(storeA, 3, listOf(source(301, "Available source")), B_ONLY_PKG),
+            ),
+            listOf(storeA),
+        )
+        return storeA
+    }
+
+    private fun assertOnlyObsoleteInstalledRuntimeRemains() {
+        val remaining = ExtensionsList.extensionTableAsDataClass().single()
+        assertEquals(TARGET_PKG, remaining.pkgName)
+        assertEquals(1L, remaining.versionCode)
+        assertEquals("$TARGET_PKG.apk", remaining.apkName)
+        assertTrue(remaining.installed)
+        assertTrue(remaining.obsolete)
+        assertFalse(remaining.hasUpdate)
+        assertTrue(ExtensionsList.updateMap.isEmpty())
+        val source =
+            transaction {
+                SourceTable.selectAll().where { SourceTable.id eq 101L }.single()[SourceTable.name]
+            }
+        assertEquals("Installed 101", source)
+    }
+
+    @Test
     fun `publish authorization atomically commits metadata with the expected marker`() =
         runBlocking {
             withFixtureDatabase {

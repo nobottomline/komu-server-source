@@ -204,6 +204,47 @@ class ExtensionJarPreflightPipelineTest {
         assertFalse(Files.exists(transport.lastPath))
     }
 
+    @Test
+    fun `generated entry point requires its own authenticated class bytes before execution`() =
+        runBlocking {
+            val className = "keiyoushi.source.Generated"
+            for (classAuthenticated in listOf(true, false)) {
+                val events = mutableListOf<String>()
+                val transport = FakeTransport(temporaryDirectory, events)
+                val metadata = artifactMetadata()
+                val candidateMetadata =
+                    metadata.copy(
+                        classFQName = className,
+                        signature = metadata.signature.copy(
+                            verifiedEntryNames =
+                                if (classAuthenticated) {
+                                    setOf("keiyoushi/source/Generated.class")
+                                } else {
+                                    setOf("${PACKAGE_NAME.replace('.', '/')}/ExtensionGenerated.class")
+                                },
+                        ),
+                    )
+                val pipeline =
+                    ExtensionJarPreflightPipeline(
+                        transport,
+                        ExtensionJarPreflightPipeline.ArtifactInspector { _, _, _ -> candidateMetadata },
+                        validator(events),
+                    )
+                if (classAuthenticated) {
+                    pipeline.prepare(extensionInfo(), SIGNING_KEY, temporaryDirectory, emptyMap()).use { candidate ->
+                        assertEquals(className, candidate.metadata.classFQName)
+                        assertEquals(listOf("download", "shadow"), events)
+                    }
+                } else {
+                    assertThrows(SecurityException::class.java) {
+                        runBlocking { pipeline.prepare(extensionInfo(), SIGNING_KEY, temporaryDirectory, emptyMap()) }
+                    }
+                    assertEquals(listOf("download"), events)
+                }
+                assertFalse(Files.exists(transport.lastPath))
+            }
+        }
+
     private fun pipeline(
         transport: ExtensionArtifactTransport,
         events: MutableList<String>,

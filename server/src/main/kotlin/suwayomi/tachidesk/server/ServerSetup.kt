@@ -9,18 +9,12 @@ package suwayomi.tachidesk.server
 
 import android.os.Looper
 import ch.qos.logback.classic.Level
-import com.typesafe.config.Config
-import com.typesafe.config.ConfigException
-import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigRenderOptions
-import com.typesafe.config.ConfigValue
-import com.typesafe.config.parser.ConfigDocument
 import dorkbox.updates.Updates
 import eu.kanade.tachiyomi.App
 import eu.kanade.tachiyomi.createAppModule
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.source.local.LocalSource
-import io.github.config4k.toConfig
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.javalin.json.JavalinJackson3
 import io.javalin.json.JsonMapper
@@ -103,6 +97,8 @@ class ApplicationDirs(
         get() = "$downloadsRoot/thumbnails"
     val mangaDownloadsRoot
         get() = "$downloadsRoot/mangas"
+
+    val cacheDir = "$dataRoot/cache"
 }
 
 @Suppress("DEPRECATION")
@@ -147,95 +143,6 @@ fun setupLogLevelUpdating(
         },
         ignoreInitialValue = false,
     )
-}
-
-fun migrateConfigValue(
-    configDocument: ConfigDocument,
-    config: Config,
-    configKey: String,
-    toConfigKey: String,
-    toType: (ConfigValue) -> Any?,
-): ConfigDocument {
-    try {
-        val configValue = config.getValue(configKey)
-        val typedValue = toType(configValue)
-        if (typedValue != null) {
-            logger.debug { "Migrating config value: $configKey -> $toConfigKey" }
-            return configDocument.withValue(
-                toConfigKey,
-                typedValue.toConfig("internal").getValue("internal"),
-            )
-        }
-    } catch (_: ConfigException) {
-        // ignore, likely already migrated
-    }
-
-    return configDocument
-}
-
-fun migrateConfig(
-    configDocument: ConfigDocument,
-    config: Config,
-): ConfigDocument {
-    var updatedConfig = configDocument
-    // `config` is normally resolved with server-reference.conf as its
-    // fallback. A replacement key can therefore appear to exist even when it
-    // is absent from the user's server.conf, which used to suppress legacy
-    // migrations whenever the replacement had a reference default (notably
-    // extensionRepos -> extensionStores, whose default is an empty list).
-    // Presence and values for a user-config migration must come from the
-    // document being rewritten, never from its fallback layer.
-    val userConfig = ConfigFactory.parseString(configDocument.render())
-
-    val settingsRequiringMigration = SettingsRegistry.getAll().filterValues { it.deprecated?.replaceWith != null }
-    settingsRequiringMigration.forEach { (name, data) ->
-        val configKey = "server.$name"
-        val toConfigKey = "server.${data.deprecated!!.replaceWith}"
-
-        try {
-            userConfig.getValue(configKey)
-        } catch (_: ConfigException) {
-            // Ignore, no migration required
-            return@forEach
-        }
-
-        try {
-            userConfig.getValue(toConfigKey)
-            // An explicitly configured replacement is authoritative. This also
-            // makes partially completed/repeated migrations idempotent.
-            return@forEach
-        } catch (_: ConfigException) {
-            // No replacement value exists yet; migrate the deprecated value.
-        }
-
-        logger.debug { "Migrating config value: $configKey -> $toConfigKey" }
-
-        try {
-            if (data.deprecated!!.migrateConfig != null) {
-                updatedConfig = data.deprecated!!.migrateConfig!!(userConfig.getValue(configKey), updatedConfig)
-                return@forEach
-            }
-
-            if (data.deprecated!!.migrateConfigValue != null) {
-                updatedConfig =
-                    migrateConfigValue(
-                        updatedConfig,
-                        userConfig,
-                        configKey,
-                        toConfigKey,
-                        data.deprecated!!.migrateConfigValue!!,
-                    )
-                return@forEach
-            }
-        } catch (e: Exception) {
-            logger.warn(e) { "Failed to migrate config value: $configKey -> $toConfigKey" }
-            return@forEach
-        }
-
-        shutdownApp(ExitCode.ConfigMigrationMisconfiguredFailure)
-    }
-
-    return updatedConfig
 }
 
 fun serverModule(applicationDirs: ApplicationDirs): Module =
@@ -406,7 +313,15 @@ fun applicationSetup() {
             }
         } else {
             // make sure the user config file is up-to-date
-            GlobalConfigManager.updateUserConfig { migrateConfig(this, it) }
+            GlobalConfigManager.updateUserConfig {
+                try {
+                    migrateConfig(this, it)
+                } catch (e: Throwable) {
+                    logger.error(e) { "Failed to migrate config" }
+                    shutdownApp(ExitCode.ConfigMigrationFailure)
+                    throw e
+                }
+            }
         }
     } catch (e: Exception) {
         logger.error(e) { "Exception while creating initial server.conf" }
@@ -437,9 +352,11 @@ fun applicationSetup() {
         "Localization service initialized. Supported languages: ${LocalizationHelper.getSupportedLocales()}"
     }
 
-    runMigrations(applicationDirs)
-
-    databaseUp()
+    runBlocking {
+        runMigrations(applicationDirs) {
+            databaseUp()
+        }
+    }
     recoverExtensionActivations()
 
     try {

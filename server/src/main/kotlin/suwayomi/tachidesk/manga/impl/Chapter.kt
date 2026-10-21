@@ -16,8 +16,6 @@ import eu.kanade.tachiyomi.util.chapter.ChapterRecognition
 import eu.kanade.tachiyomi.util.chapter.ChapterSanitizer.sanitize
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
 import org.jetbrains.exposed.v1.core.and
@@ -157,7 +155,7 @@ object Chapter {
             chapter.scanlator = chapter.scanlator?.ifBlank { null }?.trim()
         }
 
-        val now = Instant.now().epochSecond
+        val now = Instant.now()
         // Used to not set upload date of older chapters
         // to a higher value than newer chapters
         var maxSeenUploadDate = 0L
@@ -185,7 +183,7 @@ object Chapter {
                     fetchedChapter,
                     chapterEntry?.id ?: 0,
                     index + 1,
-                    now,
+                    now.epochSecond,
                     mangaEntry[MangaTable.id].value,
                     runCatching {
                         (source as? HttpSource)?.getChapterUrl(fetchedChapter)
@@ -195,7 +193,7 @@ object Chapter {
             if (chapterEntry == null) {
                 val newChapterData =
                     if (chapterData.uploadDate == 0L) {
-                        val altDateUpload = if (maxSeenUploadDate == 0L) now else maxSeenUploadDate
+                        val altDateUpload = if (maxSeenUploadDate == 0L) now.toEpochMilli() else maxSeenUploadDate
                         chapterData.copy(uploadDate = altDateUpload)
                     } else {
                         maxSeenUploadDate = max(maxSeenUploadDate, chapterData.uploadDate)
@@ -319,8 +317,6 @@ object Chapter {
                             this[ChapterTable.scanlator] = it.scanlator
                             this[ChapterTable.sourceOrder] = it.index
                             this[ChapterTable.realUrl] = it.realUrl
-                            this[ChapterTable.lastModifiedAt] = it.lastModifiedAt
-                            this[ChapterTable.version] = it.version
                             this[ChapterTable.memo] = it.memo
                             this[ChapterTable.isDownloaded] = currentChapter.downloaded
                             this[ChapterTable.pageCount] = currentChapter.pageCount

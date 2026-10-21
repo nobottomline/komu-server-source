@@ -10,11 +10,11 @@ import java.io.BufferedReader
 const val MainClass = "suwayomi.tachidesk.MainKt"
 
 // should be bumped with each stable release
-val getTachideskVersion = { "v2.3.${getCommitCount()}" }
+val getTachideskVersion = { "v2.4.${getCommitCount()}" }
 
-val webUIRevisionTag = "r3379"
+val webUIRevisionTag = "r3518"
 
-val webviewJbrRelease = "jbr-release-25.0.3b508.16"
+val webviewJbrRelease = "jbr-release-25.0.4b508.27"
 
 private val getCommitCount = {
     runCatching {

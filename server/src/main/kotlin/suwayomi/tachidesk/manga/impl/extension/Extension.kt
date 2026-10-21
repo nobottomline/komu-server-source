@@ -291,7 +291,13 @@ object Extension {
         ) : MetadataProvider {
             override fun getString(key: String): String? = bundle.getString(key)
 
-            override fun getInt(key: String): Int = bundle.getInt(key)
+            @Suppress("DEPRECATION")
+            override fun getInt(key: String): Int =
+                when (val value = bundle.get(key)) {
+                    is Number -> value.toInt()
+                    is String -> value.toIntOrNull() ?: 0
+                    else -> 0
+                }
         }
 
         class FromManifest(
