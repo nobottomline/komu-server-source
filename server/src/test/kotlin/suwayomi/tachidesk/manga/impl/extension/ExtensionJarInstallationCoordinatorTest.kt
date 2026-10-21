@@ -37,6 +37,71 @@ class ExtensionJarInstallationCoordinatorTest : ApplicationTest() {
     lateinit var extensionsRoot: Path
 
     @Test
+    fun `same catalogue refreshed during download does not invalidate authenticated preflight`() =
+        runBlocking {
+            withFixtureDatabase {
+                seedStore(2)
+                val transport = FakeTransport { ExtensionsList.reconcileExtensionDatabase(listOf(extension(2)), listOf(store())) }
+                coordinator(
+                    transport,
+                    committedEffects(mutableListOf()),
+                ).execute(TARGET_PKG, ExtensionJarInstallationCoordinator.Intent.INSTALL)
+                assertEquals(1, transport.downloadCount)
+                assertCommitted(2, "$TARGET_PKG.apk", listOf(SOURCE_ID))
+            }
+        }
+
+    @Test
+    fun `changed catalogue during download retries from new authenticated metadata and cleans discarded staging`() =
+        runBlocking {
+            withFixtureDatabase {
+                seedStore(2)
+                var changed = false
+                val transport =
+                    FakeTransport {
+                        if (!changed) {
+                            changed = true
+                            ExtensionsList.reconcileExtensionDatabase(listOf(extension(3)), listOf(store()))
+                        }
+                    }
+                coordinator(
+                    transport,
+                    committedEffects(mutableListOf()),
+                ).execute(TARGET_PKG, ExtensionJarInstallationCoordinator.Intent.INSTALL)
+                assertEquals(2, transport.downloadCount)
+                assertCommitted(3, "$TARGET_PKG.apk", listOf(SOURCE_ID))
+                assertTrue(transport.paths.all { !Files.exists(it) })
+                assertTrue(ExtensionActivationJournal(extensionsRoot).loadAll().isEmpty())
+            }
+        }
+
+    @Test
+    fun `continuous catalogue churn stops with a stale conflict without publishing or retaining staging`() =
+        runBlocking {
+            withFixtureDatabase {
+                seedStore(2)
+                var version = 2L
+                val transport =
+                    FakeTransport {
+                        version++
+                        ExtensionsList.reconcileExtensionDatabase(listOf(extension(version)), listOf(store()))
+                    }
+                assertThrows(StaleExtensionStoreSnapshotException::class.java) {
+                    runBlocking {
+                        coordinator(
+                            transport,
+                            committedEffects(mutableListOf()),
+                        ).execute(TARGET_PKG, ExtensionJarInstallationCoordinator.Intent.INSTALL)
+                    }
+                }
+                assertEquals(3, transport.downloadCount)
+                assertFalse(extensionInstalled())
+                assertTrue(transport.paths.all { !Files.exists(it) })
+                assertTrue(ExtensionActivationJournal(extensionsRoot).loadAll().isEmpty())
+            }
+        }
+
+    @Test
     fun `fresh intent composes authenticated pipeline and observes commit before runtime effects`() =
         runBlocking {
             withFixtureDatabase {
@@ -216,7 +281,11 @@ class ExtensionJarInstallationCoordinatorTest : ApplicationTest() {
             },
         )
 
-    private inner class FakeTransport : ExtensionArtifactTransport {
+    private inner class FakeTransport(
+        private val duringDownload: suspend () -> Unit = {},
+    ) : ExtensionArtifactTransport {
+        var downloadCount = 0
+        val paths = mutableListOf<Path>()
         lateinit var lastPath: Path
             private set
 
@@ -227,6 +296,9 @@ class ExtensionJarInstallationCoordinatorTest : ApplicationTest() {
                     .substringBefore('.')
                     .toLong()
             lastPath = Files.writeString(request.stagingDirectory.resolve("candidate-${UUID.randomUUID()}.jar"), "candidate-$version")
+            paths.add(lastPath)
+            downloadCount++
+            duringDownload()
             return StagedArtifact(
                 path = lastPath,
                 size = Files.size(lastPath),

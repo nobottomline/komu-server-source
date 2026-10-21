@@ -19,6 +19,7 @@ import suwayomi.tachidesk.server.user.requireUser
 import suwayomi.tachidesk.server.util.handler
 import suwayomi.tachidesk.server.util.pathParam
 import suwayomi.tachidesk.server.util.withOperation
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration.Companion.days
 
 object ExtensionController {
@@ -121,7 +122,14 @@ object ExtensionController {
                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
                 ctx.future {
                     future {
-                        Extension.updateExtension(pkgName)
+                        try {
+                            Extension.updateExtension(pkgName)
+                        } catch (failure: Exception) {
+                            if (failure is CancellationException) throw failure
+                            val response = ExtensionUpdateFailure.from(failure)
+                            logger.warn(failure) { "Extension update failed with ${response.body.code}" }
+                            ctx.status(response.status).json(response.body)
+                        }
                     }
                 }
             },
@@ -129,7 +137,9 @@ object ExtensionController {
                 httpCode(HttpStatus.CREATED)
                 httpCode(HttpStatus.FOUND)
                 httpCode(HttpStatus.NOT_FOUND)
-                httpCode(HttpStatus.INTERNAL_SERVER_ERROR)
+                json<ExtensionUpdateFailure.Body>(HttpStatus.CONFLICT)
+                json<ExtensionUpdateFailure.Body>(HttpStatus.BAD_GATEWAY)
+                json<ExtensionUpdateFailure.Body>(HttpStatus.INTERNAL_SERVER_ERROR)
             },
         )
 

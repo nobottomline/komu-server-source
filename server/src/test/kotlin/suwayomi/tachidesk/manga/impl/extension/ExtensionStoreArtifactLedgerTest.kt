@@ -40,6 +40,74 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
     lateinit var temporaryDirectory: Path
 
     @Test
+    fun `unchanged refresh retains exact trust generation even when a sibling extension changes`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = store(STORE_A, "a".repeat(64))
+                insertStore(store)
+                val target = extension(store, 2, listOf(source(201, "Target")))
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(target, extension(store, 2, listOf(source(301, "Sibling")), B_ONLY_PKG)),
+                    listOf(store),
+                )
+                val before = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(target, extension(store, 3, listOf(source(301, "Sibling")), B_ONLY_PKG)),
+                    listOf(store),
+                )
+                val after = ExtensionJarPreflightInputRepository.readUniquelyOwned(TARGET_PKG)
+                assertEquals(before.ledgerEntryID, after.ledgerEntryID)
+                assertEquals(before.storeSnapshotToken, after.storeSnapshotToken)
+                ExtensionJarPreflightInputRepository.verifyStillCurrent(before, setOf(201))
+                ExtensionsList.reconcileExtensionDatabase(listOf(target), listOf(store.copy(signingKey = "b".repeat(64))))
+                assertThrows(StaleExtensionStoreSnapshotException::class.java) {
+                    ExtensionJarPreflightInputRepository.verifyStillCurrent(before, setOf(201))
+                }
+            }
+        }
+
+    @Test
+    fun `durable update survives lost process projection and completed retries are no ops`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = store(STORE_A, "a".repeat(64))
+                insertStore(store)
+                insertInstalledExtension(TARGET_PKG, 1, 101)
+                ExtensionsList.reconcileExtensionDatabase(listOf(extension(store, 2, listOf(source(101, "Target")))), listOf(store))
+                ExtensionsList.updateMap.clear()
+                assertTrue(Extension.hasPublishedUpdate(TARGET_PKG))
+                transaction {
+                    ExtensionTable.update({ ExtensionTable.pkgName eq TARGET_PKG }) {
+                        it[versionCode] = 2
+                        it[hasUpdate] = false
+                    }
+                }
+                assertFalse(Extension.hasPublishedUpdate(TARGET_PKG))
+                assertEquals(TARGET_PKG, Extension.updateExtension(TARGET_PKG))
+                transaction {
+                    ExtensionTable.update({ ExtensionTable.pkgName eq TARGET_PKG }) { it[isCustomPinned] = true }
+                }
+                assertThrows(CustomPinnedExtensionUpdateException::class.java) { Extension.hasPublishedUpdate(TARGET_PKG) }
+                assertThrows(NoSuchElementException::class.java) { Extension.hasPublishedUpdate("absent.extension") }
+            }
+        }
+
+    @Test
+    fun `APK only legacy update availability does not require a JAR signer or positive source identity`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = store(STORE_A, "").copy(isLegacy = true)
+                insertStore(store)
+                insertInstalledExtension(TARGET_PKG, 1, 101)
+                val candidate = extension(store, 2, listOf(source(0, "Legacy"))).copy(jarUrl = null)
+                ExtensionsList.reconcileExtensionDatabase(listOf(candidate), listOf(store))
+                ExtensionsList.updateMap.clear()
+                assertTrue(Extension.hasPublishedUpdate(TARGET_PKG))
+                assertEquals(2, ExtensionStoreArtifactLedger.readUpdateCandidate(TARGET_PKG).versionCode)
+            }
+        }
+
+    @Test
     fun `automatic direct jar ownership fails closed for duplicate packages across stores`() =
         runBlocking {
             withFixtureDatabase {

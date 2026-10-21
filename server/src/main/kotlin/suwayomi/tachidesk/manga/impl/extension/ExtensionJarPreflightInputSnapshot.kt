@@ -66,7 +66,7 @@ internal object ExtensionJarPreflightInputRepository {
                     .where { ExtensionStoreEntryTable.pkgName eq packageName }
                     .toList()
             when (entries.size) {
-                0 -> throw NoSuchElementException("No durable extension-store snapshot for package $packageName")
+                0 -> throw ExtensionStoreSnapshotUnavailableException()
                 1 -> readSnapshot(entries.single())
                 else -> throw AmbiguousExtensionStoreOwnershipException(packageName, entries.size)
             }
@@ -107,17 +107,19 @@ internal object ExtensionJarPreflightInputRepository {
     ) {
         require(candidateSourceIDs.isNotEmpty()) { "Validated extension candidate has no source IDs" }
 
-        transaction(transactionIsolation = Connection.TRANSACTION_REPEATABLE_READ) {
-            verifyStillCurrent(
-                StoreGenerationEvidence(
-                    packageName = input.expected.pkgName,
-                    ledgerEntryID = input.ledgerEntryID,
-                    storeSnapshotToken = input.storeSnapshotToken,
-                    storeIndexUrl = input.expected.storeIndexUrl,
-                    storeSigningKey = input.expectedSigningKey,
-                    sourceIDs = candidateSourceIDs,
-                ),
-            )
+        ExtensionStoreArtifactLedger.withMutationLock {
+            transaction(transactionIsolation = Connection.TRANSACTION_REPEATABLE_READ) {
+                verifyStillCurrent(
+                    StoreGenerationEvidence(
+                        packageName = input.expected.pkgName,
+                        ledgerEntryID = input.ledgerEntryID,
+                        storeSnapshotToken = input.storeSnapshotToken,
+                        storeIndexUrl = input.expected.storeIndexUrl,
+                        storeSigningKey = input.expectedSigningKey,
+                        sourceIDs = candidateSourceIDs,
+                    ),
+                )
+            }
         }
     }
 
@@ -258,3 +260,5 @@ internal class AmbiguousExtensionStoreOwnershipException(
 internal class StaleExtensionStoreSnapshotException(
     packageName: String,
 ) : IllegalStateException("Extension store snapshot became stale for package $packageName")
+
+internal class ExtensionStoreSnapshotUnavailableException : NoSuchElementException("Durable extension-store metadata is unavailable")

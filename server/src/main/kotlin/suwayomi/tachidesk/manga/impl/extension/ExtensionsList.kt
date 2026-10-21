@@ -34,10 +34,19 @@ import kotlin.time.Duration.Companion.seconds
 object ExtensionsList {
     private val logger = KotlinLogging.logger {}
 
+    @Volatile
     var lastUpdateCheck: Long = 0
     var updateMap = ConcurrentHashMap<String, ExtensionInfo>()
 
-    suspend fun fetchExtensions() {
+    private val refreshMutex = Mutex()
+
+    suspend fun fetchExtensions() =
+        refreshMutex.withLock {
+            fetchExtensionsUnlocked()
+            lastUpdateCheck = System.currentTimeMillis()
+        }
+
+    private suspend fun fetchExtensionsUnlocked() {
         val allExtensions = mutableListOf<ExtensionInfo>()
         val refreshedStores = mutableListOf<ExtensionStore>()
 
@@ -56,17 +65,16 @@ object ExtensionsList {
         reconcileExtensionDatabase(allExtensions, refreshedStores)
     }
 
-    suspend fun fetchExtensionsCached() {
-        // update if 60 seconds has passed or requested offline and database is empty
-        if (lastUpdateCheck + 60.seconds.inWholeMilliseconds < System.currentTimeMillis()) {
-            logger.debug { "Getting extensions list from the internet" }
-            lastUpdateCheck = System.currentTimeMillis()
-
-            fetchExtensions()
-        } else {
-            logger.debug { "used cached extension list" }
+    suspend fun fetchExtensionsCached() =
+        refreshMutex.withLock {
+            if (lastUpdateCheck + 60.seconds.inWholeMilliseconds < System.currentTimeMillis()) {
+                logger.debug { "Getting extensions list from the internet" }
+                fetchExtensionsUnlocked()
+                lastUpdateCheck = System.currentTimeMillis()
+            } else {
+                logger.debug { "used cached extension list" }
+            }
         }
-    }
 
     suspend fun getExtensionList(): List<ExtensionDataClass> {
         fetchExtensionsCached()
@@ -101,13 +109,11 @@ object ExtensionsList {
             }
         }
 
-    private val updateExtensionDatabaseMutex = Mutex()
-
     internal suspend fun reconcileExtensionDatabase(
         foundExtensions: List<ExtensionInfo>,
         refreshedStores: List<ExtensionStore>? = null,
     ) {
-        updateExtensionDatabaseMutex.withLock {
+        ExtensionStoreArtifactLedger.withMutationLock {
             transaction {
                 val reconciliationExtensions: List<ExtensionInfo>
                 val authoritativeStoreUrls: Set<String>?

@@ -22,20 +22,13 @@ import net.dongliu.apk.parser.ApkFile
 import net.dongliu.apk.parser.bean.Icon
 import okhttp3.CacheControl
 import org.apache.commons.compress.archivers.zip.ZipFile
-import org.jetbrains.exposed.v1.core.ResultRow
-import org.jetbrains.exposed.v1.core.dao.id.EntityID
 import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.core.inList
-import org.jetbrains.exposed.v1.core.statements.BatchUpdateStatement
-import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.select
 import org.jetbrains.exposed.v1.jdbc.selectAll
-import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import org.jetbrains.exposed.v1.jdbc.upsert
 import suwayomi.tachidesk.manga.impl.util.AndroidManifestParser
 import suwayomi.tachidesk.manga.impl.util.PackageTools
 import suwayomi.tachidesk.manga.impl.util.PackageTools.EXTENSION_FEATURE
@@ -81,7 +74,6 @@ import kotlin.io.path.div
 import kotlin.io.path.exists
 import kotlin.io.path.inputStream
 import kotlin.io.path.isRegularFile
-import kotlin.io.path.isSameFileAs
 import kotlin.io.path.name
 import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.outputStream
@@ -115,7 +107,7 @@ object Extension {
                     .select(ExtensionTable.apkUrl, ExtensionTable.jarUrl, ExtensionTable.isInstalled)
                     .where { ExtensionTable.pkgName eq pkgName }
                     .firstOrNull()
-            } ?: throw NullPointerException("Could not find extension for $pkgName")
+            } ?: throw NoSuchElementException("Could not find extension for $pkgName")
         val jarUrl = extension[ExtensionTable.jarUrl]
         val apkUrl = extension[ExtensionTable.apkUrl]
         val selectedArtifact = ExtensionInstallArtifactPolicy.selectPublishedArtifact(apkUrl, jarUrl)
@@ -143,6 +135,9 @@ object Extension {
         intent: ExtensionJarInstallationCoordinator.Intent,
     ): String =
         installMutex.withLock {
+            if (intent == ExtensionJarInstallationCoordinator.Intent.UPGRADE && !hasPublishedUpdate(pkgName)) {
+                return@withLock pkgName
+            }
             val extensionsRoot = Path(applicationDirs.extensionsRoot).toAbsolutePath().normalize()
             extensionsRoot.createDirectories()
             val outcome =
@@ -383,6 +378,13 @@ object Extension {
             val isInstalled = previousRecord?.get(ExtensionTable.isInstalled) ?: false
 
             if (isInstalled) {
+                if (origin == InstallOrigin.PUBLISHED_STORE && forceReinstall &&
+                    previousRecord[ExtensionTable.isCustomPinned] == false &&
+                    metadata.versionCode.toLong() <= previousRecord[ExtensionTable.versionCode]
+                ) {
+                    extPackage.file.deleteExisting()
+                    return@withLock pkgName
+                }
                 if (!forceReinstall) {
                     extPackage.file.deleteExisting()
                     return@withLock pkgName
@@ -842,8 +844,28 @@ object Extension {
     }
 
     suspend fun updateExtension(pkgName: String): String {
-        check(ExtensionsList.updateMap.containsKey(pkgName)) { "No update is available for $pkgName" }
+        if (!hasPublishedUpdate(pkgName)) return pkgName
         return installPublishedExtension(pkgName, PublishedInstallOperation.UPGRADE)
+    }
+
+    /** A restart may discard the update projection; durable store and installed state remain authoritative. */
+    internal fun hasPublishedUpdate(pkgName: String): Boolean {
+        val installed =
+            transaction {
+                ExtensionTable.selectAll().where { ExtensionTable.pkgName eq pkgName }.firstOrNull()
+            } ?: throw NoSuchElementException("Extension does not exist")
+        if (!installed[ExtensionTable.isInstalled]) throw ExtensionNotInstalledException()
+        if (installed[ExtensionTable.isCustomPinned]) throw CustomPinnedExtensionUpdateException()
+        val advertised =
+            try {
+                ExtensionStoreArtifactLedger.readUpdateCandidate(pkgName)
+            } catch (_: NoSuchElementException) {
+                throw ExtensionUpdateStoreUnavailableException()
+            }
+        if (installed[ExtensionTable.storeIndexUrl] != advertised.storeIndexUrl) {
+            throw ExtensionUpdateStoreUnavailableException()
+        }
+        return advertised.versionCode > installed[ExtensionTable.versionCode]
     }
 
     suspend fun getExtensionIcon(pkgName: String): Pair<InputStream, String> {
@@ -884,3 +906,9 @@ object Extension {
         REPLACE_CUSTOM(true, ExtensionJarInstallationCoordinator.Intent.REPLACE_CUSTOM),
     }
 }
+
+internal class ExtensionNotInstalledException : IllegalStateException("Extension is not installed")
+
+internal class CustomPinnedExtensionUpdateException : IllegalStateException("Custom extension requires an explicit store switch")
+
+internal class ExtensionUpdateStoreUnavailableException : IllegalStateException("Extension store metadata is unavailable")

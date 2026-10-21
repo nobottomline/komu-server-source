@@ -46,25 +46,27 @@ internal object ExtensionJarPublishAuthorization {
         val activeArtifact = resolveActiveArtifact(journalEntry)
         ExtensionActivationJournal(activeArtifact.parent).requireCurrentOwnership(journalEntry)
 
-        return transaction(transactionIsolation = Connection.TRANSACTION_SERIALIZABLE) {
-            ExtensionJarPreflightInputRepository.verifyStillCurrent(this, binding)
-            assertActiveArtifact(binding, activeArtifact)
+        return ExtensionStoreArtifactLedger.withMutationLock {
+            transaction(transactionIsolation = Connection.TRANSACTION_SERIALIZABLE) {
+                ExtensionJarPreflightInputRepository.verifyStillCurrent(this, binding)
+                assertActiveArtifact(binding, activeArtifact)
 
-            val result = commitMetadata(markerKey)
-            val marker =
-                ExtensionActivationMarkerTable
-                    .selectAll()
-                    .where { ExtensionActivationMarkerTable.markerKey eq markerKey }
-                    .singleOrNull()
-                    ?: throw IllegalStateException("Authenticated extension metadata commit did not insert its activation marker")
-            check(marker[ExtensionActivationMarkerTable.packageName] == binding.packageName) {
-                "Authenticated extension activation marker belongs to a different package"
+                val result = commitMetadata(markerKey)
+                val marker =
+                    ExtensionActivationMarkerTable
+                        .selectAll()
+                        .where { ExtensionActivationMarkerTable.markerKey eq markerKey }
+                        .singleOrNull()
+                        ?: throw IllegalStateException("Authenticated extension metadata commit did not insert its activation marker")
+                check(marker[ExtensionActivationMarkerTable.packageName] == binding.packageName) {
+                    "Authenticated extension activation marker belongs to a different package"
+                }
+
+                // Fence callback code that changed store/source state or active bytes before commit.
+                ExtensionJarPreflightInputRepository.verifyStillCurrent(this, binding)
+                assertActiveArtifact(binding, activeArtifact)
+                result
             }
-
-            // Fence callback code that changed store/source state or active bytes before commit.
-            ExtensionJarPreflightInputRepository.verifyStillCurrent(this, binding)
-            assertActiveArtifact(binding, activeArtifact)
-            result
         }
     }
 

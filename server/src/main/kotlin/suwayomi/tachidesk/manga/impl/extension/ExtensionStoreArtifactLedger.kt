@@ -7,11 +7,13 @@ package suwayomi.tachidesk.manga.impl.extension
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
 import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.selectAll
+import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionInfo
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionSource
@@ -19,9 +21,45 @@ import suwayomi.tachidesk.manga.model.dataclass.ExtensionStore
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreEntryTable
 import suwayomi.tachidesk.manga.model.table.ExtensionStoreSourceTable
 import java.util.UUID
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /** Replaces only successfully fetched store partitions inside the caller's reconciliation transaction. */
 internal object ExtensionStoreArtifactLedger {
+    private val mutationLock = ReentrantLock()
+
+    /** Serializes short local ledger/publication transactions, never downloads or source execution. */
+    fun <T> withMutationLock(action: () -> T): T = mutationLock.withLock(action)
+
+    /** Availability is shared by APK and JAR routes; JAR execution constraints belong to preflight. */
+    fun readUpdateCandidate(packageName: String): UpdateCandidate =
+        transaction {
+            val entries = ExtensionStoreEntryTable.selectAll().where { ExtensionStoreEntryTable.pkgName eq packageName }.toList()
+            when (entries.size) {
+                0 -> {
+                    throw ExtensionStoreSnapshotUnavailableException()
+                }
+
+                1 -> {
+                    entries.single().let {
+                        UpdateCandidate(
+                            it[ExtensionStoreEntryTable.storeIndexUrl],
+                            it[ExtensionStoreEntryTable.versionCode],
+                        )
+                    }
+                }
+
+                else -> {
+                    throw AmbiguousExtensionStoreOwnershipException(packageName, entries.size)
+                }
+            }
+        }
+
+    data class UpdateCandidate(
+        val storeIndexUrl: String,
+        val versionCode: Long,
+    )
+
     fun replaceSuccessfulStores(
         transaction: JdbcTransaction,
         foundExtensions: List<ExtensionInfo>,
@@ -44,7 +82,6 @@ internal object ExtensionStoreArtifactLedger {
                             .thenBy { it.jarUrl.orEmpty() },
                     )
                 }.sortedWith(compareBy(ExtensionInfo::storeIndexUrl, ExtensionInfo::pkgName))
-        val snapshotTokens = storesByUrl.keys.associateWith { UUID.randomUUID().toString() }
 
         entries.forEach { extension ->
             ExtensionArtifactInputPolicy.requirePackageName(extension.pkgName)
@@ -52,18 +89,39 @@ internal object ExtensionStoreArtifactLedger {
         }
 
         with(transaction) {
-            ExtensionStoreEntryTable.deleteWhere {
-                ExtensionStoreEntryTable.storeIndexUrl inList storesByUrl.keys.toList()
+            val previous = readAll(transaction).associateBy { it.storeIndexUrl to it.pkgName }
+            val previousRows = ExtensionStoreEntryTable.selectAll().toList()
+            val incoming = entries.associateBy { it.storeIndexUrl to it.pkgName }
+            val unchanged =
+                previousRows
+                    .filter { row ->
+                        val key = row[ExtensionStoreEntryTable.storeIndexUrl] to row[ExtensionStoreEntryTable.pkgName]
+                        val next = incoming[key]
+                        next != null &&
+                            previous[key] == next.copy(sources = next.sources.sortedBy { it.id }) &&
+                            row[ExtensionStoreEntryTable.signingKey].equals(storesByUrl.getValue(key.first).signingKey, ignoreCase = true)
+                    }.mapTo(mutableSetOf()) { it[ExtensionStoreEntryTable.id] }
+            val retiredIDs =
+                previousRows
+                    .filter {
+                        it[ExtensionStoreEntryTable.storeIndexUrl] in storesByUrl && it[ExtensionStoreEntryTable.id] !in unchanged
+                    }.map { it[ExtensionStoreEntryTable.id] }
+            if (retiredIDs.isNotEmpty()) {
+                ExtensionStoreEntryTable.deleteWhere { ExtensionStoreEntryTable.id inList retiredIDs }
             }
-
-            if (entries.isEmpty()) return
+            val unchangedKeys =
+                previousRows.filter { it[ExtensionStoreEntryTable.id] in unchanged }.mapTo(mutableSetOf()) {
+                    it[ExtensionStoreEntryTable.storeIndexUrl] to it[ExtensionStoreEntryTable.pkgName]
+                }
+            val changedEntries = entries.filter { it.storeIndexUrl to it.pkgName !in unchangedKeys }
+            if (changedEntries.isEmpty()) return
 
             val insertedRows =
-                ExtensionStoreEntryTable.batchInsert(entries) { extension ->
+                ExtensionStoreEntryTable.batchInsert(changedEntries) { extension ->
                     val store = storesByUrl.getValue(extension.storeIndexUrl)
                     this[ExtensionStoreEntryTable.storeIndexUrl] = extension.storeIndexUrl
                     this[ExtensionStoreEntryTable.signingKey] = store.signingKey
-                    this[ExtensionStoreEntryTable.snapshotToken] = snapshotTokens.getValue(extension.storeIndexUrl)
+                    this[ExtensionStoreEntryTable.snapshotToken] = UUID.randomUUID().toString()
                     this[ExtensionStoreEntryTable.name] = extension.name
                     this[ExtensionStoreEntryTable.pkgName] = extension.pkgName
                     this[ExtensionStoreEntryTable.apkUrl] = extension.apkUrl
@@ -75,10 +133,10 @@ internal object ExtensionStoreArtifactLedger {
                     this[ExtensionStoreEntryTable.lang] = extension.lang
                     this[ExtensionStoreEntryTable.contentWarning] = extension.contentWarning.ordinal
                 }
-            check(insertedRows.size == entries.size) { "Artifact ledger did not persist every validated store entry" }
+            check(insertedRows.size == changedEntries.size) { "Artifact ledger did not persist every validated store entry" }
 
             val sourcesWithEntry =
-                insertedRows.zip(entries).flatMap { (row, extension) ->
+                insertedRows.zip(changedEntries).flatMap { (row, extension) ->
                     val entryID = row[ExtensionStoreEntryTable.id]
                     extension.sources.map { entryID to it }
                 }

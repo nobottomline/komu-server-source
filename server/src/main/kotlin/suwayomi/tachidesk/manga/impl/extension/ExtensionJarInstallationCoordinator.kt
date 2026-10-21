@@ -7,6 +7,8 @@ package suwayomi.tachidesk.manga.impl.extension
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import suwayomi.tachidesk.manga.model.dataclass.ExtensionInfo
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -43,6 +45,22 @@ internal class ExtensionJarInstallationCoordinator(
         intent: Intent,
     ): Outcome {
         ExtensionArtifactInputPolicy.requirePackageName(packageName)
+        repeat(MAX_SNAPSHOT_ATTEMPTS) { attempt ->
+            currentCoroutineContext().ensureActive()
+            try {
+                return executeOnce(packageName, intent)
+            } catch (failure: StaleExtensionStoreSnapshotException) {
+                // Cleanup/rollback failures retain journal ownership and must never be retried blindly.
+                if (failure.suppressed.isNotEmpty() || attempt == MAX_SNAPSHOT_ATTEMPTS - 1) throw failure
+            }
+        }
+        error("Extension snapshot retry exhausted")
+    }
+
+    private suspend fun executeOnce(
+        packageName: String,
+        intent: Intent,
+    ): Outcome {
         val prepared = preflightCoordinator.prepare(packageName, extensionsRoot)
         prepared.use {
             check(prepared.expected.pkgName == packageName) {
@@ -97,6 +115,7 @@ internal class ExtensionJarInstallationCoordinator(
     }
 
     private companion object {
+        const val MAX_SNAPSHOT_ATTEMPTS = 3
         val SHA256_HEX = Regex("^[0-9a-f]{64}$")
     }
 }
