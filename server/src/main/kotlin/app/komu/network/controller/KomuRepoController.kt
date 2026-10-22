@@ -16,13 +16,9 @@ import io.javalin.http.HttpStatus
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import org.jetbrains.exposed.v1.core.eq
-import org.jetbrains.exposed.v1.jdbc.deleteWhere
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import suwayomi.tachidesk.manga.impl.extension.ExtensionStoreService
 import suwayomi.tachidesk.manga.impl.extension.ExtensionsList
 import suwayomi.tachidesk.manga.impl.extension.repoMatchRegex
-import suwayomi.tachidesk.manga.model.table.ExtensionStoreTable
 import suwayomi.tachidesk.server.serverConfig
 
 /**
@@ -90,9 +86,7 @@ object KomuRepoController {
                     return@delete
                 }
 
-                transaction {
-                    ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl eq requestedUrl }
-                }
+                ExtensionStoreService.remove(requestedUrl)
                 ExtensionStoreService.syncDbToPrefs()
                 refreshExtensions("post-remove")
 

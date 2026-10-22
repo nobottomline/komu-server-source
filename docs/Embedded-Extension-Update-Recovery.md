@@ -79,3 +79,29 @@ fixture tests skipped, and zero failures or errors. Java 17 artifact validation
 also passed. Final committed-artifact HTTP qualification is recorded separately
 in the rollout evidence so changing version/build identity cannot be confused
 with qualifying an earlier diagnostic JAR.
+
+## Repository removal during refresh
+
+A further host reproduction on the published 2.4.2411 JAR delayed the store
+metadata response, removed that store through GraphQL, and released the response.
+The refresh reinserted the removed registration while preferences still listed
+no repositories. This used disposable data and a local HTTPS fixture.
+
+Refresh now compares the complete original store row, including its database
+identity, before updating metadata. A deleted, replaced, or changed registration
+invalidates the response. Only an explicit add may insert a missing registration.
+Redirect replacement is atomic. Repository mutations and preference projection
+share the existing short ledger/publication lock; network requests stay outside
+it. REST and GraphQL removal use the same service operation.
+
+Catalogue reconciliation independently filters responses against currently
+registered store identities and signing keys inside that lock. This also covers
+removal after metadata refresh but before the catalogue response. Invalid input
+associations still fail validation. Removing a repository retires its available
+catalogue while preserving installed versions, source rows, and artifact bytes.
+
+Four additional database regressions cover removal before metadata completion,
+delete/readd with the same URL, signer replacement, and removal before catalogue
+completion. The existing signer-rotation fixture now updates the registered
+signer before reconciling its catalogue, matching the real fetch path. No schema,
+signature, Java runtime, APK import, or desktop API contract changes are required.

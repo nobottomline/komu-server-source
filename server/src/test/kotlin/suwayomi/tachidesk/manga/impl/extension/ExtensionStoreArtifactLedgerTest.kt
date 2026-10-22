@@ -59,7 +59,9 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
                 assertEquals(before.ledgerEntryID, after.ledgerEntryID)
                 assertEquals(before.storeSnapshotToken, after.storeSnapshotToken)
                 ExtensionJarPreflightInputRepository.verifyStillCurrent(before, setOf(201))
-                ExtensionsList.reconcileExtensionDatabase(listOf(target), listOf(store.copy(signingKey = "b".repeat(64))))
+                val rotatedStore = store.copy(signingKey = "b".repeat(64))
+                ExtensionStoreService.upsert(rotatedStore)
+                ExtensionsList.reconcileExtensionDatabase(listOf(target), listOf(rotatedStore))
                 assertThrows(StaleExtensionStoreSnapshotException::class.java) {
                     ExtensionJarPreflightInputRepository.verifyStillCurrent(before, setOf(201))
                 }
@@ -414,6 +416,64 @@ class ExtensionStoreArtifactLedgerTest : ApplicationTest() {
                 assertThrows(NoSuchElementException::class.java) {
                     ExtensionJarPreflightInputRepository.read(TARGET_PKG, STORE_A)
                 }
+            }
+        }
+
+    @Test
+    fun `metadata fetched for a removed registration cannot reinsert it`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = prepareInstalledAndAvailableCatalogue()
+                val previous = transaction { ExtensionStoreTable.selectAll().single() }
+                ExtensionStoreService.remove(store.indexUrl)
+                assertFalse(ExtensionStoreService.refreshExistingStore(previous, store))
+                assertTrue(transaction { ExtensionStoreTable.selectAll().empty() })
+                ExtensionsList.reconcileExtensionDatabase(emptyList(), emptyList())
+                assertOnlyObsoleteInstalledRuntimeRemains()
+            }
+        }
+
+    @Test
+    fun `metadata fetched before delete and readd cannot overwrite the new registration`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = prepareInstalledAndAvailableCatalogue()
+                val previous = transaction { ExtensionStoreTable.selectAll().single() }
+                ExtensionStoreService.remove(store.indexUrl)
+                ExtensionStoreService.upsert(store)
+                assertFalse(ExtensionStoreService.refreshExistingStore(previous, store.copy(name = "Stale response")))
+                assertEquals(store.name, transaction { ExtensionStoreTable.selectAll().single()[ExtensionStoreTable.name] })
+            }
+        }
+
+    @Test
+    fun `metadata fetched before a signer change cannot overwrite the new signer`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = prepareInstalledAndAvailableCatalogue()
+                val previous = transaction { ExtensionStoreTable.selectAll().single() }
+                val rotatedStore = store.copy(signingKey = "d".repeat(64))
+                ExtensionStoreService.upsert(rotatedStore)
+                assertFalse(ExtensionStoreService.refreshExistingStore(previous, store))
+                assertEquals(
+                    rotatedStore.signingKey,
+                    transaction { ExtensionStoreTable.selectAll().single()[ExtensionStoreTable.signingKey] },
+                )
+            }
+        }
+
+    @Test
+    fun `catalogue fetched before removal is discarded and installed sources survive`() =
+        runBlocking {
+            withFixtureDatabase {
+                val store = prepareInstalledAndAvailableCatalogue()
+                ExtensionStoreService.remove(store.indexUrl)
+                ExtensionsList.reconcileExtensionDatabase(
+                    listOf(extension(store, 3, listOf(source(101, "Stale response")))),
+                    listOf(store),
+                )
+                assertOnlyObsoleteInstalledRuntimeRemains()
+                assertTrue(transaction { ExtensionStoreEntryTable.selectAll().empty() })
             }
         }
 

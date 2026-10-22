@@ -118,20 +118,33 @@ object ExtensionsList {
                 val reconciliationExtensions: List<ExtensionInfo>
                 val authoritativeStoreUrls: Set<String>?
                 if (refreshedStores != null) {
-                    if (refreshedStores.isNotEmpty()) {
+                    val fetchedUrls = refreshedStores.mapTo(mutableSetOf()) { it.indexUrl }
+                    require(foundExtensions.all { it.storeIndexUrl in fetchedUrls }) {
+                        "Extension entries require their successfully refreshed store identity"
+                    }
+                    // Metadata/catalogue requests run outside the mutation lock. Removal or
+                    // signer changes during either request invalidate that response.
+                    val configuredStores =
+                        ExtensionStoreTable.selectAll().associate {
+                            it[ExtensionStoreTable.indexUrl] to it[ExtensionStoreTable.signingKey]
+                        }
+                    val currentStores =
+                        refreshedStores.filter {
+                            configuredStores[it.indexUrl]?.equals(it.signingKey, ignoreCase = true) == true
+                        }
+                    val currentUrls = currentStores.mapTo(mutableSetOf()) { it.indexUrl }
+                    if (currentStores.isNotEmpty()) {
                         ExtensionStoreArtifactLedger.replaceSuccessfulStores(
                             transaction = this,
-                            foundExtensions = foundExtensions,
-                            refreshedStores = refreshedStores,
+                            foundExtensions = foundExtensions.filter { it.storeIndexUrl in currentUrls },
+                            refreshedStores = currentStores,
                         )
-                    } else {
-                        require(foundExtensions.isEmpty()) { "Extension entries require a successfully refreshed store" }
                     }
                     // An explicit empty refresh means no store was fetched successfully,
                     // not that every configured store published an empty catalogue. Keep its last good ledger
                     // and only authorize removals for stores actually refreshed this time.
                     reconciliationExtensions = ExtensionStoreArtifactLedger.readAll(this)
-                    authoritativeStoreUrls = refreshedStores.mapTo(mutableSetOf()) { it.indexUrl }
+                    authoritativeStoreUrls = currentUrls
                 } else {
                     // Compatibility path for callers/tests that predate the durable store ledger.
                     reconciliationExtensions = foundExtensions

@@ -18,6 +18,7 @@ import kotlinx.serialization.protobuf.ProtoBuf
 import okio.BufferedSource
 import okio.buffer
 import okio.gzip
+import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
@@ -91,38 +92,67 @@ object ExtensionStoreService {
         }
     }
 
-    fun upsert(store: ExtensionStore) {
-        transaction {
-            val existing =
-                ExtensionStoreTable
-                    .selectAll()
-                    .where { ExtensionStoreTable.indexUrl eq store.indexUrl }
-                    .firstOrNull()
+    fun upsert(store: ExtensionStore): Unit =
+        ExtensionStoreArtifactLedger.withMutationLock {
+            transaction {
+                val existing =
+                    ExtensionStoreTable
+                        .selectAll()
+                        .where { ExtensionStoreTable.indexUrl eq store.indexUrl }
+                        .firstOrNull()
 
-            if (existing == null) {
-                ExtensionStoreTable.insert {
-                    it[name] = store.name
-                    it[badgeLabel] = store.badgeLabel
-                    it[signingKey] = store.signingKey
-                    it[contactWebsite] = store.contact.website
-                    it[contactDiscord] = store.contact.discord
-                    it[indexUrl] = store.indexUrl
-                    it[isLegacy] = store.isLegacy
-                    it[extensionListUrl] = store.extensionListUrl
-                }
-            } else {
-                ExtensionStoreTable.update({ ExtensionStoreTable.indexUrl eq store.indexUrl }) {
-                    it[name] = store.name
-                    it[badgeLabel] = store.badgeLabel
-                    it[signingKey] = store.signingKey
-                    it[contactWebsite] = store.contact.website
-                    it[contactDiscord] = store.contact.discord
-                    it[isLegacy] = store.isLegacy
-                    it[extensionListUrl] = store.extensionListUrl
+                if (existing == null) {
+                    ExtensionStoreTable.insert {
+                        it[name] = store.name
+                        it[badgeLabel] = store.badgeLabel
+                        it[signingKey] = store.signingKey
+                        it[contactWebsite] = store.contact.website
+                        it[contactDiscord] = store.contact.discord
+                        it[indexUrl] = store.indexUrl
+                        it[isLegacy] = store.isLegacy
+                        it[extensionListUrl] = store.extensionListUrl
+                    }
+                } else {
+                    ExtensionStoreTable.update({ ExtensionStoreTable.indexUrl eq store.indexUrl }) {
+                        it[name] = store.name
+                        it[badgeLabel] = store.badgeLabel
+                        it[signingKey] = store.signingKey
+                        it[contactWebsite] = store.contact.website
+                        it[contactDiscord] = store.contact.discord
+                        it[isLegacy] = store.isLegacy
+                        it[extensionListUrl] = store.extensionListUrl
+                    }
                 }
             }
         }
-    }
+
+    fun remove(indexUrl: String) =
+        ExtensionStoreArtifactLedger.withMutationLock {
+            transaction {
+                ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl eq indexUrl }
+            }
+        }
+
+    /** A network response may update only the exact store registration that requested it. */
+    internal fun refreshExistingStore(
+        previous: ResultRow,
+        store: ExtensionStore,
+    ): Boolean =
+        ExtensionStoreArtifactLedger.withMutationLock {
+            transaction {
+                val current =
+                    ExtensionStoreTable
+                        .selectAll()
+                        .where { ExtensionStoreTable.id eq previous[ExtensionStoreTable.id] }
+                        .singleOrNull() ?: return@transaction false
+                if (ExtensionStoreTable.columns.any { current[it] != previous[it] }) return@transaction false
+                if (store.indexUrl != previous[ExtensionStoreTable.indexUrl]) {
+                    ExtensionStoreTable.deleteWhere { ExtensionStoreTable.id eq previous[ExtensionStoreTable.id] }
+                }
+                upsert(store)
+                true
+            }
+        }
 
     suspend fun getAndRefresh(): List<ExtensionStore> {
         val stores =
@@ -136,15 +166,13 @@ object ExtensionStoreService {
                 val oldName = storeRow[ExtensionStoreTable.name]
                 try {
                     val store = fetch(oldIndexUrl)
+                    if (!refreshExistingStore(storeRow, store)) return@mapNotNull null
                     if (store.indexUrl != oldIndexUrl) {
-                        transaction {
-                            ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl eq oldIndexUrl }
-                        }
                         needsPrefUpdate = true
                     }
-                    upsert(store)
                     store
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     logger.warn(e) { "Failed to fetch extension store '$oldName ($oldIndexUrl)'" }
                     null
                 }
@@ -153,27 +181,28 @@ object ExtensionStoreService {
         return updateStores
     }
 
-    fun syncDbToPrefs() {
-        val dbStores =
-            transaction {
-                ExtensionStoreTable
-                    .selectAll()
-                    .map { it[ExtensionStoreTable.indexUrl] }
-                    .toSet()
+    fun syncDbToPrefs() =
+        ExtensionStoreArtifactLedger.withMutationLock {
+            val dbStores =
+                transaction {
+                    ExtensionStoreTable
+                        .selectAll()
+                        .map { it[ExtensionStoreTable.indexUrl] }
+                        .toSet()
+                }
+
+            val currentPrefs = serverConfig.extensionStores.value.toSet()
+            val toAdd = dbStores - currentPrefs
+            val toRemove = currentPrefs - dbStores
+
+            if (toAdd.isNotEmpty()) {
+                serverConfig.extensionStores.value = (serverConfig.extensionStores.value + toAdd).distinct()
             }
 
-        val currentPrefs = serverConfig.extensionStores.value.toSet()
-        val toAdd = dbStores - currentPrefs
-        val toRemove = currentPrefs - dbStores
-
-        if (toAdd.isNotEmpty()) {
-            serverConfig.extensionStores.value = (serverConfig.extensionStores.value + toAdd).distinct()
+            if (toRemove.isNotEmpty()) {
+                serverConfig.extensionStores.value = serverConfig.extensionStores.value.filterNot { it in toRemove }
+            }
         }
-
-        if (toRemove.isNotEmpty()) {
-            serverConfig.extensionStores.value = serverConfig.extensionStores.value.filterNot { it in toRemove }
-        }
-    }
 
     suspend fun syncPrefsToDb() {
         val prefUrls = serverConfig.extensionStores.value.toSet()
@@ -191,21 +220,22 @@ object ExtensionStoreService {
             try {
                 val store = fetch(url)
                 if (store.indexUrl != url) {
-                    transaction {
-                        ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl eq url }
-                    }
+                    remove(url)
                     needsPrefUpdate = true
                     toRemove -= store.indexUrl
                 }
                 upsert(store)
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 logger.warn(e) { "Failed to sync preference store '$url' to database" }
             }
         }
 
         if (toRemove.isNotEmpty()) {
-            transaction {
-                ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl inList toRemove.toList() }
+            ExtensionStoreArtifactLedger.withMutationLock {
+                transaction {
+                    ExtensionStoreTable.deleteWhere { ExtensionStoreTable.indexUrl inList toRemove.toList() }
+                }
             }
         }
         if (needsPrefUpdate) {
