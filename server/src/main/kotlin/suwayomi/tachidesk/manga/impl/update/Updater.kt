@@ -8,11 +8,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelChildren
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,7 +21,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -38,6 +36,7 @@ import suwayomi.tachidesk.manga.model.dataclass.MangaDataClass
 import suwayomi.tachidesk.manga.model.table.MangaStatus
 import suwayomi.tachidesk.server.serverConfig
 import suwayomi.tachidesk.util.HAScheduler
+import suwayomi.tachidesk.util.sampleWhenPending
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.util.Date
@@ -46,13 +45,12 @@ import kotlin.math.absoluteValue
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 
-@OptIn(FlowPreview::class)
 class Updater : IUpdater {
     private val logger = KotlinLogging.logger {}
     private val notifyFlowScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private val notifyFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val notifyFlow = Channel<Unit>(Channel.CONFLATED)
 
     @Deprecated("Replaced with updatesFlow", replaceWith = ReplaceWith("updatesFlow"))
     private val statusFlow = MutableSharedFlow<UpdateStatus>()
@@ -66,7 +64,7 @@ class Updater : IUpdater {
     init {
         // has to be in its own scope (notifyFlowScope), otherwise, the collection gets canceled due to canceling the scopes (scope) children in the reset function
         notifyFlowScope.launch {
-            notifyFlow.sample(1.seconds).collect {
+            notifyFlow.receiveAsFlow().sampleWhenPending(1.seconds).collect {
                 updateStatus(immediate = true)
             }
         }
@@ -263,7 +261,7 @@ class Updater : IUpdater {
             return
         }
 
-        notifyFlow.emit(Unit)
+        notifyFlow.send(Unit)
     }
 
     private fun getOrCreateUpdateChannelFor(source: String): Channel<UpdateJob> =

@@ -15,13 +15,14 @@ import org.junit.jupiter.api.Test
 import suwayomi.tachidesk.manga.model.dataclass.ContentWarning
 import suwayomi.tachidesk.server.ServerConfig
 import suwayomi.tachidesk.server.database.migration.M0067_PreventDuplicatedCategoryManga
+import suwayomi.tachidesk.server.database.migration.M0071_IndexRecentChapters
 import suwayomi.tachidesk.test.ApplicationTest
 import java.util.UUID
 
 /** Protects the published Komu migration history from upstream number reuse. */
 class DatabaseMigrationLineTest : ApplicationTest() {
     @Test
-    fun `fresh database records the collision-safe ledger through version 70`() {
+    fun `fresh database records the collision-safe ledger through version 71`() {
         val previousDefaultDatabase = TransactionManager.defaultDatabase
         val fixtureDatabase = createFixtureDatabase("komu_fresh")
 
@@ -91,7 +92,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
         try {
             val migrations = loadMigrationLine()
-            assertEquals((1..70).toList(), migrations.map { it.version }.sorted())
+            assertEquals((1..71).toList(), migrations.map { it.version }.sorted())
             runMigrations(migrations.filter { it.version <= 65 }, fixtureDatabase)
             insertReleasedKomuDataAt65(fixtureDatabase)
             val publishedLedger = readLedger(fixtureDatabase)
@@ -131,7 +132,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
 
         // Each case starts from released schema 65 and simulates a separate
         // termination boundary, including DDL committed without a ledger row.
-        for (interruptedVersion in 66..69) {
+        for (interruptedVersion in listOf(66, 67, 68, 69, 71)) {
             val fixtureDatabase = createFixtureDatabase("komu_interrupted_$interruptedVersion")
             try {
                 runMigrations(migrations.filter { it.version <= 65 }, fixtureDatabase)
@@ -144,9 +145,11 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                             exec("CREATE INDEX idx_categorymanga_manga ON CATEGORYMANGA (MANGA)")
                         }
 
-                        67 -> M0067_PreventDuplicatedCategoryManga().run()
+                        67 -> {
+                            M0067_PreventDuplicatedCategoryManga().run()
+                        }
 
-                        68 ->
+                        68 -> {
                             exec(
                                 """
                                 CREATE TRIGGER delete_manga_category_update_version
@@ -155,13 +158,20 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                                 CALL "suwayomi.tachidesk.server.database.trigger.DeleteMangaCategoryUpdateVersionTrigger"
                                 """.trimIndent(),
                             )
+                        }
 
                         69 -> {
                             exec("ALTER TABLE category ADD COLUMN flags INT NOT NULL DEFAULT 0")
                             exec("ALTER TABLE manga ADD COLUMN viewer INT NOT NULL DEFAULT 0")
                         }
 
-                        else -> error("Unexpected interruption version: $interruptedVersion")
+                        71 -> {
+                            exec(M0071_IndexRecentChapters().sql)
+                        }
+
+                        else -> {
+                            error("Unexpected interruption version: $interruptedVersion")
+                        }
                     }
                 }
 
@@ -352,7 +362,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
         transaction(database) {
             exec(
                 "SELECT VERSION, NAME FROM MIGRATIONS " +
-                    "WHERE VERSION BETWEEN 55 AND 70 ORDER BY VERSION",
+                    "WHERE VERSION BETWEEN 55 AND 71 ORDER BY VERSION",
             ) { rows ->
                 buildMap {
                     while (rows.next()) {
@@ -469,6 +479,7 @@ class DatabaseMigrationLineTest : ApplicationTest() {
                 68 to "FixSyncYomiTriggers",
                 69 to "AddSyncFlags",
                 70 to "FixSecondsFallbackUploadDate",
+                71 to "IndexRecentChapters",
             )
 
         val expectedCompatibilityColumns =

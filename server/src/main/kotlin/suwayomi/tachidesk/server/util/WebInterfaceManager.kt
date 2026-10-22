@@ -22,15 +22,15 @@ import io.javalin.http.staticfiles.Location
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -56,6 +56,7 @@ import suwayomi.tachidesk.server.generated.BuildConfig
 import suwayomi.tachidesk.server.serverConfig
 import suwayomi.tachidesk.server.util.ExitCode.WebUISetupFailure
 import suwayomi.tachidesk.util.HAScheduler
+import suwayomi.tachidesk.util.sampleWhenPending
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
@@ -100,7 +101,7 @@ object WebInterfaceManager {
     private val versionMappingCache = Cache.Builder<String, JsonArray>().expireAfterWrite(CACHE_DURATION).build()
     private val previewVersionCache = Cache.Builder<String, String>().expireAfterWrite(CACHE_DURATION).build()
 
-    private val notifyFlow = MutableSharedFlow<WebUIUpdateStatus?>()
+    private val notifyFlow = Channel<WebUIUpdateStatus?>(Channel.CONFLATED)
 
     private val statusFlow = MutableSharedFlow<WebUIUpdateStatus>()
     val status =
@@ -112,8 +113,7 @@ object WebInterfaceManager {
 
     init {
         scope.launch {
-            @OptIn(FlowPreview::class)
-            notifyFlow.sample(1.seconds).collect {
+            notifyFlow.receiveAsFlow().sampleWhenPending(1.seconds).collect {
                 if (it != null) {
                     logger.debug { "notifyFlow: sampling $it" }
                     statusFlow.emit(it)
@@ -706,12 +706,12 @@ object WebInterfaceManager {
             val status = getStatus(version, state, progress)
 
             if (immediate) {
-                notifyFlow.emit(null)
+                notifyFlow.send(null)
                 statusFlow.emit(status)
                 return@launch
             }
 
-            notifyFlow.emit(status)
+            notifyFlow.send(status)
         }
     }
 

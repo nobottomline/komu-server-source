@@ -23,6 +23,7 @@ to new Komu numbers.
 | 68 | `M0068_FixSyncYomiTriggers` | upstream `M0063` (`9eb779d1`) | sync trigger repair |
 | 69 | `M0069_AddSyncFlags` | upstream `M0064` (`ee547c03`) | preserve opaque reader/category flags |
 | 70 | `M0070_FixSecondsFallbackUploadDate` | upstream `M0065` (`dba836b2`) | repair seconds stored in a millisecond column |
+| 71 | `M0071_IndexRecentChapters` | Komu | additive ordered discovery index; no row changes |
 
 Rules:
 
@@ -59,7 +60,7 @@ published migrations retain their identities; upstream's interrupted SyncYomi
 creation repair remains at Komu version 59.
 
 `DatabaseMigrationLineTest` exercises fresh, released 57, and released 65
-ledgers through 70. It preserves installed/custom extension and source records,
+ledgers through 71. It preserves installed/custom extension and source records,
 library/category state, chapter read/bookmark/page/memo values, and the old
 ledger; checks deduplication and one-time timestamp repair; and replays partial
 DDL at each new schema boundary before its ledger entry exists.

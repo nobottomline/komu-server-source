@@ -1,6 +1,7 @@
 package suwayomi.tachidesk.manga.controller
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.javalin.http.BadRequestResponse
 import io.javalin.http.HttpStatus
 import io.javalin.websocket.WsConfig
 import suwayomi.tachidesk.manga.impl.Category
@@ -8,8 +9,7 @@ import suwayomi.tachidesk.manga.impl.Chapter
 import suwayomi.tachidesk.manga.impl.update.IUpdater
 import suwayomi.tachidesk.manga.impl.update.UpdateStatus
 import suwayomi.tachidesk.manga.impl.update.UpdaterSocket
-import suwayomi.tachidesk.manga.model.dataclass.MangaChapterDataClass
-import suwayomi.tachidesk.manga.model.dataclass.PaginatedList
+import suwayomi.tachidesk.manga.model.dataclass.RecentChaptersPage
 import suwayomi.tachidesk.server.JavalinSetup.Attribute
 import suwayomi.tachidesk.server.JavalinSetup.future
 import suwayomi.tachidesk.server.JavalinSetup.getAttribute
@@ -17,6 +17,7 @@ import suwayomi.tachidesk.server.user.requireUser
 import suwayomi.tachidesk.server.util.formParam
 import suwayomi.tachidesk.server.util.handler
 import suwayomi.tachidesk.server.util.pathParam
+import suwayomi.tachidesk.server.util.queryParam
 import suwayomi.tachidesk.server.util.withOperation
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
@@ -35,30 +36,31 @@ object UpdateController {
     val recentChapters =
         handler(
             pathParam<Int>("pageNum"),
+            queryParam<Long?>("beforeFetchedAt"),
+            queryParam<Int?>("beforeId"),
             documentWith = {
                 withOperation {
                     summary("Updates fetch")
                     description("Get recently updated manga chapters")
                 }
             },
-            behaviorOf = { ctx, pageNum ->
+            behaviorOf = { ctx, pageNum, beforeFetchedAt, beforeId ->
                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
+                if (pageNum < 0 || (beforeFetchedAt == null) != (beforeId == null) ||
+                    (beforeFetchedAt != null && beforeFetchedAt < 0) || (beforeId != null && beforeId <= 0)
+                ) {
+                    throw BadRequestResponse("Use a nonnegative page and a complete, valid recent-chapter cursor")
+                }
                 ctx.future {
                     future {
-                        Chapter.getRecentChapters(pageNum)
+                        Chapter.getRecentChapters(pageNum, beforeFetchedAt, beforeId)
                     }.thenApply { ctx.json(it) }
                 }
             },
             withResults = {
-                json<PagedMangaChapterListDataClass>(HttpStatus.OK)
+                json<RecentChaptersPage>(HttpStatus.OK)
             },
         )
-
-    /**
-     * Class made for handling return type in the documentation for [UpdateController.recentChapters],
-     * since OpenApi cannot handle runtime generics.
-     */
-    private class PagedMangaChapterListDataClass : PaginatedList<MangaChapterDataClass>(emptyList(), false)
 
     val categoryUpdate =
         handler(

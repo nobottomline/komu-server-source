@@ -9,6 +9,7 @@ package suwayomi.tachidesk
 
 import app.komu.security.EmbeddedSessionCapability
 import suwayomi.tachidesk.graphql.server.GraphQLSchemaProvider
+import suwayomi.tachidesk.server.EmbeddedRuntimePlatform
 import suwayomi.tachidesk.server.JavalinSetup.javalinSetup
 import suwayomi.tachidesk.server.JavalinSetup.javalinStartSocket
 import suwayomi.tachidesk.server.JavalinSetup.javalinStopSocket
@@ -17,7 +18,9 @@ import suwayomi.tachidesk.server.applicationSetup
 fun main(args: Array<String>) {
     EmbeddedSessionCapability.initialize(args)
     // Trigger graphql schema generation as early as possible, takes multiple seconds, delaying the javalin startup otherwise
-    GraphQLSchemaProvider.init()
+    if (EmbeddedRuntimePlatform.supportsClasspathScanning()) {
+        GraphQLSchemaProvider.init()
+    }
     applicationSetup()
     javalinSetup()
 }

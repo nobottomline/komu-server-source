@@ -22,6 +22,7 @@ import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import suwayomi.tachidesk.graphql.types.DatabaseType
 import suwayomi.tachidesk.server.ApplicationDirs
+import suwayomi.tachidesk.server.EmbeddedRuntimePlatform
 import suwayomi.tachidesk.server.ServerConfig
 import suwayomi.tachidesk.server.serverConfig
 import suwayomi.tachidesk.server.util.ExitCode
@@ -70,6 +71,11 @@ object DBManager {
                 idleTimeout = 5.minutes.inWholeMilliseconds // close idle connections faster
                 maxLifetime = 15.minutes.inWholeMilliseconds // recycle connections more often
                 leakDetectionThreshold = 1.minutes.inWholeMilliseconds
+                configureEmbeddedH2Maintenance(
+                    isIOS = EmbeddedRuntimePlatform.isIOS(),
+                    databaseType = serverConfig.databaseType.value,
+                    diagnostics = java.lang.Boolean.getBoolean("komu.database.diagnostics"),
+                )
 
                 // Pool name for monitoring
                 poolName = "Suwayomi-DB-Pool"
@@ -190,5 +196,21 @@ fun databaseUp(givenDb: Database? = null) {
     } catch (e: Exception) {
         logger.error(e) { "Error up-to-database migration" }
         shutdownApp(ExitCode.DbMigrationFailure)
+    }
+}
+
+/** Local file connections have no network keepalive or server-enforced lifetime. */
+internal fun HikariConfig.configureEmbeddedH2Maintenance(
+    isIOS: Boolean,
+    databaseType: DatabaseType,
+    diagnostics: Boolean,
+) {
+    if (isIOS && databaseType == DatabaseType.H2) {
+        keepaliveTime = 0
+        maxLifetime = 0
+        // Leak checks schedule a task per checkout, including short-lived progress reads.
+        leakDetectionThreshold = if (diagnostics) 1.minutes.inWholeMilliseconds else 0
+        // Keep the existing pool bounds/minimum: closing every H2 connection can close
+        // the database, and changing concurrency requires separate contention measurements.
     }
 }

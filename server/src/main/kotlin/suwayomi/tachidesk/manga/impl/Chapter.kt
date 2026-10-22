@@ -16,15 +16,22 @@ import eu.kanade.tachiyomi.util.chapter.ChapterRecognition
 import eu.kanade.tachiyomi.util.chapter.ChapterSanitizer.sanitize
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.serialization.Serializable
+import org.jetbrains.exposed.v1.core.AbstractQuery
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.core.alias
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.dao.id.EntityID
 import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.core.exists
 import org.jetbrains.exposed.v1.core.greater
 import org.jetbrains.exposed.v1.core.inList
+import org.jetbrains.exposed.v1.core.inSubQuery
 import org.jetbrains.exposed.v1.core.less
+import org.jetbrains.exposed.v1.core.lessEq
 import org.jetbrains.exposed.v1.core.statements.BatchUpdateStatement
+import org.jetbrains.exposed.v1.jdbc.UnionAll
+import org.jetbrains.exposed.v1.jdbc.andWhere
 import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.deleteWhere
 import org.jetbrains.exposed.v1.jdbc.select
@@ -39,8 +46,8 @@ import suwayomi.tachidesk.manga.impl.track.Track
 import suwayomi.tachidesk.manga.impl.util.updateChapterDownloadDir
 import suwayomi.tachidesk.manga.model.dataclass.ChapterDataClass
 import suwayomi.tachidesk.manga.model.dataclass.MangaChapterDataClass
-import suwayomi.tachidesk.manga.model.dataclass.PaginatedList
-import suwayomi.tachidesk.manga.model.dataclass.paginatedFrom
+import suwayomi.tachidesk.manga.model.dataclass.PAGINATION_FACTOR
+import suwayomi.tachidesk.manga.model.dataclass.RecentChaptersPage
 import suwayomi.tachidesk.manga.model.table.ChapterMetaTable
 import suwayomi.tachidesk.manga.model.table.ChapterTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
@@ -759,21 +766,70 @@ object Chapter {
         }
     }
 
-    fun getRecentChapters(pageNum: Int): PaginatedList<MangaChapterDataClass> =
-        paginatedFrom(pageNum) {
-            transaction {
+    fun getRecentChapters(
+        pageNum: Int,
+        beforeFetchedAt: Long? = null,
+        beforeId: Int? = null,
+    ): RecentChaptersPage {
+        require(pageNum >= 0) { "Page number must be nonnegative" }
+        require((beforeFetchedAt == null) == (beforeId == null)) { "Both recent chapter cursor fields are required" }
+        require(beforeFetchedAt == null || beforeFetchedAt >= 0) { "Cursor timestamp must be nonnegative" }
+        require(beforeId == null || beforeId > 0) { "Cursor chapter ID must be positive" }
+        return transaction {
+            // Keep the ordered scan on ChapterTable: an inner join lets H2 start
+            // from MangaTable and sort every qualifying chapter before the LIMIT.
+            val eligibleIds =
+                ChapterTable
+                    .select(ChapterTable.id)
+                    .where {
+                        exists(
+                            MangaTable.select(MangaTable.id).where {
+                                (MangaTable.id eq ChapterTable.manga) and
+                                    (MangaTable.inLibrary eq true) and
+                                    (ChapterTable.fetchedAt greater MangaTable.inLibraryAt)
+                            },
+                        )
+                    }.orderBy(ChapterTable.fetchedAt to SortOrder.DESC, ChapterTable.id to SortOrder.DESC)
+                    .limit(PAGINATION_FACTOR + 1)
+            val recentIds: AbstractQuery<*> =
+                if (beforeFetchedAt != null && beforeId != null) {
+                    // H2's tuple/OR comparison only seeks on fetched_at, then scans
+                    // a whole equal-timestamp group. Two disjoint bounded scans let
+                    // the index seek on BOTH columns without OFFSET or raw SQL.
+                    val sameTime =
+                        eligibleIds
+                            .copy()
+                            .andWhere { (ChapterTable.fetchedAt eq beforeFetchedAt) and (ChapterTable.id less beforeId) }
+                            .alias("recent_same_time")
+                    val older =
+                        eligibleIds
+                            .copy()
+                            .andWhere { ChapterTable.fetchedAt lessEq beforeFetchedAt - 1 }
+                            .alias("recent_older")
+                    // Derived tables retain each branch's ORDER/LIMIT on H2 as well
+                    // as PostgreSQL; Exposed does not allow limited union operands.
+                    UnionAll(sameTime.select(sameTime[ChapterTable.id]), older.select(older[ChapterTable.id]))
+                } else {
+                    eligibleIds.offset(pageNum.toLong() * PAGINATION_FACTOR)
+                }
+            // Each candidate branch returns at most 51 IDs; hydrate only the first
+            // 51 joined rows in the SAME statement/snapshot. Separate
+            // queries could lose a manga deleted between ID selection and hydration.
+            val rows =
                 (ChapterTable innerJoin MangaTable)
                     .selectAll()
-                    .where { (MangaTable.inLibrary eq true) and (ChapterTable.fetchedAt greater MangaTable.inLibraryAt) }
-                    .orderBy(ChapterTable.fetchedAt to SortOrder.DESC)
-                    .map {
-                        MangaChapterDataClass(
-                            MangaTable.toDataClass(it),
-                            ChapterTable.toDataClass(it),
-                        )
-                    }
-            }
+                    .where { ChapterTable.id inSubQuery recentIds }
+                    .orderBy(ChapterTable.fetchedAt to SortOrder.DESC, ChapterTable.id to SortOrder.DESC)
+                    .limit(PAGINATION_FACTOR + 1)
+                    .toList()
+            RecentChaptersPage(
+                rows.take(PAGINATION_FACTOR).map {
+                    MangaChapterDataClass(MangaTable.toDataClass(it), ChapterTable.toDataClass(it))
+                },
+                rows.size > PAGINATION_FACTOR,
+            )
         }
+    }
 
     fun updateChapterProgress(
         mangaId: Int,

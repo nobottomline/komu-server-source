@@ -115,17 +115,18 @@ object HAScheduler {
     private val scheduledTasks = PriorityQueue<BaseHATask>()
     private val scheduler = Scheduler()
 
-    private val timer = Timer()
+    private val timer = Timer("Suwayomi-HAScheduler", true)
+    private var hibernateChecker: TimerTask? = null
+
+    internal val hasHibernateChecker: Boolean
+        @Synchronized get() = hibernateChecker != null
 
     private val HIBERNATION_THRESHOLD = 10.seconds.inWholeMilliseconds
     private const val TASK_THRESHOLD = 0.1
 
-    init {
-        scheduleHibernateCheckerTask(1.minutes)
-    }
-
     private fun scheduleHibernateCheckerTask(interval: Duration) {
-        timer.scheduleAtFixedRate(
+        if (hibernateChecker != null) return
+        val checker =
             object : TimerTask() {
                 var lastExecutionTime = System.currentTimeMillis()
 
@@ -140,7 +141,8 @@ object HAScheduler {
                             "System hibernation detected, task was delayed by " +
                                 "${elapsedTime - interval.inWholeMilliseconds}ms"
                         }
-                        scheduledTasks.toList().forEach {
+                        val tasks = synchronized(this@HAScheduler) { scheduledTasks.toList() }
+                        tasks.forEach {
                             val wasLastExecutionMissed = currentTime - it.getLastExecutionTime() - elapsedTime < 0
                             if (wasLastExecutionMissed) {
                                 logger.debug { "$it missed its execution, executing now..." }
@@ -160,10 +162,17 @@ object HAScheduler {
                         }
                     }
                 }
-            },
-            interval.inWholeMilliseconds,
-            interval.inWholeMilliseconds,
-        )
+            }
+        hibernateChecker = checker
+        timer.scheduleAtFixedRate(checker, interval.inWholeMilliseconds, interval.inWholeMilliseconds)
+    }
+
+    private fun stopUnusedSchedulers() {
+        if (scheduledTasks.isEmpty()) {
+            hibernateChecker?.cancel()
+            hibernateChecker = null
+        }
+        timer.purge()
     }
 
     private fun createTimerTask(
@@ -193,6 +202,7 @@ object HAScheduler {
         }
     }
 
+    @Synchronized
     fun schedule(
         execute: () -> Unit,
         interval: Long,
@@ -204,6 +214,7 @@ object HAScheduler {
 
         val task = HATask(taskId, interval, execute, timerTask, name, delay)
         scheduledTasks.add(task)
+        scheduleHibernateCheckerTask(1.minutes)
         timer.scheduleAtFixedRate(timerTask, delay, interval)
 
         logger.debug { "schedule: $task" }
@@ -211,16 +222,19 @@ object HAScheduler {
         return taskId
     }
 
+    @Synchronized
     fun deschedule(taskId: String): HATask? {
         val task = (scheduledTasks.find { it.id == taskId } ?: return null) as HATask
         task.timerTask.cancel()
         scheduledTasks.remove(task)
+        stopUnusedSchedulers()
 
         logger.debug { "deschedule: $task" }
 
         return task
     }
 
+    @Synchronized
     fun reschedule(
         taskId: String,
         interval: Long,
@@ -235,11 +249,13 @@ object HAScheduler {
 
         val updatedTask = HATask(taskId, interval, task.execute, timerTask, task.name, initialDelay = remainingTimeTillNextExecution)
         scheduledTasks.add(updatedTask)
+        scheduleHibernateCheckerTask(1.minutes)
         timer.scheduleAtFixedRate(timerTask, remainingTimeTillNextExecution, interval)
 
         logger.debug { "reschedule: new= $updatedTask, old= $task" }
     }
 
+    @Synchronized
     fun scheduleCron(
         execute: () -> Unit,
         cronExpr: String,
@@ -261,20 +277,24 @@ object HAScheduler {
 
         val task = HACronTask(taskId, cronExpr, execute, name)
         scheduledTasks.add(task)
+        scheduleHibernateCheckerTask(1.minutes)
 
         logger.debug { "scheduleCron: $task" }
 
         return taskId
     }
 
+    @Synchronized
     fun descheduleCron(taskId: String) {
         scheduler.deschedule(taskId)
         val task = scheduledTasks.find { it.id == taskId } ?: return
         scheduledTasks.remove(task)
+        stopUnusedSchedulers()
 
         logger.debug { "descheduleCron: $task" }
     }
 
+    @Synchronized
     fun rescheduleCron(
         taskId: String,
         cronExpr: String,

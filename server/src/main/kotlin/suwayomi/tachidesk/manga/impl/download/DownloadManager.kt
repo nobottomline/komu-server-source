@@ -14,17 +14,17 @@ import io.javalin.websocket.WsContext
 import io.javalin.websocket.WsMessageContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
-import kotlinx.coroutines.flow.sample
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.v1.core.and
@@ -50,23 +50,26 @@ import suwayomi.tachidesk.manga.model.table.ChapterTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
 import suwayomi.tachidesk.manga.model.table.toDataClass
 import suwayomi.tachidesk.server.serverConfig
+import suwayomi.tachidesk.util.sampleWhenPending
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CopyOnWriteArraySet
 import kotlin.reflect.jvm.jvmName
 import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
 
-@OptIn(FlowPreview::class)
 object DownloadManager {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val clients = ConcurrentHashMap<String, WsContext>()
     private val downloadQueue = CopyOnWriteArrayList<DownloadQueueItem>()
-    private val downloadUpdates = CopyOnWriteArraySet<DownloadUpdate>()
+    private val downloadUpdates = LinkedHashMap<Int, DownloadUpdate>()
+    private val downloadUpdatesLock = Any()
     private val downloaders = ConcurrentHashMap<Long, Downloader>()
+
+    private val downloaderSchedulingLock = Any()
+    private var downloadsRequested = false
 
     private const val DOWNLOAD_QUEUE_KEY = "downloadQueueKey"
     private val sharedPreferences =
@@ -142,7 +145,7 @@ object DownloadManager {
         }
     }
 
-    private val notifyFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val notifyFlow = Channel<Unit>(Channel.CONFLATED)
 
     @Deprecated("Replaced with updatesFlow", replaceWith = ReplaceWith("updatesFlow"))
     private val statusFlow = MutableSharedFlow<DownloadStatus>()
@@ -155,7 +158,7 @@ object DownloadManager {
 
     init {
         scope.launch {
-            notifyFlow.sample(1.seconds).collect {
+            notifyFlow.receiveAsFlow().sampleWhenPending(1.seconds).collect {
                 notifyAllClients(immediate = true, gqlEmit = true)
             }
         }
@@ -172,15 +175,15 @@ object DownloadManager {
         downloads: List<DownloadUpdate> = emptyList(),
         gqlEmit: Boolean = false,
     ) {
-        val outdatedUpdates =
-            downloadUpdates.filter { update ->
-                downloads.any { download ->
-                    download.downloadQueueItem.chapterId ==
-                        update.downloadQueueItem.chapterId
-                }
-            }
-        downloadUpdates.removeAll(outdatedUpdates.toSet())
-        downloadUpdates.addAll(downloads)
+        synchronized(downloadUpdatesLock) {
+            downloads.forEach { downloadUpdates[it.downloadQueueItem.chapterId] = it }
+        }
+
+        // Immediate REST updates must also arm a GraphQL flush: the last terminal
+        // event may be the only event left after a source fails or the queue drains.
+        if (!gqlEmit) {
+            notifyFlow.trySend(Unit)
+        }
 
         // There is a problem where too many immediate updates can cause the client to lag out (e.g., in case it has to
         // update the queue in the cache based on the updates).
@@ -189,9 +192,10 @@ object DownloadManager {
         // While the immediate notification functionality is no longer needed for the latest graphql download subscription,
         // it is still required for the deprecated version as well as the rest api subscription.
         if (gqlEmit) {
-            val updates = getDownloadUpdates()
-
-            downloadUpdates.clear()
+            val updates =
+                synchronized(downloadUpdatesLock) {
+                    getDownloadUpdates().also { downloadUpdates.clear() }
+                }
 
             scope.launch {
                 updatesFlow.emit(updates)
@@ -211,10 +215,6 @@ object DownloadManager {
             }
 
             return
-        }
-
-        scope.launch {
-            notifyFlow.emit(Unit)
         }
     }
 
@@ -268,11 +268,11 @@ object DownloadManager {
             } else {
                 Status.Stopped
             },
-            downloadUpdates.toList(),
+            synchronized(downloadUpdatesLock) { downloadUpdates.values.toList() },
             if (addInitial) downloadQueue.toList() else null,
         )
 
-    private val downloaderWatch = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val downloaderWatch = Channel<Unit>(Channel.CONFLATED)
 
     init {
         serverConfig.subscribeTo(serverConfig.maxSourcesInParallel, { maxSourcesInParallel ->
@@ -292,38 +292,39 @@ object DownloadManager {
         })
 
         scope.launch {
-            downloaderWatch.sample(1.seconds).collect {
-                val runningDownloaders = downloaders.values.filter { it.isActive }
-                val availableDownloads = downloadQueue.filter { it.state != Error }
+            downloaderWatch.receiveAsFlow().sampleWhenPending(1.seconds).collect {
+                synchronized(downloaderSchedulingLock) {
+                    if (!downloadsRequested) return@synchronized
+                    val runningDownloaders = downloaders.values.filter { it.isActive }
+                    val availableDownloads = downloadQueue.filter { it.state != Error }
 
-                logger.info {
-                    "Running: ${runningDownloaders.size}, " +
-                        "Queued: ${availableDownloads.size}, " +
-                        "Failed: ${downloadQueue.size - availableDownloads.size}"
-                }
+                    logger.info {
+                        "Running: ${runningDownloaders.size}, " +
+                            "Queued: ${availableDownloads.size}, " +
+                            "Failed: ${downloadQueue.size - availableDownloads.size}"
+                    }
 
-                if (runningDownloaders.size < serverConfig.maxSourcesInParallel.value) {
-                    availableDownloads
-                        .asSequence()
-                        .map { it.sourceId }
-                        .distinct()
-                        .minus(
-                            runningDownloaders.map { it.sourceId }.toSet(),
-                        ).take((serverConfig.maxSourcesInParallel.value - runningDownloaders.size).coerceAtLeast(0))
-                        .map { getDownloader(it) }
-                        .forEach {
-                            it.start()
-                        }
-                    notifyAllClients()
+                    if (runningDownloaders.size < serverConfig.maxSourcesInParallel.value) {
+                        availableDownloads
+                            .asSequence()
+                            .map { it.sourceId }
+                            .distinct()
+                            .minus(
+                                runningDownloaders.map { it.sourceId }.toSet(),
+                            ).take((serverConfig.maxSourcesInParallel.value - runningDownloaders.size).coerceAtLeast(0))
+                            .map { getDownloader(it) }
+                            .forEach {
+                                it.start()
+                            }
+                        notifyAllClients()
+                    }
                 }
             }
         }
     }
 
     private fun refreshDownloaders() {
-        scope.launch {
-            downloaderWatch.emit(Unit)
-        }
+        downloaderWatch.trySend(Unit)
     }
 
     private fun getDownloader(sourceId: Long) =
@@ -536,15 +537,23 @@ object DownloadManager {
     fun start() {
         logger.debug { "start" }
 
-        refreshDownloaders()
+        synchronized(downloaderSchedulingLock) {
+            downloadsRequested = true
+            refreshDownloaders()
+        }
     }
 
     suspend fun stop() {
         logger.debug { "stop" }
+        val running =
+            synchronized(downloaderSchedulingLock) {
+                downloadsRequested = false
+                downloaders.values.toList()
+            }
 
         coroutineScope {
-            downloaders
-                .map { (_, downloader) ->
+            running
+                .map { downloader ->
                     async {
                         downloader.stop()
                     }
