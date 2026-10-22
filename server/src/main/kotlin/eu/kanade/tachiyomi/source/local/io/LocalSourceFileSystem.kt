@@ -13,15 +13,18 @@ class LocalSourceFileSystem(
             // Get all the files inside all baseDir
             .flatMap { it.listFiles().orEmpty().toList() }
 
-    fun getMangaDirectory(name: String): File? =
-        getFilesInBaseDirectories()
-            // Get the first mangaDir or null
-            .firstOrNull { it.isDirectory && it.name == name }
+    fun getMangaDirectory(name: String): File? = mangaDirectories(name).firstOrNull()
 
     fun getFilesInMangaDirectory(name: String): Sequence<File> =
-        getFilesInBaseDirectories()
-            // Filter out ones that are not related to the manga and is not a directory
-            .filter { it.isDirectory && it.name == name }
-            // Get all the files inside the filtered folders
+        mangaDirectories(name)
             .flatMap { it.listFiles().orEmpty().toList() }
+
+    private fun mangaDirectories(name: String): Sequence<File> {
+        // A manga URL is one leaf name. Retain the old enumeration's containment
+        // without listing every sibling directory for each lookup.
+        if (name.isEmpty() || name == "." || name == ".." || File(name).isAbsolute || File(name).name != name) {
+            return emptySequence()
+        }
+        return getBaseDirectories().map { File(it, name) }.filter(File::isDirectory)
+    }
 }

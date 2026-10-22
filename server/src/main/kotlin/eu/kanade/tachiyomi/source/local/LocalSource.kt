@@ -28,9 +28,11 @@ import eu.kanade.tachiyomi.util.chapter.ChapterRecognition
 import eu.kanade.tachiyomi.util.lang.compareToCaseInsensitiveNaturalOrder
 import eu.kanade.tachiyomi.util.storage.EpubFile
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -87,88 +89,91 @@ class LocalSource(
         page: Int,
         query: String,
         filters: FilterList,
-    ): MangasPage {
-        val baseDirsFiles = fileSystem.getFilesInBaseDirectories()
-        val lastModifiedLimit by lazy { if (filters === LATEST_FILTERS) System.currentTimeMillis() - LATEST_THRESHOLD else 0L }
-        var mangaDirs =
-            baseDirsFiles
-                // Filter out files that are hidden and is not a folder
-                .filter { it.isDirectory && !it.name.startsWith('.') }
-                .distinctBy { it.name }
-                .filter {
-                    // Filter by query or last modified
-                    if (lastModifiedLimit == 0L) {
-                        it.name.contains(query, ignoreCase = true)
-                    } else {
-                        it.lastModified() >= lastModifiedLimit
-                    }
-                }
-
-        filters.forEach { filter ->
-            when (filter) {
-                is OrderBy.Popular -> {
-                    mangaDirs =
-                        if (filter.state!!.ascending) {
-                            mangaDirs.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+    ): MangasPage =
+        withContext(Dispatchers.IO) {
+            require(page > 0) { "Local source page must be positive" }
+            val baseDirsFiles = fileSystem.getFilesInBaseDirectories()
+            val lastModifiedLimit by lazy { if (filters === LATEST_FILTERS) System.currentTimeMillis() - LATEST_THRESHOLD else 0L }
+            var mangaDirs =
+                baseDirsFiles
+                    // Filter out files that are hidden and is not a folder
+                    .filter { it.isDirectory && !it.name.startsWith('.') }
+                    .distinctBy { it.name }
+                    .filter {
+                        // Filter by query or last modified
+                        if (lastModifiedLimit == 0L) {
+                            it.name.contains(query, ignoreCase = true)
                         } else {
-                            mangaDirs.sortedWith(compareByDescending(String.CASE_INSENSITIVE_ORDER) { it.name })
-                        }
-                }
-
-                is OrderBy.Latest -> {
-                    mangaDirs =
-                        if (filter.state!!.ascending) {
-                            mangaDirs.sortedBy(File::lastModified)
-                        } else {
-                            mangaDirs.sortedByDescending(File::lastModified)
-                        }
-                }
-
-                else -> {
-                    // Do nothing
-                }
-            }
-        }
-
-        // Transform mangaDirs to list of SManga
-        val mangas =
-            mangaDirs.map { mangaDir ->
-                SManga.create().apply {
-                    title = mangaDir.name
-                    url = mangaDir.name
-
-                    // Try to find the cover
-                    coverManager
-                        .find(mangaDir.name)
-                        ?.takeIf(File::exists)
-                        ?.let { thumbnail_url = it.absolutePath }
-                }
-            }
-
-        // Fetch chapters of all the manga
-        mangas.forEach { manga ->
-            runBlocking {
-                val chapters = getChapterList(manga)
-                if (chapters.isNotEmpty()) {
-                    val chapter = chapters.last()
-                    val format = getFormat(chapter)
-
-                    if (format is Format.Epub) {
-                        EpubFile(format.file).use { epub ->
-                            epub.fillMangaMetadata(manga)
+                            it.lastModified() >= lastModifiedLimit
                         }
                     }
 
-                    // Copy the cover from the first chapter found if not available
-                    if (manga.thumbnail_url == null) {
-                        updateCover(chapter, manga)
+            filters.forEach { filter ->
+                when (filter) {
+                    is OrderBy -> {
+                        val byName = compareBy<File, String>(String.CASE_INSENSITIVE_ORDER) { it.name }.thenBy { it.name }
+                        val comparator =
+                            when (filter.state?.index) {
+                                1 -> compareBy<File> { it.lastModified() }.then(byName)
+                                else -> byName
+                            }
+                        mangaDirs = mangaDirs.sortedWith(if (filter.state?.ascending == false) comparator.reversed() else comparator)
+                    }
+
+                    else -> {
+                        // Do nothing
                     }
                 }
             }
-        }
 
-        return MangasPage(mangas.toList(), false)
-    }
+            // Directory names/sort metadata are cheap. Chapter and archive work is
+            // bounded to the requested page instead of preparing the whole library.
+            val directories = mangaDirs.toList()
+            val offset = (page.toLong() - 1) * PAGE_SIZE
+            val selected =
+                if (offset >= directories.size) {
+                    emptyList()
+                } else {
+                    directories.subList(offset.toInt(), minOf(offset + PAGE_SIZE, directories.size.toLong()).toInt())
+                }
+            val mangas =
+                selected.map { mangaDir ->
+                    currentCoroutineContext().ensureActive()
+                    val files = mangaDir.listFiles().orEmpty().toList()
+                    val manga =
+                        SManga.create().apply {
+                            title = mangaDir.name
+                            url = mangaDir.name
+                            thumbnail_url = coverManager.find(files.asSequence())?.absolutePath
+                        }
+                    // EPUB authors/descriptions come from package metadata. Preserve
+                    // that behavior; other cached-cover titles need no chapter parsing.
+                    val hasEpub =
+                        files.any {
+                            !it.name.startsWith('.') && it.extension.equals("epub", true) && it.isFile
+                        }
+                    if (manga.thumbnail_url == null || hasEpub) {
+                        try {
+                            val chapters = getChapterList(manga, files.asSequence())
+                            if (chapters.isNotEmpty()) {
+                                val chapter = chapters.last()
+                                val format = getFormat(chapter)
+                                if (format is Format.Epub) {
+                                    EpubFile(format.file).use { epub -> epub.fillMangaMetadata(manga) }
+                                }
+                                if (manga.thumbnail_url == null) updateCover(chapter, manga)
+                            }
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            // One unreadable archive must not hide the rest of the catalogue.
+                            logger.warn { "Unable to prepare local catalogue metadata (${error.javaClass.simpleName})" }
+                        }
+                    }
+                    manga
+                }
+            MangasPage(mangas, offset + mangas.size < directories.size)
+        }
 
     override suspend fun getMangaUpdate(
         manga: SManga,
@@ -304,9 +309,11 @@ class LocalSource(
     }
 
     // Chapters
-    private suspend fun getChapterList(manga: SManga): List<SChapter> =
-        fileSystem
-            .getFilesInMangaDirectory(manga.url)
+    private suspend fun getChapterList(
+        manga: SManga,
+        files: Sequence<File> = fileSystem.getFilesInMangaDirectory(manga.url),
+    ): List<SChapter> =
+        files
             // Only keep supported formats
             .filterNot { it.name.orEmpty().startsWith('.') }
             .filter { it.isDirectory || Archive.isSupported(it) }
@@ -459,6 +466,8 @@ class LocalSource(
         const val NAME = "Local source"
 
         const val EXTENSION_NAME = "Local Source fake extension"
+
+        internal const val PAGE_SIZE = 64
 
         private val LATEST_THRESHOLD = 7.days.inWholeMilliseconds
 

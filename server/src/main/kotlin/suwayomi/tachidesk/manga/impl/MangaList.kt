@@ -132,7 +132,15 @@ object MangaList {
         val mangaList =
             transaction {
                 val mangaIds = insertOrUpdate(sourceId)
-                return@transaction MangaTable.selectAll().where { MangaTable.id inList mangaIds }.map { MangaTable.toDataClass(it) }
+                val byId =
+                    MangaTable
+                        .selectAll()
+                        .where { MangaTable.id inList mangaIds }
+                        .map { MangaTable.toDataClass(it) }
+                        .associateBy { it.id }
+                // SQL IN does not preserve the source's order. Pagination and
+                // local title/date sorting must keep the requested sequence.
+                return@transaction mangaIds.map { byId.getValue(it) }
             }
         return PagedMangaListDataClass(
             mangaList,
