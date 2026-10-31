@@ -2,14 +2,15 @@ package suwayomi.tachidesk.manga.impl.update
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 import suwayomi.tachidesk.manga.impl.Category
@@ -22,6 +23,7 @@ import suwayomi.tachidesk.test.ApplicationTest
 import suwayomi.tachidesk.test.clearTables
 import suwayomi.tachidesk.test.createLibraryManga
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -104,7 +106,11 @@ class LibraryUpdateRunTest : ApplicationTest() {
         val terminal = emitted.last()
         assertEquals(UpdateRunState.COMPLETED, terminal.runState)
         assertTrue(!terminal.running)
-        val finished = terminal.mangaStatusMap.filterKeys { it == JobStatus.COMPLETE || it == JobStatus.FAILED }.values.sumOf { it.size }
+        val finished =
+            terminal.mangaStatusMap
+                .filterKeys { it == JobStatus.COMPLETE || it == JobStatus.FAILED }
+                .values
+                .sumOf { it.size }
         assertEquals(2, finished, "both titles were checked (their source is unavailable here)")
     }
 
@@ -133,7 +139,10 @@ class LibraryUpdateRunTest : ApplicationTest() {
     fun `a snapshot repeats the latest emission's sequence`() {
         val updater = Updater()
         val runId = updater.startLibraryUpdate(category(), clear = true, forceAll = true)
-        waitFor { updater.statusDeprecated.value.runState?.isTerminal == true }
+        waitFor {
+            updater.statusDeprecated.value.runState
+                ?.isTerminal == true
+        }
         val latest = updater.statusDeprecated.value
         val frames = updater.record()
         val snapshot = assertNotNull(frames.firstOrNull())
@@ -185,7 +194,13 @@ class LibraryUpdateRunTest : ApplicationTest() {
         assertTrue(afterStop.none { it.running || it.runState == UpdateRunState.RUNNING }, "no job runs after the stop: $afterStop")
         val last = updater.statusDeprecated.value
         assertEquals(UpdateRunState.CANCELLED, last.runState)
-        assertTrue(last.mangaStatusMap.filterKeys { it != JobStatus.SKIPPED }.values.all { it.isEmpty() }, "the tracker stays empty")
+        assertTrue(
+            last.mangaStatusMap
+                .filterKeys { it != JobStatus.SKIPPED }
+                .values
+                .all { it.isEmpty() },
+            "the tracker stays empty",
+        )
     }
 
     @Test
@@ -220,8 +235,112 @@ class LibraryUpdateRunTest : ApplicationTest() {
         val last = updater.statusDeprecated.value
         assertEquals(secondRun, last.runId)
         assertEquals(UpdateRunState.COMPLETED, last.runState)
-        val titles = last.mangaStatusMap.values.flatten().map { it.title }
+        val titles =
+            last.mangaStatusMap.values
+                .flatten()
+                .map { it.title }
         assertEquals(listOf("Replacing run title"), titles, "the replaced run's job left no trace (category $oldTitle)")
         Category.removeCategory(second)
+    }
+
+    @Test
+    fun `a delayed stop never publishes its titles under a newer run`() {
+        val categories = category("Delayed stop title")
+        val updater = Updater()
+        val jobHeld = CompletableDeferred<Unit>()
+        val releaseJob = CompletableDeferred<Unit>()
+        var firstRun: String? = null
+        updater.beforeJobResult = { job ->
+            if (job.runId == firstRun) {
+                jobHeld.complete(Unit)
+                withContext(NonCancellable) { releaseJob.await() }
+            }
+        }
+        val stopHeld = CompletableDeferred<Unit>()
+        val releaseStop = CompletableDeferred<Unit>()
+        updater.beforeCapturedPublish = {
+            stopHeld.complete(Unit)
+            releaseStop.await()
+        }
+        val frames = updater.record()
+        firstRun = updater.startLibraryUpdate(categories, clear = true, forceAll = true)
+        runBlocking { jobHeld.await() }
+
+        // Stop A, hold its publication, and let an empty run B complete.
+        updater.reset()
+        runBlocking { stopHeld.await() }
+        val empty = Category.createCategory("Empty replacing run fixture")
+        val secondRun =
+            updater.startLibraryUpdate(listOfNotNull(Category.getCategoryById(empty)), clear = true, forceAll = true)
+        waitFor { updater.statusDeprecated.value.let { it.runId == secondRun && it.runState == UpdateRunState.COMPLETED } }
+        val completed = updater.statusDeprecated.value
+
+        releaseStop.complete(Unit)
+        releaseJob.complete(Unit)
+        Thread.sleep(1_000)
+
+        val last = updater.statusDeprecated.value
+        assertEquals(secondRun, last.runId)
+        assertEquals(UpdateRunState.COMPLETED, last.runState)
+        assertTrue(
+            frames.none { it.sequence > completed.sequence && it.runId != secondRun },
+            "the stopped run publishes nothing once it is replaced: ${frames.filter { it.sequence > completed.sequence }}",
+        )
+        assertTrue(last.mangaStatusMap.values.all { it.isEmpty() }, "B has no titles: $last")
+        assertTrue(
+            frames.filter { it.runId == secondRun }.all { frame -> frame.mangaStatusMap.values.all { it.isEmpty() } },
+            "no status of B carries A's titles",
+        )
+        Category.removeCategory(empty)
+    }
+
+    /** Collects [flow], taking its opening item and then stopping on the next one until [release]. */
+    private fun <T> Flow<T>.blockedAfterFirst(
+        release: CompletableDeferred<Unit>,
+        delivered: CompletableDeferred<Unit>,
+        latest: AtomicReference<T?>,
+    ) {
+        val opened = CompletableDeferred<Unit>()
+        var first = true
+        onEach {
+            latest.set(it)
+            if (first) {
+                first = false
+                opened.complete(Unit)
+            } else {
+                delivered.complete(Unit)
+                release.await()
+            }
+        }.launchIn(scope)
+        runBlocking { opened.await() }
+    }
+
+    @Test
+    fun `a blocked subscriber never holds up the summary`() {
+        val updater = Updater()
+        val release = CompletableDeferred<Unit>()
+        val statusDelivered = CompletableDeferred<Unit>()
+        val updatesDelivered = CompletableDeferred<Unit>()
+        val latestStatus = AtomicReference<UpdateStatus?>()
+        val latestUpdates = AtomicReference<UpdateUpdates?>()
+        updater.status.blockedAfterFirst(release, statusDelivered, latestStatus)
+        updater.updates.blockedAfterFirst(release, updatesDelivered, latestUpdates)
+        // The collectors subscribe to the shared flows right after their
+        // opening item.
+        Thread.sleep(200)
+
+        repeat(200) { updater.reset() }
+        val runId = updater.startLibraryUpdate(category(), clear = true, forceAll = true)
+
+        waitFor { updater.statusDeprecated.value.let { it.runId == runId && it.runState == UpdateRunState.COMPLETED } }
+        val summary = updater.statusDeprecated.value
+        assertTrue(summary.sequence >= 201, "every publication reached the summary: ${summary.sequence}")
+        assertTrue(statusDelivered.isCompleted && updatesDelivered.isCompleted, "both subscribers are stuck on a delivered item")
+
+        // Once released, the subscribers catch up with the latest status.
+        release.complete(Unit)
+        waitFor { latestStatus.get()?.sequence == summary.sequence }
+        assertEquals(runId, latestStatus.get()?.runId)
+        waitFor { latestUpdates.get()?.isRunning == false }
     }
 }

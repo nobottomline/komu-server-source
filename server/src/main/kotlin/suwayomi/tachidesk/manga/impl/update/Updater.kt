@@ -12,6 +12,7 @@ import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -82,14 +83,34 @@ class Updater : IUpdater {
     /** Test seam: suspends a job right before it records its result. */
     internal var beforeJobResult: (suspend (UpdateJob) -> Unit)? = null
 
+    // Komu: buffered, latest wins for a slow subscriber. Statuses are whole
+    // snapshots ordered by `sequence`, so a subscriber that falls behind
+    // skips stale ones instead of holding up every publication.
     @Deprecated("Replaced with updatesFlow", replaceWith = ReplaceWith("updatesFlow"))
-    private val statusFlow = MutableSharedFlow<UpdateStatus>()
+    private val statusFlow =
+        MutableSharedFlow<UpdateStatus>(extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     @Deprecated("Replaced with updates", replaceWith = ReplaceWith("updates"))
     override val status = statusFlow.onStart { emit(_status.value) }
 
     private val updatesFlow = MutableSharedFlow<UpdateUpdates>()
     override val updates = updatesFlow.onStart { emit(getUpdates(addInitial = true)) }
+
+    // Komu: the deltas waiting for a slow `updates` subscriber, merged in
+    // publication order (guarded by `publishMutex`). One forwarder delivers
+    // them, so a subscriber's backpressure stays with the forwarder and no
+    // title's latest state is lost or reordered.
+    private var pendingUpdates: UpdateUpdates? = null
+    private val updatesPending = Channel<Unit>(Channel.CONFLATED)
+
+    init {
+        notifyFlowScope.launch {
+            for (signal in updatesPending) {
+                val next = publishMutex.withLock { pendingUpdates.also { pendingUpdates = null } } ?: continue
+                updatesFlow.emit(next)
+            }
+        }
+    }
 
     init {
         // has to be in its own scope (notifyFlowScope), otherwise, the collection gets canceled due to canceling the scopes (scope) children in the reset function
@@ -218,18 +239,6 @@ class Updater : IUpdater {
     private fun isRunning(): Boolean =
         tracker.values.toList().any { job -> job.status == JobStatus.PENDING || job.status == JobStatus.RUNNING }
 
-    // old status that is still required for the deprecated endpoints
-    private fun getStatusDeprecated(
-        running: Boolean? = null,
-        sequence: Long = emissionSequence.get(),
-        jobs: List<UpdateJob> = tracker.values.toList(),
-    ): UpdateStatus {
-        val isRunning = running ?: isRunning()
-        val (id, state) = synchronized(runLock) { runId to runState }
-        return UpdateStatus(this.updateStatusCategories, jobs, this.updateStatusSkippedMangas, isRunning)
-            .copy(runId = id, runState = state, sequence = sequence, serverInstanceId = serverInstanceId)
-    }
-
     /** Moves run [id] to [to] when it is the current run in one of [from]. */
     private fun transitionRun(
         id: String?,
@@ -306,21 +315,52 @@ class Updater : IUpdater {
         notifyFlow.send(Unit)
     }
 
+    /** Everything one status says, captured together under the run lock. */
+    private class StatusSnapshot(
+        val runId: String?,
+        val runState: UpdateRunState?,
+        val jobs: List<UpdateJob>,
+        val categories: Map<CategoryUpdateStatus, List<CategoryDataClass>>,
+        val skipped: List<MangaDataClass>,
+    )
+
+    private fun captureLocked() =
+        StatusSnapshot(runId, runState, tracker.values.toList(), updateStatusCategories, updateStatusSkippedMangas)
+
+    /** Test seam: suspends the publication of a captured (stop) status. */
+    internal var beforeCapturedPublish: (suspend () -> Unit)? = null
+
     /**
-     * Publishes the current status (or [jobs]) as the next emission. The
-     * snapshot is set before the flow emits, so a subscriber's opening
-     * snapshot is never older than a frame it then receives.
+     * Publishes the next emission: the status as it is now, or [captured]
+     * (a stop's status) only while its run is still the current one, so a
+     * late publication never puts one run's titles under another run.
+     *
+     * The sequence and the snapshot are assigned under one mutex; the
+     * status flow is buffered (`tryEmit`) and the deltas go through the
+     * forwarder, so the order holds and no subscriber holds up a
+     * publication.
      */
     private suspend fun publish(
         isRunning: Boolean?,
-        jobs: List<UpdateJob>? = null,
+        captured: StatusSnapshot? = null,
     ) {
+        if (captured != null) beforeCapturedPublish?.invoke()
         publishMutex.withLock {
+            val snapshot =
+                if (captured != null) {
+                    if (synchronized(runLock) { runId } != captured.runId) return
+                    captured
+                } else {
+                    synchronized(runLock) { captureLocked() }
+                }
+            val running =
+                isRunning ?: snapshot.jobs.any { it.status == JobStatus.PENDING || it.status == JobStatus.RUNNING }
             val status =
-                getStatusDeprecated(
-                    running = isRunning,
+                UpdateStatus(snapshot.categories, snapshot.jobs, snapshot.skipped, running).copy(
+                    runId = snapshot.runId,
+                    runState = snapshot.runState,
                     sequence = emissionSequence.incrementAndGet(),
-                    jobs = jobs ?: tracker.values.toList(),
+                    serverInstanceId = serverInstanceId,
                 )
             val updates = getUpdates(isRunning)
 
@@ -328,14 +368,22 @@ class Updater : IUpdater {
             this.categoryUpdates.clear()
 
             _status.update { status }
-            statusFlow.emit(status)
-            updatesFlow.emit(updates)
+            statusFlow.tryEmit(status)
+            pendingUpdates = pendingUpdates?.then(updates) ?: updates
         }
+        updatesPending.trySend(Unit)
     }
 
+    /** This delta followed by [next]: [next]'s totals, the latest job per title and category. */
+    private fun UpdateUpdates.then(next: UpdateUpdates): UpdateUpdates =
+        next.copy(
+            categoryUpdates = (categoryUpdates + next.categoryUpdates).associateBy { it.category.id }.values.toList(),
+            mangaUpdates = (mangaUpdates + next.mangaUpdates).associateBy { it.manga.id }.values.toList(),
+            initial = next.initial ?: initial,
+        )
+
     /** The job may change the tracker: it belongs to the running run (or to no run). */
-    private fun ownsLocked(job: UpdateJob): Boolean =
-        job.runId == null || (job.runId == runId && runState == UpdateRunState.RUNNING)
+    private fun ownsLocked(job: UpdateJob): Boolean = job.runId == null || (job.runId == runId && runState == UpdateRunState.RUNNING)
 
     private fun getOrCreateUpdateChannelFor(source: String): Channel<UpdateJob> =
         updateChannels.getOrPut(source) {
@@ -590,24 +638,25 @@ class Updater : IUpdater {
     }
 
     override fun reset() {
-        // Komu: a stop ends the current run as CANCELLED; its last status
-        // (titles checked so far, the rest still pending) is emitted with
-        // that state before the queue is cleared.
-        val (cancelled, jobs) =
+        // Komu: a stop ends the current run as CANCELLED. Its last status
+        // (its id, CANCELLED, the titles checked so far and the rest still
+        // pending) is captured with the transition, under the run lock,
+        // before the queue is cleared.
+        val captured =
             synchronized(runLock) {
                 // The start coroutine stops too: nothing is queued after this.
                 startJob?.cancel()
                 startJob = null
                 val active = runId != null && (runState == UpdateRunState.QUEUED || runState == UpdateRunState.RUNNING)
                 if (active) runState = UpdateRunState.CANCELLED
-                val jobs = tracker.values.toList()
+                val snapshot = if (active) captureLocked() else null
                 clearQueue()
-                active to jobs
+                snapshot
             }
         // Outside `scope`: a start right after the stop clears `scope`, and
-        // the cancelled status must still be published.
+        // the cancelled status must still be published (while it is current).
         notifyFlowScope.launch {
-            publish(isRunning = false, jobs = if (cancelled) jobs else null)
+            publish(isRunning = false, captured = captured)
         }
     }
 
