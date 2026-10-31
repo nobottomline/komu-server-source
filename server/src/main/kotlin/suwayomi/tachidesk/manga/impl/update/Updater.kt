@@ -124,8 +124,16 @@ class Updater : IUpdater {
     private val _status = MutableStateFlow(UpdateStatus(serverInstanceId = serverInstanceId))
     override val statusDeprecated = _status.asStateFlow()
 
+    // Komu: the deltas since the last publication. Recording one, and
+    // taking them for a publication (read, then clear), happen under
+    // `deltaLock`, so a delta recorded meanwhile goes to the next
+    // publication instead of being cleared unseen.
+    private val deltaLock = Any()
     private val mangaUpdates = ConcurrentHashMap<Int, UpdateJob>()
     private val categoryUpdates = ConcurrentHashMap<Int, CategoryUpdateJob>()
+
+    /** Test seam: runs while a publication holds the deltas it took, before it clears them. */
+    internal var whileTakingDeltas: (() -> Unit)? = null
     private var updateStatusCategories: Map<CategoryUpdateStatus, List<CategoryDataClass>> = emptyMap()
     private var updateStatusSkippedMangas: List<MangaDataClass> = emptyList()
 
@@ -298,14 +306,16 @@ class Updater : IUpdater {
     /**
      * Pass "isRunning" to force a specific running state
      */
-    private suspend fun updateStatus(
+    internal suspend fun updateStatus(
         immediate: Boolean = false,
         categoryUpdates: List<CategoryUpdateJob> = emptyList(),
         mangaUpdates: List<UpdateJob> = emptyList(),
         isRunning: Boolean? = null,
     ) {
-        mangaUpdates.forEach { this.mangaUpdates[it.manga.id] = it }
-        categoryUpdates.forEach { this.categoryUpdates[it.category.id] = it }
+        synchronized(deltaLock) {
+            mangaUpdates.forEach { this.mangaUpdates[it.manga.id] = it }
+            categoryUpdates.forEach { this.categoryUpdates[it.category.id] = it }
+        }
 
         if (immediate) {
             publish(isRunning)
@@ -362,10 +372,14 @@ class Updater : IUpdater {
                     sequence = emissionSequence.incrementAndGet(),
                     serverInstanceId = serverInstanceId,
                 )
-            val updates = getUpdates(isRunning)
-
-            this.mangaUpdates.clear()
-            this.categoryUpdates.clear()
+            val updates =
+                synchronized(deltaLock) {
+                    getUpdates(isRunning).also {
+                        whileTakingDeltas?.invoke()
+                        this.mangaUpdates.clear()
+                        this.categoryUpdates.clear()
+                    }
+                }
 
             _status.update { status }
             statusFlow.tryEmit(status)
@@ -665,8 +679,10 @@ class Updater : IUpdater {
         scope.coroutineContext.cancelChildren()
 
         tracker.clear()
-        this.mangaUpdates.clear()
-        this.categoryUpdates.clear()
+        synchronized(deltaLock) {
+            this.mangaUpdates.clear()
+            this.categoryUpdates.clear()
+        }
         this.updateStatusCategories = emptyMap()
         this.updateStatusSkippedMangas = emptyList()
 

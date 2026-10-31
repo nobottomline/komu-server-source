@@ -22,6 +22,7 @@ import suwayomi.tachidesk.manga.model.table.MangaTable
 import suwayomi.tachidesk.test.ApplicationTest
 import suwayomi.tachidesk.test.clearTables
 import suwayomi.tachidesk.test.createLibraryManga
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
@@ -342,5 +343,41 @@ class LibraryUpdateRunTest : ApplicationTest() {
         waitFor { latestStatus.get()?.sequence == summary.sequence }
         assertEquals(runId, latestStatus.get()?.runId)
         waitFor { latestUpdates.get()?.isRunning == false }
+    }
+
+    @Test
+    fun `a delta recorded while a publication takes the deltas reaches the next publication`() {
+        val categories = category("Delta title")
+        val title = CategoryManga.getCategoryMangaList(categories.first().id).first()
+        val updater = Updater()
+        val delivered = ConcurrentHashMap<Int, JobStatus>()
+        val opened = CompletableDeferred<Unit>()
+        updater.updates
+            .onEach { delta ->
+                delta.mangaUpdates.forEach { delivered[it.manga.id] = it.status }
+                opened.complete(Unit)
+            }.launchIn(scope)
+        runBlocking { opened.await() }
+        // The collector subscribes right after its opening item.
+        Thread.sleep(200)
+
+        // While the RUNNING publication holds the deltas it took, the
+        // title's COMPLETE is recorded from another thread.
+        var writer: Thread? = null
+        updater.whileTakingDeltas = {
+            if (writer == null) {
+                val complete = UpdateJob(title, JobStatus.COMPLETE)
+                writer =
+                    Thread { runBlocking { updater.updateStatus(mangaUpdates = listOf(complete)) } }
+                        .also {
+                            it.start()
+                            it.join(500)
+                        }
+            }
+        }
+        runBlocking { updater.updateStatus(immediate = true, mangaUpdates = listOf(UpdateJob(title, JobStatus.RUNNING))) }
+
+        waitFor(5_000) { delivered[title.id] == JobStatus.COMPLETE }
+        assertEquals(JobStatus.COMPLETE, delivered[title.id], "the final delta is delivered, never cleared unseen")
     }
 }
