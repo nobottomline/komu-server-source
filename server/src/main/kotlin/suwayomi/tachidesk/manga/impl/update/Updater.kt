@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.channels.Channel
@@ -24,7 +25,9 @@ import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import suwayomi.tachidesk.global.impl.sync.SyncManager
 import suwayomi.tachidesk.manga.impl.Category
@@ -58,15 +61,32 @@ class Updater : IUpdater {
     // outside `scope`, which clearing the queue cancels.
     private val startScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val emissionSequence = AtomicLong(0)
+    private val serverInstanceId = UUID.randomUUID().toString()
+
+    // Run state, the tracker's membership and the queue change together
+    // under this lock: a stop, a replacement and an enqueue never interleave.
     private val runLock = Any()
     private var runId: String? = null
     private var runState: UpdateRunState? = null
+    private var startJob: Job? = null
+
+    // The single writer of deprecated statuses: building a status,
+    // assigning its sequence and publishing it to the flow and the snapshot
+    // happen in one critical section, so sequences reach every subscriber
+    // in order and the snapshot is always the last published status.
+    private val publishMutex = Mutex()
+
+    /** Test seam: suspends a run right before it queues its titles. */
+    internal var beforeEnqueue: (suspend (runId: String) -> Unit)? = null
+
+    /** Test seam: suspends a job right before it records its result. */
+    internal var beforeJobResult: (suspend (UpdateJob) -> Unit)? = null
 
     @Deprecated("Replaced with updatesFlow", replaceWith = ReplaceWith("updatesFlow"))
     private val statusFlow = MutableSharedFlow<UpdateStatus>()
 
     @Deprecated("Replaced with updates", replaceWith = ReplaceWith("updates"))
-    override val status = statusFlow.onStart { emit(getStatusDeprecated(null)) }
+    override val status = statusFlow.onStart { emit(_status.value) }
 
     private val updatesFlow = MutableSharedFlow<UpdateUpdates>()
     override val updates = updatesFlow.onStart { emit(getUpdates(addInitial = true)) }
@@ -80,7 +100,7 @@ class Updater : IUpdater {
         }
     }
 
-    private val _status = MutableStateFlow(UpdateStatus())
+    private val _status = MutableStateFlow(UpdateStatus(serverInstanceId = serverInstanceId))
     override val statusDeprecated = _status.asStateFlow()
 
     private val mangaUpdates = ConcurrentHashMap<Int, UpdateJob>()
@@ -207,7 +227,7 @@ class Updater : IUpdater {
         val isRunning = running ?: isRunning()
         val (id, state) = synchronized(runLock) { runId to runState }
         return UpdateStatus(this.updateStatusCategories, jobs, this.updateStatusSkippedMangas, isRunning)
-            .copy(runId = id, runState = state, sequence = sequence)
+            .copy(runId = id, runState = state, sequence = sequence, serverInstanceId = serverInstanceId)
     }
 
     /** Moves run [id] to [to] when it is the current run in one of [from]. */
@@ -279,21 +299,43 @@ class Updater : IUpdater {
         categoryUpdates.forEach { this.categoryUpdates[it.category.id] = it }
 
         if (immediate) {
-            val status = getStatusDeprecated(running = isRunning, sequence = emissionSequence.incrementAndGet())
-            val updates = getUpdates(isRunning)
-
-            this.mangaUpdates.clear()
-            this.categoryUpdates.clear()
-
-            statusFlow.emit(status)
-            _status.update { status }
-            updatesFlow.emit(updates)
-
+            publish(isRunning)
             return
         }
 
         notifyFlow.send(Unit)
     }
+
+    /**
+     * Publishes the current status (or [jobs]) as the next emission. The
+     * snapshot is set before the flow emits, so a subscriber's opening
+     * snapshot is never older than a frame it then receives.
+     */
+    private suspend fun publish(
+        isRunning: Boolean?,
+        jobs: List<UpdateJob>? = null,
+    ) {
+        publishMutex.withLock {
+            val status =
+                getStatusDeprecated(
+                    running = isRunning,
+                    sequence = emissionSequence.incrementAndGet(),
+                    jobs = jobs ?: tracker.values.toList(),
+                )
+            val updates = getUpdates(isRunning)
+
+            this.mangaUpdates.clear()
+            this.categoryUpdates.clear()
+
+            _status.update { status }
+            statusFlow.emit(status)
+            updatesFlow.emit(updates)
+        }
+    }
+
+    /** The job may change the tracker: it belongs to the running run (or to no run). */
+    private fun ownsLocked(job: UpdateJob): Boolean =
+        job.runId == null || (job.runId == runId && runState == UpdateRunState.RUNNING)
 
     private fun getOrCreateUpdateChannelFor(source: String): Channel<UpdateJob> =
         updateChannels.getOrPut(source) {
@@ -333,13 +375,15 @@ class Updater : IUpdater {
     }
 
     private suspend fun process(job: UpdateJob) {
-        // The run this job belongs to; a job of a replaced run never ends
-        // the current one.
-        val jobRun = currentRunId()
-        tracker[job.manga.id] = job.copy(status = JobStatus.RUNNING)
-        updateStatus(mangaUpdates = listOf(tracker[job.manga.id]!!))
+        // A job of a stopped or replaced run neither runs nor publishes.
+        val started =
+            synchronized(runLock) {
+                if (!ownsLocked(job)) return
+                job.copy(status = JobStatus.RUNNING).also { tracker[job.manga.id] = it }
+            }
+        updateStatus(mangaUpdates = listOf(started))
 
-        tracker[job.manga.id] =
+        val result =
             try {
                 logger.info { "Updating ${job.manga}" }
                 Manga.updateMangaAndChapters(
@@ -352,16 +396,24 @@ class Updater : IUpdater {
                 if (e is CancellationException) throw e
                 job.copy(status = JobStatus.FAILED)
             }
+        beforeJobResult?.invoke(job)
 
-        val wasLastJob = tracker.values.none { it.status == JobStatus.PENDING || it.status == JobStatus.RUNNING }
+        val wasLastJob =
+            synchronized(runLock) {
+                if (!ownsLocked(job)) return
+                tracker[job.manga.id] = result
+                tracker.values.none { it.status == JobStatus.PENDING || it.status == JobStatus.RUNNING }
+            }
 
         // in case this is the last update job, the running flag has to be true, before it gets set to false, to be able
         // to properly clear the dataloader store in UpdateType
-        updateStatus(immediate = wasLastJob, isRunning = true, mangaUpdates = listOf(tracker[job.manga.id]!!))
+        updateStatus(immediate = wasLastJob, isRunning = true, mangaUpdates = listOf(result))
 
         if (wasLastJob) {
-            transitionRun(jobRun, UpdateRunState.COMPLETED, UpdateRunState.RUNNING)
-            updateStatus(isRunning = false)
+            // Fails when a stop or a newer run came first: nothing is revived.
+            if (job.runId == null || transitionRun(job.runId, UpdateRunState.COMPLETED, UpdateRunState.RUNNING)) {
+                updateStatus(isRunning = false)
+            }
         }
     }
 
@@ -380,20 +432,23 @@ class Updater : IUpdater {
     ): String {
         val id = UUID.randomUUID().toString()
         synchronized(runLock) {
+            // A newer run replaces the previous one's start.
+            startJob?.cancel()
             runId = id
             runState = UpdateRunState.QUEUED
-        }
-        startScope.launch {
-            try {
-                queueLibraryUpdate(id, categories, clear, forceAll)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.error(e) { "Library update $id could not start" }
-                if (transitionRun(id, UpdateRunState.FAILED, UpdateRunState.QUEUED, UpdateRunState.RUNNING)) {
-                    updateStatus(immediate = true, isRunning = false)
+            startJob =
+                startScope.launch {
+                    try {
+                        queueLibraryUpdate(id, categories, clear, forceAll)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.error(e) { "Library update $id could not start" }
+                        if (transitionRun(id, UpdateRunState.FAILED, UpdateRunState.QUEUED, UpdateRunState.RUNNING)) {
+                            updateStatus(immediate = true, isRunning = false)
+                        }
+                    }
                 }
-            }
         }
         return id
     }
@@ -413,7 +468,10 @@ class Updater : IUpdater {
             if (!isQueued(id)) return
 
             if (clear == true) {
-                clearQueue()
+                synchronized(runLock) {
+                    if (!(runId == id && runState == UpdateRunState.QUEUED)) return
+                    clearQueue()
+                }
                 updateStatus(immediate = true, isRunning = false)
             }
 
@@ -471,20 +529,35 @@ class Updater : IUpdater {
                     }.toList()
             val skippedMangas = categoriesToUpdateMangas.subtract(mangasToUpdate.toSet()).toList()
 
-            this@Updater.updateStatusCategories = updateStatusCategories
-            this@Updater.updateStatusSkippedMangas = skippedMangas
+            beforeEnqueue?.invoke(id)
 
-            if (mangasToUpdate.isEmpty()) {
+            // The decision and the queueing happen under the run lock: a stop
+            // or a newer run either comes before (nothing is queued) or after
+            // (it clears what was queued).
+            val queued =
+                synchronized(runLock) {
+                    if (!(runId == id && runState == UpdateRunState.QUEUED)) return
+                    this@Updater.updateStatusCategories = updateStatusCategories
+                    this@Updater.updateStatusSkippedMangas = skippedMangas
+                    if (mangasToUpdate.isEmpty()) {
+                        runState = UpdateRunState.COMPLETED
+                        return@synchronized false
+                    }
+                    runState = UpdateRunState.RUNNING
+                    val ordered = mangasToUpdate.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER, MangaDataClass::title))
+                    // create all jobs before queueing them so that the client can calculate the progress right from the start
+                    ordered.forEach { tracker[it.id] = UpdateJob(it, runId = id) }
+                    ordered.forEach { addMangaToQueue(it, id) }
+                    true
+                }
+
+            if (!queued) {
                 // In case no manga gets updated and no update job was running before, the client would never receive an info
                 // about its update request
-                if (transitionRun(id, UpdateRunState.COMPLETED, UpdateRunState.QUEUED)) {
-                    updateStatus(immediate = true)
-                }
+                updateStatus(immediate = true)
                 return
             }
 
-            // Stopped (or replaced) meanwhile: its titles are not queued.
-            if (!transitionRun(id, UpdateRunState.RUNNING, UpdateRunState.QUEUED)) return
             scope.launch {
                 updateStatus(
                     categoryUpdates =
@@ -492,15 +565,10 @@ class Updater : IUpdater {
                             ?.map {
                                 CategoryUpdateJob(it, CategoryUpdateStatus.UPDATING)
                             }.orEmpty(),
-                    mangaUpdates = mangasToUpdate.map { UpdateJob(it) },
+                    mangaUpdates = mangasToUpdate.map { UpdateJob(it, runId = id) },
                     isRunning = true,
                 )
             }
-
-            addMangasToQueue(
-                mangasToUpdate
-                    .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER, MangaDataClass::title)),
-            )
         }
     }
 
@@ -508,13 +576,16 @@ class Updater : IUpdater {
         // create all manga update jobs before adding them to the queue so that the client is able to calculate the
         // progress properly right form the start
         mangas.forEach { tracker[it.id] = UpdateJob(it) }
-        mangas.forEach { addMangaToQueue(it) }
+        mangas.forEach { addMangaToQueue(it, runId = null) }
     }
 
-    private fun addMangaToQueue(manga: MangaDataClass) {
+    private fun addMangaToQueue(
+        manga: MangaDataClass,
+        runId: String?,
+    ) {
         val updateChannel = getOrCreateUpdateChannelFor(manga.sourceId)
         scope.launch {
-            updateChannel.send(UpdateJob(manga))
+            updateChannel.send(UpdateJob(manga, runId = runId))
         }
     }
 
@@ -522,19 +593,21 @@ class Updater : IUpdater {
         // Komu: a stop ends the current run as CANCELLED; its last status
         // (titles checked so far, the rest still pending) is emitted with
         // that state before the queue is cleared.
-        val cancelled =
-            transitionRun(currentRunId(), UpdateRunState.CANCELLED, UpdateRunState.QUEUED, UpdateRunState.RUNNING)
-        val jobs = tracker.values.toList()
-        clearQueue()
-        scope.launch {
-            if (cancelled) {
-                val status = getStatusDeprecated(running = false, sequence = emissionSequence.incrementAndGet(), jobs = jobs)
-                statusFlow.emit(status)
-                _status.update { status }
-                updatesFlow.emit(getUpdates(false))
-            } else {
-                updateStatus(immediate = true, isRunning = false)
+        val (cancelled, jobs) =
+            synchronized(runLock) {
+                // The start coroutine stops too: nothing is queued after this.
+                startJob?.cancel()
+                startJob = null
+                val active = runId != null && (runState == UpdateRunState.QUEUED || runState == UpdateRunState.RUNNING)
+                if (active) runState = UpdateRunState.CANCELLED
+                val jobs = tracker.values.toList()
+                clearQueue()
+                active to jobs
             }
+        // Outside `scope`: a start right after the stop clears `scope`, and
+        // the cancelled status must still be published.
+        notifyFlowScope.launch {
+            publish(isRunning = false, jobs = if (cancelled) jobs else null)
         }
     }
 

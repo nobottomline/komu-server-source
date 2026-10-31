@@ -16,6 +16,8 @@ import suwayomi.tachidesk.manga.model.dataclass.MangaDataClass
  *   `update/summary` carry the value of the latest emission). A snapshot
  *   (on connect, on request) repeats the latest emission's sequence, so a
  *   client correlating by run and sequence can tell snapshots from news.
+ * - [serverInstanceId] identifies this server process: runs and sequences
+ *   do not survive a restart, and a client sees the restart as a new id.
  */
 enum class UpdateRunState {
     QUEUED,
@@ -42,6 +44,7 @@ data class UpdateStatus(
     val runId: String? = null,
     val runState: UpdateRunState? = null,
     val sequence: Long = 0,
+    val serverInstanceId: String? = null,
 ) {
     constructor(
         categories: Map<CategoryUpdateStatus, List<CategoryDataClass>>,

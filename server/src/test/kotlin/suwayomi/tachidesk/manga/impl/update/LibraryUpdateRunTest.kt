@@ -1,6 +1,10 @@
 package suwayomi.tachidesk.manga.impl.update
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -135,5 +139,89 @@ class LibraryUpdateRunTest : ApplicationTest() {
         val snapshot = assertNotNull(frames.firstOrNull())
         assertEquals(latest.sequence, snapshot.sequence)
         assertEquals(runId, snapshot.runId)
+    }
+
+    @Test
+    fun `concurrent publications reach subscribers in sequence order and the snapshot is the last frame`() {
+        val updater = Updater()
+        val frames = updater.record()
+        // Every reset publishes; a thousand of them from many threads race
+        // to build, number and publish statuses.
+        val threads =
+            (0 until 8).map {
+                Thread { repeat(125) { updater.reset() } }.also { it.start() }
+            }
+        threads.forEach { it.join() }
+        waitFor { frames.size >= 1_001 }
+        Thread.sleep(200)
+        val sequences = frames.drop(1).map { it.sequence }
+        val inversions = sequences.zipWithNext().count { (a, b) -> b <= a }
+        assertEquals(0, inversions, "every subscriber sees strictly increasing sequences")
+        assertEquals(frames.last().sequence, updater.statusDeprecated.value.sequence, "the snapshot is the last published status")
+        assertTrue(frames.all { it.serverInstanceId != null && it.serverInstanceId == frames.first().serverInstanceId })
+        assertTrue(Updater().statusDeprecated.value.serverInstanceId != frames.first().serverInstanceId, "another process, another id")
+    }
+
+    @Test
+    fun `a stop before the titles are queued leaves nothing to run`() {
+        val categories = category("Race fixture")
+        val updater = Updater()
+        val reached = CompletableDeferred<Unit>()
+        val resume = CompletableDeferred<Unit>()
+        updater.beforeEnqueue = {
+            reached.complete(Unit)
+            withContext(NonCancellable) { resume.await() }
+        }
+        val frames = updater.record()
+
+        val runId = updater.startLibraryUpdate(categories, clear = true, forceAll = true)
+        runBlocking { reached.await() }
+        updater.reset()
+        resume.complete(Unit)
+
+        waitFor { frames.any { it.runId == runId && it.runState == UpdateRunState.CANCELLED } }
+        Thread.sleep(1_500)
+        val afterStop = frames.dropWhile { it.runState != UpdateRunState.CANCELLED }
+        assertTrue(afterStop.none { it.running || it.runState == UpdateRunState.RUNNING }, "no job runs after the stop: $afterStop")
+        val last = updater.statusDeprecated.value
+        assertEquals(UpdateRunState.CANCELLED, last.runState)
+        assertTrue(last.mangaStatusMap.filterKeys { it != JobStatus.SKIPPED }.values.all { it.isEmpty() }, "the tracker stays empty")
+    }
+
+    @Test
+    fun `a job of a replaced run never changes the current run`() {
+        val first = category("Replaced run title")
+        val updater = Updater()
+        val held = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var firstRun: String? = null
+        updater.beforeJobResult = { job ->
+            if (job.runId == firstRun) {
+                held.complete(Unit)
+                // Survives the cancellation a newer run causes: only
+                // ownership keeps its result out.
+                withContext(NonCancellable) { release.await() }
+            }
+        }
+        val frames = updater.record()
+        firstRun = updater.startLibraryUpdate(first, clear = true, forceAll = true)
+        runBlocking { held.await() }
+
+        val oldTitle = first.first().id
+        val second = Category.createCategory("Replacing run fixture")
+        val secondTitle = createLibraryManga("Replacing run title")
+        CategoryManga.addMangaToCategory(secondTitle, second)
+        val secondRun =
+            updater.startLibraryUpdate(listOfNotNull(Category.getCategoryById(second)), clear = true, forceAll = true)
+        waitFor { frames.any { it.runId == secondRun && it.runState == UpdateRunState.COMPLETED } }
+        release.complete(Unit)
+        Thread.sleep(1_000)
+
+        val last = updater.statusDeprecated.value
+        assertEquals(secondRun, last.runId)
+        assertEquals(UpdateRunState.COMPLETED, last.runState)
+        val titles = last.mangaStatusMap.values.flatten().map { it.title }
+        assertEquals(listOf("Replacing run title"), titles, "the replaced run's job left no trace (category $oldTitle)")
+        Category.removeCategory(second)
     }
 }

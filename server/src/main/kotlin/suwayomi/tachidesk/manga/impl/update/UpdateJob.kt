@@ -14,6 +14,13 @@ enum class JobStatus {
 data class UpdateJob(
     val manga: MangaDataClass,
     val status: JobStatus = JobStatus.PENDING,
+    /**
+     * Komu: the library update run that created this job; `null` for jobs
+     * queued outside a run (`addMangasToQueue`), which keep the upstream
+     * behaviour. A job of a run that is no longer current never changes
+     * the tracker or publishes.
+     */
+    val runId: String? = null,
 )
 
 enum class CategoryUpdateStatus {
