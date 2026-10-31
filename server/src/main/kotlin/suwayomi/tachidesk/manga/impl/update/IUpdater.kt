@@ -16,6 +16,20 @@ interface IUpdater {
         forceAll: Boolean,
     )
 
+    /**
+     * Komu: starts a library update like [addCategoriesToUpdateQueue] and
+     * returns its run identity, which every status of that run carries
+     * ([UpdateStatus.runId]).
+     */
+    fun startLibraryUpdate(
+        categories: List<CategoryDataClass>,
+        clear: Boolean?,
+        forceAll: Boolean,
+    ): String {
+        addCategoriesToUpdateQueue(categories, clear, forceAll)
+        return ""
+    }
+
     fun addMangasToQueue(mangas: List<MangaDataClass>)
 
     @Deprecated("Replaced with updates", replaceWith = ReplaceWith("updates"))

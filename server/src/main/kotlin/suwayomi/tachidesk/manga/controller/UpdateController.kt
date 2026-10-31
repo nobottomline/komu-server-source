@@ -7,6 +7,7 @@ import io.javalin.websocket.WsConfig
 import suwayomi.tachidesk.manga.impl.Category
 import suwayomi.tachidesk.manga.impl.Chapter
 import suwayomi.tachidesk.manga.impl.update.IUpdater
+import suwayomi.tachidesk.manga.impl.update.LibraryUpdateStarted
 import suwayomi.tachidesk.manga.impl.update.UpdateStatus
 import suwayomi.tachidesk.manga.impl.update.UpdaterSocket
 import suwayomi.tachidesk.manga.model.dataclass.RecentChaptersPage
@@ -76,19 +77,24 @@ object UpdateController {
                 val updater = Injekt.get<IUpdater>()
                 if (categoryId == null) {
                     logger.info { "Adding Library to Update Queue" }
-                    updater.addCategoriesToUpdateQueue(
-                        Category.getCategoryList(),
-                        clear = true,
-                        forceAll = false,
-                    )
+                    // Komu: the run's identity, carried by its statuses.
+                    val runId =
+                        updater.startLibraryUpdate(
+                            Category.getCategoryList(),
+                            clear = true,
+                            forceAll = false,
+                        )
+                    ctx.json(LibraryUpdateStarted(runId))
                 } else {
                     val category = Category.getCategoryById(categoryId)
                     if (category != null) {
-                        updater.addCategoriesToUpdateQueue(
-                            listOf(category),
-                            clear = true,
-                            forceAll = true,
-                        )
+                        val runId =
+                            updater.startLibraryUpdate(
+                                listOf(category),
+                                clear = true,
+                                forceAll = true,
+                            )
+                        ctx.json(LibraryUpdateStarted(runId))
                     } else {
                         logger.info { "No Category found" }
                         ctx.status(HttpStatus.BAD_REQUEST)
@@ -96,7 +102,7 @@ object UpdateController {
                 }
             },
             withResults = {
-                httpCode(HttpStatus.OK)
+                json<LibraryUpdateStarted>(HttpStatus.OK)
                 httpCode(HttpStatus.BAD_REQUEST)
             },
         )
