@@ -34,10 +34,17 @@ data class CoverVerdict(
     /** When this verdict should be checked again; `null`: never. */
     fun recheckAfterEpochSeconds(): Long? =
         when (kind) {
-            CoverVerdictKind.ACCEPTED, CoverVerdictKind.NO_RULE -> null
-            CoverVerdictKind.TRANSIENT, CoverVerdictKind.UNVERIFIABLE ->
+            CoverVerdictKind.ACCEPTED, CoverVerdictKind.NO_RULE -> {
+                null
+            }
+
+            CoverVerdictKind.TRANSIENT, CoverVerdictKind.UNVERIFIABLE -> {
                 checkedAtEpochSeconds + transientBackoff(attempts).inWholeSeconds
-            else -> checkedAtEpochSeconds + REJECTION_RECHECK.inWholeSeconds
+            }
+
+            else -> {
+                checkedAtEpochSeconds + REJECTION_RECHECK.inWholeSeconds
+            }
         }
 
     /** A transient failure that has run out of retries counts as a rejection. */
@@ -133,7 +140,6 @@ class CoverVerdictStore(
     companion object {
         fun key(thumbnailUrl: String): String = sha256Hex(thumbnailUrl.toByteArray(Charsets.UTF_8))
 
-        fun sha256Hex(bytes: ByteArray): String =
-            MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        fun sha256Hex(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
     }
 }

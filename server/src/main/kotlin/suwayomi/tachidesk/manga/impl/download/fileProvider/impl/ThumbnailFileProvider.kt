@@ -1,5 +1,6 @@
 package suwayomi.tachidesk.manga.impl.download.fileProvider.impl
 
+import app.komu.covers.FullSizeCovers
 import suwayomi.tachidesk.manga.impl.Manga
 import suwayomi.tachidesk.manga.impl.download.fileProvider.DownloadedFilesProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.FileDownload0Args
@@ -62,7 +63,8 @@ class ThumbnailFileProvider(
             return true
         }
 
-        return File(filePath).delete()
+        // Komu (ADR-0084): serialised with full-size cover publication.
+        return FullSizeCovers.invalidate(mangaId) { File(filePath).delete() }
     }
 
     private fun makeSureDownloadDirExists() {

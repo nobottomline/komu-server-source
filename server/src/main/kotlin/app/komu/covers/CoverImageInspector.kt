@@ -91,8 +91,7 @@ internal object ImageIoCoverImageInspector : CoverImageInspector {
     /** Decoded side length before the luma grid is drawn; bounds memory. */
     private const val DECODE_TARGET = 256
 
-    override fun inspect(bytes: ByteArray): CoverInspection? =
-        runCatching { read(bytes) }.getOrNull()
+    override fun inspect(bytes: ByteArray): CoverInspection? = runCatching { read(bytes) }.getOrNull()
 
     private fun read(bytes: ByteArray): CoverInspection? {
         ImageIO.createImageInputStream(ByteArrayInputStream(bytes)).use { input ->

@@ -108,19 +108,21 @@ object MangaController {
             behaviorOf = { ctx, mangaId ->
                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
                 ctx.future {
-                    future { Manga.getMangaThumbnail(mangaId) to FullSizeCovers.serveState(mangaId) }
-                        .thenApply { (thumbnail, coverState) ->
-                            ctx.header("content-type", thumbnail.second)
-                            // Komu (ADR-0084): a pending cover is replaced by its
-                            // verified original soon, so clients must not keep it.
-                            coverState.header?.let { ctx.header("X-Komu-Cover", it) }
-                            if (coverState == CoverServeState.PENDING) {
+                    // Komu (ADR-0084): the cover is opened first and its state
+                    // describes exactly the bytes served.
+                    future { FullSizeCovers.serve(mangaId) }
+                        .thenApply { cover ->
+                            ctx.header("content-type", cover.contentType)
+                            // A pending cover is replaced by its verified original
+                            // soon, so clients must not keep it.
+                            cover.state.header?.let { ctx.header("X-Komu-Cover", it) }
+                            if (cover.state == CoverServeState.PENDING) {
                                 ctx.header("cache-control", "no-store")
                             } else {
                                 val httpCacheSeconds = 1.days.inWholeSeconds
                                 ctx.header("cache-control", "max-age=$httpCacheSeconds")
                             }
-                            ctx.result(thumbnail.first)
+                            ctx.result(cover.stream)
                         }
                 }
             },

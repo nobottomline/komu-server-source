@@ -22,6 +22,8 @@ data class CoverCandidate(
     val ruleId: String,
     val url: String,
     val maxAspectDeviation: Double,
+    /** Hosts a fetch of [url] may reach, redirects included ([CoverEgress]). */
+    val allowedHosts: Set<String>,
 )
 
 /**
@@ -64,7 +66,8 @@ object CoverOriginalRules {
         sourceBaseUrl: String?,
     ): CoverCandidate? {
         val url = thumbnailUrl.toHttpUrlOrNull() ?: return null
-        if (url.scheme != "https" && url.scheme != "http") return null
+        // Candidates are fetched over https only (ADR-0084 Review 1, [CoverEgress]).
+        if (url.scheme != "https") return null
         return wordpress(url, sourceBaseUrl)
             ?: baozi(url)
             ?: mangaGeko(url)
@@ -79,7 +82,9 @@ object CoverOriginalRules {
         val match = wordpressSuffix.matchEntire(url.encodedPath) ?: return null
         val path = "${match.groupValues[1]}.${match.groupValues[2]}"
         val candidate = url.newBuilder().encodedPath(path).build()
-        return CoverCandidate(WORDPRESS_SIZE_SUFFIX, candidate.toString(), maxAspectDeviation = 0.5)
+        // `www.` and the bare host are one site (WordPress redirects between them).
+        val twin = if (url.host.startsWith("www.")) url.host.removePrefix("www.") else "www.${url.host}"
+        return CoverCandidate(WORDPRESS_SIZE_SUFFIX, candidate.toString(), maxAspectDeviation = 0.5, allowedHosts = setOf(url.host, twin))
     }
 
     private fun baozi(url: HttpUrl): CoverCandidate? {
@@ -91,14 +96,14 @@ object CoverOriginalRules {
                 .removeAllQueryParameters("w")
                 .removeAllQueryParameters("h")
                 .build()
-        return CoverCandidate(BAOZI_COVER_RESIZE, candidate.toString(), maxAspectDeviation = 0.5)
+        return CoverCandidate(BAOZI_COVER_RESIZE, candidate.toString(), maxAspectDeviation = 0.5, allowedHosts = setOf(url.host))
     }
 
     private fun mangaGeko(url: HttpUrl): CoverCandidate? {
         if (!mangaGekoHost.matches(url.host)) return null
         val match = mangaGekoAvatar.matchEntire(url.encodedPath) ?: return null
         val candidate = url.newBuilder().encodedPath(match.groupValues[1]).build()
-        return CoverCandidate(MANGAGEKO_AVATAR_SIZE, candidate.toString(), maxAspectDeviation = 0.5)
+        return CoverCandidate(MANGAGEKO_AVATAR_SIZE, candidate.toString(), maxAspectDeviation = 0.5, allowedHosts = setOf(url.host))
     }
 
     /** `www.example.com` and `example.com` are one site. */

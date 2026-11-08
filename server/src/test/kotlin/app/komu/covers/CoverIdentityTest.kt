@@ -89,7 +89,13 @@ class CoverIdentityTest {
     @Test
     fun `the native ABI envelope decodes and rejects malformed payloads`() {
         val luma = ByteArray(CoverInspection.GRID * CoverInspection.GRID) { (it % 251).toByte() }
-        val raw = ByteBuffer.allocate(8 + luma.size).putInt(330).putInt(440).put(luma).array()
+        val raw =
+            ByteBuffer
+                .allocate(8 + luma.size)
+                .putInt(330)
+                .putInt(440)
+                .put(luma)
+                .array()
         val decoded = NativeCoverImageInspector.decode(raw)
         assertNotNull(decoded)
         decoded!!
@@ -97,8 +103,24 @@ class CoverIdentityTest {
         assertEquals(440, decoded.height)
         assertTrue(decoded.luma.contentEquals(luma))
         assertNull(NativeCoverImageInspector.decode(raw.copyOf(raw.size - 1)))
-        assertNull(NativeCoverImageInspector.decode(ByteBuffer.allocate(8 + luma.size).putInt(0).putInt(10).array()))
-        assertNull(NativeCoverImageInspector.decode(ByteBuffer.allocate(8 + luma.size).putInt(100_000).putInt(100_000).array()))
+        assertNull(
+            NativeCoverImageInspector.decode(
+                ByteBuffer
+                    .allocate(8 + luma.size)
+                    .putInt(0)
+                    .putInt(10)
+                    .array(),
+            ),
+        )
+        assertNull(
+            NativeCoverImageInspector.decode(
+                ByteBuffer
+                    .allocate(8 + luma.size)
+                    .putInt(100_000)
+                    .putInt(100_000)
+                    .array(),
+            ),
+        )
     }
 
     @Test

@@ -2,6 +2,7 @@
 
 package suwayomi.tachidesk.graphql.mutations
 
+import app.komu.covers.FullSizeCovers
 import suwayomi.tachidesk.graphql.directives.RequireAuth
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse
 import suwayomi.tachidesk.server.ApplicationDirs
@@ -30,14 +31,14 @@ class ImageMutation {
 
         val downloadedThumbnailsResult =
             if (downloadedThumbnails == true) {
-                ImageResponse.clearImages(applicationDirs.thumbnailDownloadsRoot)
+                FullSizeCovers.invalidateAll { ImageResponse.clearImages(applicationDirs.thumbnailDownloadsRoot) }
             } else {
                 null
             }
 
         val cachedThumbnailsResult =
             if (cachedThumbnails == true) {
-                ImageResponse.clearImages(applicationDirs.tempThumbnailCacheRoot)
+                FullSizeCovers.invalidateAll { ImageResponse.clearImages(applicationDirs.tempThumbnailCacheRoot) }
             } else {
                 null
             }

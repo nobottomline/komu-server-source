@@ -482,8 +482,12 @@ object Manga {
     fun clearThumbnail(mangaId: Int) {
         val fileName = mangaId.toString()
 
-        clearCachedImage(applicationDirs.tempThumbnailCacheRoot, fileName)
-        clearCachedImage(applicationDirs.thumbnailDownloadsRoot, fileName)
+        // Komu (ADR-0084): serialised with full-size cover publication, so a
+        // verification that started before this clear cannot publish over it.
+        FullSizeCovers.invalidate(mangaId) {
+            clearCachedImage(applicationDirs.tempThumbnailCacheRoot, fileName)
+            clearCachedImage(applicationDirs.thumbnailDownloadsRoot, fileName)
+        }
     }
 
     fun getLatestChapter(mangaId: Int): ChapterDataClass? =

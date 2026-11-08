@@ -7,6 +7,7 @@
 package app.komu.covers
 
 import io.github.oshai.kotlinlogging.KotlinLogging
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -14,8 +15,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
 import java.io.File
+import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -42,22 +45,31 @@ interface CoverCatalog {
     /** `null` when the manga has no HTTP-source thumbnail. */
     suspend fun subject(mangaId: Int): CoverSubject?
 
-    /** The cached cover file a request for [mangaId] is answered from. */
-    fun servedCover(mangaId: Int): File?
-
     /** Every cached cover file of [mangaId] (temporary and library cache). */
     fun cachedCovers(mangaId: Int): List<File>
 }
 
 /** GETs a URL with the source's client and headers (rate limits included). */
 fun interface CoverHttp {
-    /** Throws on network failure; returns the status otherwise. */
+    /**
+     * Throws [CoverEgressRefused] when the fetch (or a redirect) would leave
+     * [allowedHosts] or reach a non-public address, another exception on
+     * network failure, and returns the status otherwise.
+     */
     suspend fun get(
         sourceId: Long,
         url: String,
+        allowedHosts: Set<String>,
         maximumBytes: Int,
     ): CoverFetch
 }
+
+/** A cover answer: the bytes being served and the state that describes exactly those bytes. */
+class ServedCover(
+    val stream: InputStream,
+    val contentType: String,
+    val state: CoverServeState,
+)
 
 /** What a served cover is, for the app's cache (`X-Komu-Cover`). */
 enum class CoverServeState(
@@ -83,11 +95,17 @@ enum class CoverServeState(
  * or thumbnail fetch; nothing waits for an original. When a rule names a
  * candidate original and no verdict exists for the thumbnail URL, the cover
  * is answered as [CoverServeState.PENDING] and one background verification
- * fetches the candidate with the source's client, compares it with the
- * cached thumbnail ([CoverIdentity]) and records the verdict. An accepted
- * original replaces the cached cover files atomically; the next request
- * gets it as [CoverServeState.ORIGINAL]. Rejections are remembered per URL
- * ([CoverVerdictStore]) and every failure keeps the thumbnail.
+ * fetches the candidate with the source's client ([CoverEgress] policy),
+ * compares it with the cached thumbnail ([CoverIdentity]) and records the
+ * verdict. An accepted original replaces the cached cover files in place
+ * (same file name, atomic rename) under the [CoverPublicationGate]; the next
+ * request gets it as [CoverServeState.ORIGINAL]. Rejections are remembered
+ * per URL ([CoverVerdictStore]) and every failure keeps the thumbnail.
+ *
+ * The state of an answer is derived from the bytes actually served (their
+ * SHA-256 against the accepted original's), never from a second look at
+ * the cache, so a cover replaced while a request streams it is never
+ * labelled with the other version's state.
  */
 class FullSizeCoverService(
     private val preferences: CoverPreferences,
@@ -96,11 +114,14 @@ class FullSizeCoverService(
     private val http: CoverHttp,
     private val catalog: CoverCatalog,
     private val scope: CoroutineScope,
+    private val publication: CoverPublicationGate = CoverPublicationGate(),
     private val nowEpochSeconds: () -> Long = { System.currentTimeMillis() / 1000 },
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val sourceSpacingMillis: Long = 1_000,
     private val maximumScheduled: Int = 512,
     concurrency: Int = 2,
+    /** Test seam: runs after a verification decided to publish, before it takes the publication lock. */
+    private val beforePublish: suspend (mangaId: Int) -> Unit = {},
 ) {
     private val logger = KotlinLogging.logger {}
     private val scheduled: MutableSet<Int> = ConcurrentHashMap.newKeySet()
@@ -124,27 +145,81 @@ class FullSizeCoverService(
     // ------------------------------------------------------------ serving
 
     /**
-     * Classifies the cover just served for [mangaId] and, when a decision
-     * is still open, schedules its background verification. Never blocks
-     * on the network.
+     * Classifies the cover [opened] for [mangaId] (the stream and content
+     * type the cache returned) and, when a decision is still open,
+     * schedules its background verification. Never blocks on the network.
+     * When a rule applies, the bytes are read once and the state is derived
+     * from exactly those bytes.
      */
-    suspend fun serveState(mangaId: Int): CoverServeState {
+    suspend fun serve(
+        mangaId: Int,
+        opened: Pair<InputStream, String>,
+    ): ServedCover {
+        val (stream, contentType) = opened
+        val subject =
+            try {
+                if (!preferences.preferFullSize) null else catalog.subject(mangaId)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                logger.warn(error) { "Full-size cover state unavailable for manga $mangaId" }
+                null
+            } ?: return ServedCover(stream, contentType, CoverServeState.NOT_APPLICABLE)
+        if (CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl) == null) {
+            return ServedCover(stream, contentType, CoverServeState.THUMBNAIL)
+        }
+        val bytes = stream.use { it.readAllBytes() }
+        val state =
+            try {
+                stateFor(mangaId, subject, bytes)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                logger.warn(error) { "Full-size cover verdict unreadable for manga $mangaId" }
+                CoverServeState.PENDING // not cacheable: the next request decides
+            }
+        // An installed original keeps the cache file's name, so its type comes from the bytes.
+        val type = ImageUtil.findImageType { bytes.inputStream() }?.mime ?: contentType
+        return ServedCover(bytes.inputStream(), type, state)
+    }
+
+    /** The state of [servedBytes] as the cover of [mangaId]; see [serve]. */
+    suspend fun serveState(
+        mangaId: Int,
+        servedBytes: ByteArray,
+    ): CoverServeState {
         if (!preferences.preferFullSize) return CoverServeState.NOT_APPLICABLE
         val subject = catalog.subject(mangaId) ?: return CoverServeState.NOT_APPLICABLE
-        CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl)
-            ?: return CoverServeState.THUMBNAIL
+        CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl) ?: return CoverServeState.THUMBNAIL
+        return stateFor(mangaId, subject, servedBytes)
+    }
+
+    private fun stateFor(
+        mangaId: Int,
+        subject: CoverSubject,
+        servedBytes: ByteArray,
+    ): CoverServeState {
         val verdict = currentVerdict(subject.thumbnailUrl)
         return when {
-            verdict == null -> scheduleOrPending(mangaId)
-            verdict.kind == CoverVerdictKind.ACCEPTED ->
-                if (isOriginal(catalog.servedCover(mangaId), verdict)) {
-                    CoverServeState.ORIGINAL
-                } else {
-                    scheduleOrPending(mangaId)
-                }
-            verdict.kind.isFinal || verdict.isExhausted -> CoverServeState.THUMBNAIL
-            isDue(verdict) -> scheduleOrPending(mangaId)
-            else -> CoverServeState.PENDING
+            verdict == null -> {
+                scheduleOrPending(mangaId)
+            }
+
+            verdict.kind == CoverVerdictKind.ACCEPTED -> {
+                if (isOriginal(servedBytes, verdict)) CoverServeState.ORIGINAL else scheduleOrPending(mangaId)
+            }
+
+            // A due recheck comes first: a rejected or exhausted cover is
+            // looked at again through ordinary traffic once its time is up.
+            isDue(verdict) -> {
+                scheduleOrPending(mangaId)
+            }
+
+            verdict.kind.isFinal || verdict.isExhausted -> {
+                CoverServeState.THUMBNAIL
+            }
+
+            else -> {
+                CoverServeState.PENDING
+            }
         }
     }
 
@@ -152,8 +227,8 @@ class FullSizeCoverService(
      * The verified original's bytes for [thumbnailUrl], fetched now, when a
      * verdict has already accepted it. Lets a cover cache that was cleared
      * (a refreshed title, a purged temporary cache) refill with the
-     * original directly. A changed original drops the verdict, so it is
-     * verified again; `null` means use the thumbnail.
+     * original directly. A changed, gone or refused original drops the
+     * verdict, so it is verified again; `null` means use the thumbnail.
      */
     suspend fun acceptedOriginal(
         sourceId: Long,
@@ -165,9 +240,18 @@ class FullSizeCoverService(
         val verdict = currentVerdict(thumbnailUrl)?.takeIf { it.kind == CoverVerdictKind.ACCEPTED } ?: return null
         // Replaces the thumbnail fetch the user is waiting for, so it is not
         // paced like background checks; the source client's own rate limit applies.
-        val fetched = runCatching { http.get(sourceId, candidate.url, MAXIMUM_ORIGINAL_BYTES) }.getOrNull()
+        val fetched =
+            try {
+                http.get(sourceId, candidate.url, candidate.allowedHosts, MAXIMUM_ORIGINAL_BYTES)
+            } catch (_: CoverEgressRefused) {
+                store.remove(thumbnailUrl)
+                return null
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                null
+            }
         val bytes = fetched?.bytes?.takeIf { fetched.status in 200..299 }
-        if (bytes != null && CoverVerdictStore.sha256Hex(bytes) == verdict.originalSha256) return fetched
+        if (bytes != null && isOriginal(bytes, verdict)) return fetched
         if (fetched != null && fetched.status in 200..499) store.remove(thumbnailUrl) // changed or gone: verify again
         return null
     }
@@ -202,11 +286,14 @@ class FullSizeCoverService(
     fun isScheduled(mangaId: Int): Boolean = mangaId in scheduled
 
     /**
-     * Verifies [mangaId]'s candidate original and installs it when it is
+     * Verifies [mangaId]'s candidate original and publishes it when it is
      * the same picture, larger. Returns the verdict recorded (or reused).
      */
     suspend fun verify(mangaId: Int): CoverVerdict? {
         if (!preferences.preferFullSize) return null
+        // Captured before anything is read: an invalidation after this point
+        // (a refresh, a restore, a cleared cache) fails the publication.
+        val generation = publication.generation(mangaId)
         val subject = catalog.subject(mangaId) ?: return null
         val candidate = CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl) ?: return null
         val existing = currentVerdict(subject.thumbnailUrl)
@@ -214,29 +301,60 @@ class FullSizeCoverService(
 
         val cached = catalog.cachedCovers(mangaId)
         if (existing?.kind == CoverVerdictKind.ACCEPTED && cached.all { isOriginal(it, existing) }) return existing
+        // An original accepted before (under any rule-set version) is not a thumbnail.
+        val previousOriginal = store.get(subject.thumbnailUrl)?.takeIf { it.kind == CoverVerdictKind.ACCEPTED }
+        val holdsPreviousOriginal = previousOriginal != null && cached.any { isOriginal(it, previousOriginal) }
 
+        val thumbnailHost = subject.thumbnailUrl.toHttpUrlOrNull()?.host ?: return null
         val reference =
-            cached.firstOrNull { existing == null || !isOriginal(it, existing) }?.readBytes()
-                ?: fetchBytes(subject.sourceId, subject.thumbnailUrl)
+            cached.firstOrNull { previousOriginal == null || !isOriginal(it, previousOriginal) }?.readBytes()
+                ?: fetchBytes(subject.sourceId, subject.thumbnailUrl, setOf(thumbnailHost))
                 ?: return record(subject, existing, CoverComparison(CoverVerdictKind.TRANSIENT))
         val fetched =
             try {
-                paced(subject.sourceId) { http.get(subject.sourceId, candidate.url, MAXIMUM_ORIGINAL_BYTES) }
+                paced(subject.sourceId) { http.get(subject.sourceId, candidate.url, candidate.allowedHosts, MAXIMUM_ORIGINAL_BYTES) }
+            } catch (error: CoverEgressRefused) {
+                logger.info { "Original refused for manga $mangaId (${candidate.ruleId}): ${error.message}" }
+                return finish(subject, generation, existing, CoverComparison(CoverVerdictKind.REFUSED), reference, holdsPreviousOriginal)
             } catch (error: Throwable) {
-                if (error is kotlinx.coroutines.CancellationException) throw error
+                if (error is CancellationException) throw error
                 logger.debug { "Original not fetched (${error.javaClass.simpleName}) for manga $mangaId" }
                 return record(subject, existing, CoverComparison(CoverVerdictKind.TRANSIENT))
             }
         val statusKind = classify(fetched.status)
-        if (statusKind != null) return record(subject, existing, CoverComparison(statusKind))
-        val originalBytes = fetched.bytes ?: return record(subject, existing, CoverComparison(CoverVerdictKind.NOT_IMAGE))
-
-        val comparison = compare(reference, originalBytes, candidate)
-        val verdict = record(subject, existing, comparison, originalBytes.takeIf { comparison.kind == CoverVerdictKind.ACCEPTED })
-        if (verdict.kind == CoverVerdictKind.ACCEPTED) install(subject, originalBytes)
+        val comparison =
+            when {
+                statusKind != null -> CoverComparison(statusKind)
+                fetched.bytes == null -> CoverComparison(CoverVerdictKind.NOT_IMAGE)
+                else -> compare(reference, fetched.bytes, candidate)
+            }
+        val verdict = finish(subject, generation, existing, comparison, reference, holdsPreviousOriginal, fetched.bytes)
         logger.info {
             "Full-size cover ${verdict.kind} for manga $mangaId (${candidate.ruleId}, gain=${comparison.resolutionGain}, " +
                 "hash=${comparison.hashDistance})"
+        }
+        return verdict
+    }
+
+    /**
+     * Records the verdict and makes the cache agree with it: an accepted
+     * original is published; a final rejection replaces an original that
+     * an earlier verdict had published with the thumbnail again.
+     */
+    private suspend fun finish(
+        subject: CoverSubject,
+        generation: CoverPublicationGate.Generation,
+        existing: CoverVerdict?,
+        comparison: CoverComparison,
+        reference: ByteArray,
+        holdsPreviousOriginal: Boolean,
+        originalBytes: ByteArray? = null,
+    ): CoverVerdict {
+        val accepted = comparison.kind == CoverVerdictKind.ACCEPTED
+        val verdict = record(subject, existing, comparison, originalBytes.takeIf { accepted })
+        when {
+            accepted -> publish(subject, generation, originalBytes!!)
+            verdict.kind.isFinal && holdsPreviousOriginal -> publish(subject, generation, reference)
         }
         return verdict
     }
@@ -260,14 +378,16 @@ class FullSizeCoverService(
         comparison: CoverComparison,
         originalBytes: ByteArray? = null,
     ): CoverVerdict {
-        val attempts =
-            if (!comparison.kind.isFinal && previous != null && previous.kind == comparison.kind) previous.attempts + 1 else 1
+        // Failures that will be retried count consecutively whatever their
+        // kind (a network error after an undecodable answer is the second
+        // attempt, not a new first); any final outcome starts over.
+        val consecutiveFailure = previous != null && !previous.kind.isFinal && !comparison.kind.isFinal
         val verdict =
             CoverVerdict(
                 kind = comparison.kind,
                 rulesVersion = CoverOriginalRules.VERSION,
                 checkedAtEpochSeconds = nowEpochSeconds(),
-                attempts = attempts,
+                attempts = if (consecutiveFailure) previous!!.attempts + 1 else 1,
                 originalSha256 = originalBytes?.let(CoverVerdictStore::sha256Hex),
                 originalBytes = originalBytes?.size?.toLong(),
             )
@@ -276,36 +396,50 @@ class FullSizeCoverService(
     }
 
     /**
-     * Replaces every cached cover of the manga with the original. Each file
-     * is staged beside its cache directory and moved in atomically; a file
-     * of another extension is removed only after the original is in place,
-     * so a concurrent reader always finds one complete image.
+     * Replaces every cached cover file of the manga with [bytes], keeping
+     * each file's name: a reader that found the name always opens one
+     * complete image (the old one or the new one; an open stream keeps the
+     * old file), never nothing. The bytes are staged beside the cache
+     * directory and renamed over the file atomically, under the
+     * publication lock and only while the manga's generation is still the
+     * one the verification started from.
      */
-    private suspend fun install(
+    private suspend fun publish(
         subject: CoverSubject,
+        generation: CoverPublicationGate.Generation,
         bytes: ByteArray,
-    ) {
-        // The title may have been refreshed to another cover meanwhile.
-        if (!preferences.preferFullSize || catalog.subject(subject.mangaId)?.thumbnailUrl != subject.thumbnailUrl) return
-        val extension = ImageUtil.findImageType { bytes.inputStream() }?.extension ?: "jpg"
-        for (existing in catalog.cachedCovers(subject.mangaId)) {
-            val directory = existing.parentFile ?: continue
-            val staging = File(directory.parentFile ?: directory, ".komu-cover-staging").apply { mkdirs() }
-            val staged = File(staging, "${subject.mangaId}.${UUID.randomUUID()}")
-            val target = File(directory, "${subject.mangaId}.$extension")
-            try {
-                staged.writeBytes(bytes)
-                try {
-                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                } catch (_: AtomicMoveNotSupportedException) {
-                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                }
-                if (existing.name != target.name) existing.delete()
-            } catch (error: Exception) {
-                logger.warn(error) { "Could not install the original cover of manga ${subject.mangaId}" }
-            } finally {
-                staged.delete()
+    ): Boolean {
+        if (!preferences.preferFullSize) return false
+        // A refresh to another cover URL that has not invalidated the cache (yet).
+        if (catalog.subject(subject.mangaId)?.thumbnailUrl != subject.thumbnailUrl) return false
+        beforePublish(subject.mangaId)
+        val published =
+            publication.publishIfCurrent(subject.mangaId, generation) {
+                for (existing in catalog.cachedCovers(subject.mangaId)) replace(existing, bytes, subject.mangaId)
             }
+        if (!published) logger.info { "Cover of manga ${subject.mangaId} changed during verification; not published" }
+        return published
+    }
+
+    private fun replace(
+        target: File,
+        bytes: ByteArray,
+        mangaId: Int,
+    ) {
+        val directory = target.parentFile ?: return
+        val staging = File(directory.parentFile ?: directory, ".komu-cover-staging").apply { mkdirs() }
+        val staged = File(staging, "$mangaId.${UUID.randomUUID()}")
+        try {
+            staged.writeBytes(bytes)
+            try {
+                Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        } catch (error: Exception) {
+            logger.warn(error) { "Could not publish the cover of manga $mangaId" }
+        } finally {
+            staged.delete()
         }
     }
 
@@ -317,19 +451,27 @@ class FullSizeCoverService(
     private fun isDue(verdict: CoverVerdict): Boolean = verdict.recheckAfterEpochSeconds()?.let { nowEpochSeconds() >= it } ?: false
 
     private fun isOriginal(
-        file: File?,
+        file: File,
         verdict: CoverVerdict,
     ): Boolean {
-        if (file == null || !file.isFile || verdict.originalBytes == null) return false
-        if (file.length() != verdict.originalBytes) return false
-        return CoverVerdictStore.sha256Hex(file.readBytes()) == verdict.originalSha256
+        if (!file.isFile || file.length() != verdict.originalBytes) return false
+        return runCatching { isOriginal(file.readBytes(), verdict) }.getOrDefault(false)
     }
+
+    private fun isOriginal(
+        bytes: ByteArray,
+        verdict: CoverVerdict,
+    ): Boolean =
+        verdict.originalSha256 != null &&
+            bytes.size.toLong() == verdict.originalBytes &&
+            CoverVerdictStore.sha256Hex(bytes) == verdict.originalSha256
 
     private suspend fun fetchBytes(
         sourceId: Long,
         url: String,
+        allowedHosts: Set<String>,
     ): ByteArray? =
-        runCatching { paced(sourceId) { http.get(sourceId, url, MAXIMUM_ORIGINAL_BYTES) } }
+        runCatching { paced(sourceId) { http.get(sourceId, url, allowedHosts, MAXIMUM_ORIGINAL_BYTES) } }
             .getOrNull()
             ?.takeIf { it.status in 200..299 }
             ?.bytes
@@ -359,9 +501,16 @@ class FullSizeCoverService(
         fun classify(status: Int): CoverVerdictKind? =
             when (status) {
                 in 200..299 -> null
+
                 408, 425, 429 -> CoverVerdictKind.TRANSIENT
+
                 413 -> CoverVerdictKind.NOT_IMAGE
+
+                in 300..399 -> CoverVerdictKind.REFUSED
+
+                // a redirect without a usable Location
                 in 400..499 -> CoverVerdictKind.NOT_FOUND
+
                 else -> CoverVerdictKind.TRANSIENT
             }
     }

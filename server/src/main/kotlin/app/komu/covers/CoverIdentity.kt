@@ -37,6 +37,12 @@ enum class CoverVerdictKind(
     /** The perceptual hash says it is another picture. */
     DIFFERENT_PICTURE(true),
 
+    /**
+     * The fetch was refused by [CoverEgress]: a redirect off the source's
+     * cover host, a downgrade to http, a non-public address or too many hops.
+     */
+    REFUSED(true),
+
     /** Network error, timeout, server error or challenge: retried later. */
     TRANSIENT(false),
 
@@ -189,6 +195,7 @@ object CoverIdentity {
                 val x0 = floor(sx).toInt()
                 val x1 = min(x0 + 1, n - 1)
                 val fx = sx - x0
+
                 fun at(
                     x: Int,
                     y: Int,

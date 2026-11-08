@@ -57,7 +57,13 @@ object SyntheticCovers {
         val target = width.toDouble() / height
         val sourceAspect = source.width.toDouble() / source.height
         val (cw, ch) =
-            if (sourceAspect > target) (source.height * target).toInt() to source.height else source.width to (source.width / target).toInt()
+            if (sourceAspect >
+                target
+            ) {
+                (source.height * target).toInt() to source.height
+            } else {
+                source.width to (source.width / target).toInt()
+            }
         val sub = source.getSubimage((source.width - cw) / 2, (source.height - ch) / 2, cw, ch)
         return scaled(sub, width, height)
     }

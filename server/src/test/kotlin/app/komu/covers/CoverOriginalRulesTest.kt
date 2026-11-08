@@ -27,7 +27,10 @@ class CoverOriginalRulesTest {
     fun `wordpress rule accepts www and bare host of one site and every image extension`() {
         assertEquals(
             "https://bunmanga.com/wp-content/uploads/2025/05/Why-Is-The-Male-Lead-Seducing-Me.jpeg",
-            candidate("https://bunmanga.com/wp-content/uploads/2025/05/Why-Is-The-Male-Lead-Seducing-Me-193x278.jpeg", "https://www.bunmanga.com")?.url,
+            candidate(
+                "https://bunmanga.com/wp-content/uploads/2025/05/Why-Is-The-Male-Lead-Seducing-Me-193x278.jpeg",
+                "https://www.bunmanga.com",
+            )?.url,
         )
         for (extension in listOf("png", "webp", "gif", "JPG")) {
             assertEquals(
@@ -62,7 +65,10 @@ class CoverOriginalRulesTest {
 
     @Test
     fun `baozi resize parameters are dropped and quality kept`() {
-        val result = candidate("https://static-tw.baozimh.com/cover/silingfashiwojishitianzai-mantudezhuyuanzhuheiniaoshe.jpg?w=285&h=375&q=100")!!
+        val result =
+            candidate(
+                "https://static-tw.baozimh.com/cover/silingfashiwojishitianzai-mantudezhuyuanzhuheiniaoshe.jpg?w=285&h=375&q=100",
+            )!!
         assertEquals(CoverOriginalRules.BAOZI_COVER_RESIZE, result.ruleId)
         assertEquals("https://static-tw.baozimh.com/cover/silingfashiwojishitianzai-mantudezhuyuanzhuheiniaoshe.jpg?q=100", result.url)
     }
@@ -94,5 +100,21 @@ class CoverOriginalRulesTest {
         assertNull(candidate("ftp://likemanga.in/wp-content/uploads/a-175x238.jpg", "https://likemanga.in"))
         assertNull(candidate("/wp-content/uploads/a-175x238.jpg", "https://likemanga.in"))
         assertNull(candidate("", "https://likemanga.in"))
+    }
+
+    @Test
+    fun `candidates are https only and bound to the thumbnail's own host`() {
+        assertNull(candidate("http://likemanga.in/wp-content/uploads/a-175x238.jpg", "http://likemanga.in"), "no candidate over plain http")
+        assertNull(candidate("http://static-tw.baozimh.com/cover/x.jpg?w=285&h=375"))
+        assertEquals(
+            setOf("likemanga.in", "www.likemanga.in"),
+            candidate("https://likemanga.in/wp-content/uploads/a-175x238.jpg", "https://www.likemanga.in")?.allowedHosts,
+        )
+        assertEquals(
+            setOf("www.bunmanga.com", "bunmanga.com"),
+            candidate("https://www.bunmanga.com/wp-content/uploads/a-193x278.jpg", "https://bunmanga.com")?.allowedHosts,
+        )
+        assertEquals(setOf("static-tw.baozimh.com"), candidate("https://static-tw.baozimh.com/cover/x.jpg?w=285&h=375")?.allowedHosts)
+        assertEquals(setOf("imgsrv5.com"), candidate("https://imgsrv5.com/avatar/288x412/media/x.jpg")?.allowedHosts)
     }
 }

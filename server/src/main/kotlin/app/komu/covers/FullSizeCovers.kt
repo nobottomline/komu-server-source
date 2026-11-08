@@ -6,13 +6,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 package app.komu.covers
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.local.LocalSource
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import okhttp3.CacheControl
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Protocol
 import okhttp3.Request
@@ -21,7 +19,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import suwayomi.tachidesk.manga.impl.util.network.await
+import suwayomi.tachidesk.manga.impl.Manga
 import suwayomi.tachidesk.manga.impl.util.source.GetSource
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse
 import suwayomi.tachidesk.manga.model.table.MangaTable
@@ -33,11 +31,15 @@ import java.io.IOException
 /**
  * Production wiring of [FullSizeCoverService]: the server's manga table,
  * source registry, cover caches and each source's own OkHttp client.
- * The two call sites in upstream code are `Manga.fetchHttpSourceMangaThumbnail`
- * ([originalResponse]) and the thumbnail endpoint ([serveState]).
+ * The call sites in upstream code are `Manga.fetchHttpSourceMangaThumbnail`
+ * ([originalResponse]), the thumbnail endpoint ([serve]) and every place
+ * that clears a cached cover ([invalidate], [invalidateAll]).
  */
 object FullSizeCovers {
     private val applicationDirs: ApplicationDirs by injectLazy()
+
+    /** Shared with upstream cache invalidation; has no dependencies, so clearing never initialises the service. */
+    val publication = CoverPublicationGate()
 
     val service: FullSizeCoverService by lazy {
         val root = File(applicationDirs.dataRoot, "komu-covers")
@@ -48,6 +50,7 @@ object FullSizeCovers {
             http = SourceCoverHttp,
             catalog = ServerCoverCatalog(applicationDirs),
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            publication = publication,
         )
     }
 
@@ -71,26 +74,38 @@ object FullSizeCovers {
             .build()
     }
 
-    /** See [FullSizeCoverService.serveState]. */
-    suspend fun serveState(mangaId: Int): CoverServeState = runCatching { service.serveState(mangaId) }.getOrDefault(CoverServeState.NOT_APPLICABLE)
+    /**
+     * The cover of [mangaId] as upstream serves it, opened first, with the
+     * state of exactly those bytes ([FullSizeCoverService.serve]).
+     */
+    suspend fun serve(mangaId: Int): ServedCover {
+        val opened = Manga.getMangaThumbnail(mangaId)
+        val service = runCatching { service }.getOrNull() ?: return ServedCover(opened.first, opened.second, CoverServeState.NOT_APPLICABLE)
+        return service.serve(mangaId, opened)
+    }
+
+    /** Runs an upstream clear of [mangaId]'s cached cover under the publication gate. */
+    fun <T> invalidate(
+        mangaId: Int,
+        clear: () -> T,
+    ): T = publication.invalidate(mangaId, clear)
+
+    /** Runs an upstream clear of a whole cover cache under the publication gate. */
+    fun <T> invalidateAll(clear: () -> T): T = publication.invalidateAll(clear)
 }
 
-/** Each source's own client and headers: its rate limits, Cloudflare handling and referer. */
+/** Each source's own client and headers (rate limits, Cloudflare handling, referer) behind [CoverEgress]. */
 internal object SourceCoverHttp : CoverHttp {
+    private val egress = CoverEgress()
+
     override suspend fun get(
         sourceId: Long,
         url: String,
+        allowedHosts: Set<String>,
         maximumBytes: Int,
     ): CoverFetch {
         val source = GetSource.getSourceOrNull(sourceId) as? HttpSource ?: throw IOException("Source $sourceId is unavailable")
-        source.client.newCall(GET(url, source.headers, cache = CacheControl.FORCE_NETWORK)).await().use { response ->
-            if (!response.isSuccessful) return CoverFetch(response.code)
-            val body = response.body
-            if (body.contentLength() > maximumBytes) return CoverFetch(413)
-            val bytes = body.byteStream().use { input -> input.readNBytes(maximumBytes + 1) }
-            if (bytes.size > maximumBytes) return CoverFetch(413)
-            return CoverFetch(response.code, bytes, response.header("Content-Type"))
-        }
+        return egress.get(source.client, source.headers, url, allowedHosts, maximumBytes)
     }
 }
 
@@ -104,12 +119,6 @@ internal class ServerCoverCatalog(
         if (sourceId == LocalSource.ID) return null
         val source = GetSource.getSourceOrNull(sourceId) as? HttpSource ?: return null
         return CoverSubject(mangaId, sourceId, runCatching { source.baseUrl }.getOrNull(), thumbnailUrl)
-    }
-
-    override fun servedCover(mangaId: Int): File? {
-        val inLibrary = transaction { MangaTable.selectAll().where { MangaTable.id eq mangaId }.firstOrNull()?.get(MangaTable.inLibrary) } ?: false
-        val root = if (inLibrary) applicationDirs.thumbnailDownloadsRoot else applicationDirs.tempThumbnailCacheRoot
-        return find(root, mangaId)
     }
 
     override fun cachedCovers(mangaId: Int): List<File> =
