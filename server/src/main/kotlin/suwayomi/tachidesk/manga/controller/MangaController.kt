@@ -7,6 +7,8 @@ package suwayomi.tachidesk.manga.controller
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.covers.CoverServeState
+import app.komu.covers.FullSizeCovers
 import io.javalin.http.HandlerType
 import io.javalin.http.HttpStatus
 import kotlinx.coroutines.GlobalScope
@@ -106,12 +108,19 @@ object MangaController {
             behaviorOf = { ctx, mangaId ->
                 ctx.getAttribute(Attribute.TachideskUser).requireUser()
                 ctx.future {
-                    future { Manga.getMangaThumbnail(mangaId) }
-                        .thenApply {
-                            ctx.header("content-type", it.second)
-                            val httpCacheSeconds = 1.days.inWholeSeconds
-                            ctx.header("cache-control", "max-age=$httpCacheSeconds")
-                            ctx.result(it.first)
+                    future { Manga.getMangaThumbnail(mangaId) to FullSizeCovers.serveState(mangaId) }
+                        .thenApply { (thumbnail, coverState) ->
+                            ctx.header("content-type", thumbnail.second)
+                            // Komu (ADR-0084): a pending cover is replaced by its
+                            // verified original soon, so clients must not keep it.
+                            coverState.header?.let { ctx.header("X-Komu-Cover", it) }
+                            if (coverState == CoverServeState.PENDING) {
+                                ctx.header("cache-control", "no-store")
+                            } else {
+                                val httpCacheSeconds = 1.days.inWholeSeconds
+                                ctx.header("cache-control", "max-age=$httpCacheSeconds")
+                            }
+                            ctx.result(thumbnail.first)
                         }
                 }
             },

@@ -7,6 +7,7 @@ package suwayomi.tachidesk.manga.impl
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.covers.FullSizeCovers
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.network.NetworkHelper
@@ -387,6 +388,10 @@ object Manga {
             } else {
                 mangaEntry[MangaTable.thumbnail_url]
             } ?: throw NullPointerException("No thumbnail found")
+
+        // Komu (ADR-0084): a cover whose original was already verified
+        // refills a cleared cache with that original; otherwise unchanged.
+        FullSizeCovers.originalResponse(source, thumbnailUrl)?.let { return it }
 
         return try {
             source.client
