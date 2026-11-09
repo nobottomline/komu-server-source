@@ -430,6 +430,26 @@ class WKWebViewProviderContractTest {
     }
 
     @Test
+    fun visualStateCallbacksCompleteAfterARoundTripThroughThePage() {
+        val view = newWebView()
+        val handle = handleOf(view)
+        val done = LinkedBlockingQueue<String>()
+        onMain {
+            view.postVisualStateCallback(
+                7,
+                object : WebView.VisualStateCallback() {
+                    override fun onComplete(requestId: Long) {
+                        done += "${Looper.myLooper() == mainLooper}|$requestId"
+                    }
+                },
+            )
+        }
+        val evaluate = engine.await(JsExecutor.OP_EVALUATE)
+        engine.emit(handle, JsExecutor.EV_EVAL_RESULT, evaluate.id, "0")
+        assertEquals("true|7", done.poll(5, TimeUnit.SECONDS))
+    }
+
+    @Test
     fun cookieRulesFollowTheTargetSite() {
         assertTrue(CookieLines.domainMatches("www.site.test", "site.test"))
         assertTrue(CookieLines.domainMatches("site.test", "site.test"))

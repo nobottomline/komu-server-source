@@ -272,6 +272,15 @@ class WKWebViewProvider(
 
     private fun flags(): String = "js=" + (if (settings.javaScriptEnabled) "1" else "0")
 
+    /**
+     * Android calls back once the DOM state at posting time can be drawn. A round trip
+     * through the page's process orders the callback after that state.
+     */
+    override fun insertVisualStateCallback(
+        requestId: Long,
+        callback: WebView.VisualStateCallback,
+    ) = evaluateJavaScript("0") { callback.onComplete(requestId) }
+
     override fun stopLoading() = submit(JsExecutor.OP_STOP)
 
     override fun reload() = submit(JsExecutor.OP_RELOAD)
