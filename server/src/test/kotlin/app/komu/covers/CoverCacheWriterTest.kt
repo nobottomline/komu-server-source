@@ -12,6 +12,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -90,6 +91,77 @@ class CoverCacheWriterTest {
                 ) { error("no fetch") }
             }
         again.close()
+    }
+
+    // ---- Review 5: staging lives outside the caches and the request keeps its bytes
+
+    @Test
+    fun `a whole-cache clear after staging never takes the request's bytes`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val generation = gate.generation(mangaId)
+        var stagedDuringClear: File? = null
+        val saved =
+            CoverCacheWriter.save(gate, mangaId, generation, dir, coverA.inputStream(), "image/jpeg") { staged ->
+                // The request has staged its cover; "clear cached thumbnails" runs now.
+                gate.invalidateAll { dir.deleteRecursively() }
+                assertTrue(staged.isFile, "the clear never deletes a staging file")
+                assertFalse(staged.toPath().startsWith(dir.toPath()), "staging is outside the cache")
+                stagedDuringClear = staged
+            }
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() }, "the request serves its fetched bytes")
+        assertEquals("image/jpeg", saved.mimeType)
+        assertFalse(saved.cached, "the clear won: nothing cached")
+        assertFalse(File(dir, "$mangaId.jpg").exists())
+        assertFalse(stagedDuringClear!!.exists(), "the staging file is removed afterwards")
+    }
+
+    @Test
+    fun `the request keeps its bytes when its staging file vanishes`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val saved =
+            CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverA.inputStream(), "image/jpeg") { it.delete() }
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() })
+        assertFalse(saved.cached, "nothing to publish")
+        assertTrue(visible(dir).isEmpty())
+    }
+
+    @Test
+    fun `a cover above the memory limit is served through the handle opened on its staging file`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val saved =
+            CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverA.inputStream(), "image/jpeg", memoryLimit = 64) { staged ->
+                gate.invalidateAll { dir.deleteRecursively() }
+                staged.delete() // even an unlinked staging file keeps the request's bytes
+            }
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() })
+        assertFalse(saved.cached)
+    }
+
+    @Test
+    fun `a current save above the memory limit is published and served whole`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val saved = CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverA.inputStream(), "image/jpeg", memoryLimit = 64)
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() })
+        assertTrue(saved.cached)
+        assertArrayEquals(coverA, File(dir, "$mangaId.jpg").readBytes())
+        assertTrue(CoverStaging.directory(dir).list().orEmpty().isEmpty(), "no staging file left")
+    }
+
+    @Test
+    fun `orphaned staging files are removed at start-up and once they are old`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val staging = CoverStaging.directory(dir).apply { mkdirs() }
+        assertEquals(dir.absoluteFile.parentFile, staging.parentFile, "beside the cache, on the same volume")
+        val old = File(staging, "1.old.komu-tmp").apply { writeBytes(coverA) }
+        val fresh = File(staging, "2.fresh.komu-tmp").apply { writeBytes(coverA) }
+        val now = 10_000_000_000L
+        old.setLastModified(now - CoverStaging.MAXIMUM_AGE_MILLIS - 1)
+        fresh.setLastModified(now - 1_000)
+        assertEquals(1, CoverStaging.sweep(staging, CoverStaging.MAXIMUM_AGE_MILLIS, now))
+        assertFalse(old.exists())
+        assertTrue(fresh.exists(), "a file a request may still be writing stays")
+        CoverStaging.sweepAtStartup(listOf(dir, File(root, "other/thumbnails")))
+        assertTrue(staging.list().orEmpty().isEmpty(), "at start-up no request runs: every staged file goes")
     }
 
     // ---- Review 4: a cached cover vanishing between lookup and open

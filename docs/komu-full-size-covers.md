@@ -75,5 +75,13 @@ With the preference off the thumbnail path is byte-for-byte upstream.
   the native decoder inside OpenJ9.
 - `CoverCacheWriterArchitectureTest` fails on any other write into the
   cover-cache directories.
+- Staging (`CoverStaging`): files are staged in
+  `<parent of the cache>/.komu-cover-staging`, beside the cache on the same
+  volume (publication stays an atomic rename) and never inside it, so a
+  cache clear never removes a file a request is writing; names are unique
+  per request; orphans are removed at start-up (`ServerSetup`) and after an
+  hour. A request keeps its fetched bytes in memory up to 12 MB (larger:
+  a handle opened on the staging file), so it serves them even when the
+  cache was cleared or the staging file vanished.
 
 Tests: `server/src/test/kotlin/app/komu/covers/`.

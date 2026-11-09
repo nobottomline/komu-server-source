@@ -14,11 +14,11 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileNotFoundException
+import java.io.IOException
 import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.util.UUID
 
 /**
  * The only writer of cover-cache files (ADR-0084 Review 2): the upstream
@@ -94,12 +94,23 @@ object CoverCacheWriter {
         val served: Pair<InputStream, String> get() = stream to mimeType
     }
 
+    /** Fetched covers up to this size are kept in memory for their request. */
+    const val MEMORY_LIMIT_BYTES = FullSizeCoverService.MAXIMUM_ORIGINAL_BYTES
+
     /**
      * Writes [image] as `<directory>/<mangaId>.<type>` when the manga is
      * still at [generation]; the stream to serve and its MIME type either
      * way (ADR-0084 Review 3: a caller never looks the file up again, it may
      * not exist). The name follows the bytes (upstream `saveImage`), so a
      * 2418 reader that picks the type by extension stays right.
+     *
+     * The request keeps its own bytes whatever happens to the cache
+     * (ADR-0084 Review 5): up to [memoryLimit] they are held in memory; a
+     * larger image is served through a handle opened on its staging file
+     * before anything can remove it. The staging file lives in
+     * [CoverStaging], outside every cache directory, so a whole-cache clear
+     * never deletes it; if it vanishes anyway, nothing is cached and the
+     * request still gets its bytes. [afterStaging] is a test seam.
      */
     fun save(
         gate: CoverPublicationGate,
@@ -108,31 +119,59 @@ object CoverCacheWriter {
         directory: File,
         image: InputStream,
         mimeType: String?,
+        memoryLimit: Int = MEMORY_LIMIT_BYTES,
+        afterStaging: (File) -> Unit = {},
     ): Saved {
-        directory.mkdirs()
-        // Hidden and unique: never found by a reader looking for "<id>.",
-        // never clobbered by a concurrent fetch of the same cover.
-        val staged = File(directory, ".$mangaId.${UUID.randomUUID()}.komu-tmp")
+        val staged = CoverStaging.newFile(directory, mangaId)
+        var handle: InputStream? = null
         try {
-            image.use { input -> staged.outputStream().use { output -> input.copyTo(output) } }
+            val bytes: ByteArray? =
+                image.use { input ->
+                    val head = input.readNBytes(memoryLimit + 1)
+                    if (head.size <= memoryLimit) {
+                        staged.writeBytes(head)
+                        head
+                    } else {
+                        staged.outputStream().use { output ->
+                            output.write(head)
+                            input.copyTo(output)
+                        }
+                        // Opened now: the request reads it even after the file is unlinked.
+                        handle = FileInputStream(staged).buffered()
+                        null
+                    }
+                }
+            afterStaging(staged)
             val declared = mimeType?.takeIf { it.startsWith("image/") }?.lowercase()
-            val type = ImageUtil.findImageType { staged.inputStream() } ?: ImageUtil.ImageType.entries.find { it.mime == declared }
+            val sniffed =
+                if (bytes != null) {
+                    ImageUtil.findImageType { bytes.inputStream() }
+                } else {
+                    runCatching { ImageUtil.findImageType { staged.inputStream() } }.getOrNull()
+                }
+            val type = sniffed ?: ImageUtil.ImageType.entries.find { it.mime == declared }
             val extension = type?.extension ?: declared?.let { MimeUtils.guessExtensionFromMimeType(it) } ?: "jpg"
             val mime = type?.mime ?: declared ?: "image/jpeg"
             val target = File(directory, "$mangaId.$extension")
-            var opened: InputStream? = null
-            val cached =
-                gate.publishIfCurrent(mangaId, generation) {
+            var moved = false
+            gate.publishIfCurrent(mangaId, generation) {
+                try {
+                    directory.mkdirs()
                     try {
                         Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
                     } catch (_: AtomicMoveNotSupportedException) {
                         Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
                     }
-                    // Opened under the lock: a clear right after cannot pull the file away.
-                    opened = FileInputStream(target).buffered()
+                    moved = true
+                } catch (_: IOException) {
+                    // The staging file vanished: nothing is cached, the request keeps its bytes.
                 }
-            return Saved(opened ?: ByteArrayInputStream(staged.readBytes()), mime, cached)
+            }
+            val served = bytes?.let(::ByteArrayInputStream) ?: handle!!
+            handle = null
+            return Saved(served, mime, moved)
         } finally {
+            handle?.close()
             staged.delete()
         }
     }

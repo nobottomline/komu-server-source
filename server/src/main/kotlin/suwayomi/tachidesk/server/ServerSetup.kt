@@ -251,6 +251,11 @@ fun applicationSetup() {
         applicationDirs.localMangaRoot,
     ).forEach { File(it).mkdirs() }
 
+    // Komu (ADR-0084 Review 5): staged cover files a killed process left behind.
+    app.komu.covers.CoverStaging.sweepAtStartup(
+        listOf(File(applicationDirs.tempThumbnailCacheRoot), File(applicationDirs.thumbnailDownloadsRoot)),
+    )
+
     // initialize Koin modules
     val app = App()
     startKoin {

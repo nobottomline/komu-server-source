@@ -22,7 +22,6 @@ import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /** A manga whose cover comes from an HTTP source thumbnail URL. */
@@ -467,8 +466,7 @@ class FullSizeCoverService(
         // Never a format under another format's name (verified before; re-checked here).
         if (typeOfName(target.name) != ImageUtil.findImageType { bytes.inputStream() }?.extension) return
         val directory = target.parentFile ?: return
-        val staging = File(directory.parentFile ?: directory, ".komu-cover-staging").apply { mkdirs() }
-        val staged = File(staging, "$mangaId.${UUID.randomUUID()}")
+        val staged = CoverStaging.newFile(directory, mangaId)
         try {
             staged.writeBytes(bytes)
             try {
