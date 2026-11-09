@@ -1,31 +1,53 @@
 package suwayomi.tachidesk.graphql
 
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.runBlocking
+import org.junit.jupiter.api.BeforeAll
+import org.junit.jupiter.api.TestInstance
+import suwayomi.tachidesk.graphql.queries.InfoQuery
 import suwayomi.tachidesk.server.ApplicationDirs
 import suwayomi.tachidesk.server.serverConfig
-import suwayomi.tachidesk.test.GraphQLTest
+import suwayomi.tachidesk.test.ApplicationTest
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
+import kotlin.test.assertFails
 
-class AboutWebUIQueryTest : GraphQLTest() {
+/**
+ * Upstream #2458 drives these cases through its user-account GraphQL test
+ * harness, which this line does not carry; the resolver behind `aboutWebUI`
+ * is called directly instead. Komu always runs with WebUI serving disabled
+ * and no local WebUI bundle.
+ *
+ * Touching `WebInterfaceManager` subscribes its WebUI update check to the
+ * scheduler. The check is turned off first and stays off for the rest of the
+ * run, so no scheduler job outlives this class (`HASchedulerTest` asserts an
+ * empty scheduler in the same JVM).
+ */
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class AboutWebUIQueryTest : ApplicationTest() {
+    private val infoQuery = InfoQuery()
+
+    @BeforeAll
+    fun disableWebUIUpdateChecks() {
+        serverConfig.webUIUpdateCheckInterval.value = 0.0
+    }
+
+    private fun aboutWebUITag(): String = runBlocking { infoQuery.aboutWebUI().await().tag }
+
     @Test
     fun disabledWebUIWithoutLocalVersionDoesNotFailServerInfoQuery() {
         withWebUIVersion(enabled = false, revision = null) {
-            val response = graphql(SERVER_INFO_QUERY)
-
-            response.assertNoErrors()
-            assertNotNull(response.dataPath("aboutServer", "name"))
-            assertEquals("r-1", response.dataPath("aboutWebUI", "tag"))
+            assertEquals("r-1", aboutWebUITag())
         }
     }
 
     @Test
     fun enabledWebUIWithoutLocalVersionStillReportsAnError() {
         withWebUIVersion(enabled = true, revision = null) {
-            graphql(SERVER_INFO_QUERY).assertHasError()
+            assertFails { aboutWebUITag() }
         }
     }
 
@@ -33,11 +55,7 @@ class AboutWebUIQueryTest : GraphQLTest() {
     fun localVersionIsPreservedWhetherWebUIIsEnabledOrDisabled() {
         for (enabled in listOf(false, true)) {
             withWebUIVersion(enabled = enabled, revision = "r1234\n") {
-                val response = graphql(SERVER_INFO_QUERY)
-
-                response.assertNoErrors()
-                assertNotNull(response.dataPath("aboutServer", "name"))
-                assertEquals("r1234", response.dataPath("aboutWebUI", "tag"))
+                assertEquals("r1234", aboutWebUITag())
             }
         }
     }
@@ -69,19 +87,5 @@ class AboutWebUIQueryTest : GraphQLTest() {
                 check(!revisionFile.exists() || revisionFile.delete())
             }
         }
-    }
-
-    companion object {
-        private val SERVER_INFO_QUERY =
-            """
-            query {
-                aboutServer {
-                    name
-                }
-                aboutWebUI {
-                    tag
-                }
-            }
-            """.trimIndent()
     }
 }

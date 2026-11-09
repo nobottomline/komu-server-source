@@ -19,9 +19,7 @@ import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.ArchiveProvider
 import suwayomi.tachidesk.manga.impl.util.getChapterCbzPath
 import suwayomi.tachidesk.manga.impl.util.lang.EMPTY
 import suwayomi.tachidesk.manga.model.table.ChapterTable
-import suwayomi.tachidesk.manga.model.table.ChapterUserTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
-import suwayomi.tachidesk.manga.model.table.MangaUserTable
 import suwayomi.tachidesk.test.ApplicationTest
 import suwayomi.tachidesk.test.clearTables
 import suwayomi.tachidesk.test.createLibraryManga
@@ -144,9 +142,7 @@ class ArchiveProviderTest : ApplicationTest() {
         }
         createdMangaDirs.clear()
         clearTables(
-            ChapterUserTable,
             ChapterTable,
-            MangaUserTable,
             MangaTable,
         )
     }
