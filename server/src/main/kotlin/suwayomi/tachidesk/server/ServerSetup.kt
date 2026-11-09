@@ -502,6 +502,10 @@ fun applicationSetup() {
         CefHelper.cefApp.value = Result.failure(CefHelper.CefException("CEF is not available on this platform"))
     }
 
+    // Komu (ADR-0086): debug builds of the app can run the WebView contract stub in-process.
+    suwayomi.tachidesk.server.util.WebViewContractDiagnostic
+        .runIfConfigured()
+
     serverConfig.subscribeTo(
         serverConfig.extensionStores,
         { _ ->

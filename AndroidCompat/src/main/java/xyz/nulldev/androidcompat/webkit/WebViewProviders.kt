@@ -10,28 +10,57 @@ package xyz.nulldev.androidcompat.webkit
 import android.webkit.WebView
 import android.webkit.WebViewProvider
 import xyz.nulldev.androidcompat.CallableArgument
+import xyz.nulldev.androidcompat.webkit.ios.NativeWebEngine
+import xyz.nulldev.androidcompat.webkit.ios.WKWebViewProvider
+import xyz.nulldev.androidcompat.webkit.ios.WKWebViewSessions
+import xyz.nulldev.androidcompat.webkit.ios.WebEngine
 
 /**
  * Komu: selects the `WebViewProvider` for the host. Desktop keeps upstream's KCEF
  * provider. The iOS host (`-Dkomu.platform=ios`, set by Komu's JVM launcher) never
  * starts CEF, so KCEF's provider would block the creating thread forever waiting
- * for it; the iOS factory fails fast instead.
+ * for it. There, the off-screen WKWebView engine linked into the app backs
+ * [WKWebViewProvider]; a process without that engine fails fast with a typed error.
  */
 object WebViewProviders {
     const val PLATFORM_PROPERTY = "komu.platform"
     const val IOS = "ios"
 
+    /** AndroidX WebKit features the iOS provider implements through the boundary glue. */
+    val IOS_GLUE_FEATURES = listOf("DOCUMENT_START_SCRIPT:1", "WEB_MESSAGE_LISTENER")
+
+    @Volatile
+    private var iosEngine: Lazy<WebEngine?> = lazy { NativeWebEngine.linkedOrNull() }
+
+    @Volatile
+    private var iosSelected = false
+
     fun isIOS(platform: String? = System.getProperty(PLATFORM_PROPERTY)): Boolean = platform == IOS
 
     fun factoryFor(platform: String? = System.getProperty(PLATFORM_PROPERTY)): CallableArgument<WebView, WebViewProvider> =
         if (isIOS(platform)) {
-            CallableArgument { _: WebView ->
-                throw WebViewUnavailableException(
-                    WebViewUnavailableException.Reason.NO_ENGINE,
-                    "this host has no embedded WebView engine",
-                )
+            iosSelected = true
+            CallableArgument { view: WebView ->
+                val engine =
+                    iosEngine.value ?: throw WebViewUnavailableException(
+                        WebViewUnavailableException.Reason.NATIVE_BRIDGE_MISSING,
+                        "this process does not link the iOS WebView engine",
+                    )
+                WKWebViewSessions.install(engine)
+                WKWebViewProvider(view, engine)
             }
         } else {
+            iosSelected = false
             CallableArgument { view: WebView -> KcefWebViewProvider(view) }
         }
+
+    /** The glue's supported features: [base] plus those of the selected provider. */
+    @JvmStatic
+    fun glueFeatures(base: Array<String>): Array<String> =
+        if (iosSelected && iosEngine.value != null) (base.toList() + IOS_GLUE_FEATURES).distinct().toTypedArray() else base
+
+    /** Tests: back the iOS provider with [engine] (null: no engine linked). */
+    fun installIOSEngineForTesting(engine: WebEngine?) {
+        iosEngine = lazyOf(engine)
+    }
 }

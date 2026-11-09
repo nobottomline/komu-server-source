@@ -88,14 +88,16 @@ class WebViewFailFastTest {
     }
 
     @Test
-    fun iosHostFailsFastWithATypedErrorAndKeepsTheLooperRunning() {
+    fun iosHostWithoutTheEngineFailsFastWithATypedErrorAndKeepsTheLooperRunning() {
+        // This JVM does not link the app's WKWebView engine.
+        WebViewProviders.installIOSEngineForTesting(null)
         WebView.setProviderFactory(WebViewProviders.factoryFor("ios"))
         val handler = looperThread()
         val began = System.nanoTime()
         val first = construct(handler, 2_000)
         val elapsedMs = (System.nanoTime() - began) / 1_000_000
         val failure = assertIs<WebViewUnavailableException>(first?.exceptionOrNull(), "a typed failure, not a hang")
-        assertEquals(WebViewUnavailableException.Reason.NO_ENGINE, failure.reason)
+        assertEquals(WebViewUnavailableException.Reason.NATIVE_BRIDGE_MISSING, failure.reason)
         assertTrue(elapsedMs < 1_000, "failed after $elapsedMs ms")
         assertTrue(looperRuns(handler), "the looper still runs posted work")
         val second = construct(handler, 2_000)

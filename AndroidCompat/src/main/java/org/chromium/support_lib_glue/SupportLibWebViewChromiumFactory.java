@@ -54,6 +54,12 @@ public class SupportLibWebViewChromiumFactory implements WebViewProviderFactoryB
 
     @Override
     public /* WebViewProvider */ InvocationHandler createWebView(WebView webView) {
+        // Komu: a provider that implements the boundary itself (the iOS WKWebView
+        // provider) is handed out; the desktop KCEF provider does not.
+        android.webkit.WebViewProvider provider = webView.getWebViewProvider();
+        if (provider instanceof org.chromium.support_lib_boundary.WebViewProviderBoundaryInterface) {
+            return BoundaryInterfaceReflectionUtil.createInvocationHandlerFor(provider);
+        }
         throw new RuntimeException("Not supported");
     }
 
@@ -74,7 +80,8 @@ public class SupportLibWebViewChromiumFactory implements WebViewProviderFactoryB
 
     @Override
     public String[] getSupportedFeatures() {
-        return sWebViewSupportedFeatures;
+        // Komu: plus the features of the registered provider (none for KCEF).
+        return xyz.nulldev.androidcompat.webkit.WebViewProviders.glueFeatures(sWebViewSupportedFeatures);
     }
 
     @Override

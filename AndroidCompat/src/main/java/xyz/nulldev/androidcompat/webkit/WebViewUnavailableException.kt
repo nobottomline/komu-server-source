@@ -18,9 +18,6 @@ class WebViewUnavailableException(
     message: String,
 ) : RuntimeException("WebView is not available: $message (${reason.name})") {
     enum class Reason {
-        /** The host has no WebView engine at all. */
-        NO_ENGINE,
-
         /** The host's native WebView bridge is not linked into this process. */
         NATIVE_BRIDGE_MISSING,
 
