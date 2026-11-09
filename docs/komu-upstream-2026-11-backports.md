@@ -55,10 +55,18 @@ Already present in the fork in another form: #2477 (thread-safe class-loader
 cache), #2480 (missing old JAR on update; staged activation owns it), #2421
 (missing chapters are skipped by the existing `inList` enqueue).
 
+Security dependency updates (review follow-up), minimal bumps: BouncyCastle
+1.86 (`1d37c431`), Junrar 8.1.2 (`8d881964`), OkHttp 5.5.1 (eMudhra CA block;
+upstream `b4be7852`), Javalin 7.2.4 with Jackson 3.2.4 and Jetty 12.1.14
+(`39c57aee`, `db544477`), Logback 1.6.6 with SLF4J 2.0.20 (`c929d5b4`,
+`a0fae74e`). Reachability per library is recorded in Komu's
+`docs/problems/server-upstream-reconciliation-2026-11.md`.
+
 Not taken: everything that depends on user accounts or REST removal, auth/CSRF
 changes (Komu authenticates with its session capability), KCEF/WebView
 lifecycle (no KCEF on iOS), OPDS/KOReader/SyncYomi features, desktop packaging,
-dependency bumps, and #2461/#2391 (written against refactors this line lacks;
+other dependency bumps (kotlinx-serialization 1.12 waits for the Kotlin
+2.4.21 move), and #2461/#2391 (written against refactors this line lacks;
 the covers work owns the thumbnail path).
 
 ## Schema
