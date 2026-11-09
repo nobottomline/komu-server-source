@@ -10,6 +10,9 @@ object ThumbnailDownloadHelper {
 
     suspend fun download(mangaId: Int): Boolean = provider(mangaId).download().execute()
 
+    // Komu (ADR-0084 Review 3): one request's cover, never a second lookup of a file that may not have been written.
+    suspend fun getOrDownloadImage(mangaId: Int): Pair<InputStream, String> = provider(mangaId).getOrDownloadImage()
+
     // return the appropriate provider based on how the download was saved. For the logic is simple but will evolve when new types of downloads are available
     private fun provider(mangaId: Int): ThumbnailFileProvider = ThumbnailFileProvider(mangaId)
 }

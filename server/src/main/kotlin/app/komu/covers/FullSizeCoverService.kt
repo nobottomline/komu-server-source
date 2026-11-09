@@ -204,8 +204,9 @@ class FullSizeCoverService(
             }
 
             // A due recheck comes first: a rejected or exhausted cover is
-            // looked at again through ordinary traffic once its time is up.
-            isDue(verdict) -> {
+            // looked at again through ordinary traffic once its time is up,
+            // and a format mismatch as soon as the cached format changed.
+            isDue(verdict) || formatChanged(verdict, mangaId) -> {
                 scheduleOrPending(mangaId)
             }
 
@@ -293,9 +294,16 @@ class FullSizeCoverService(
         val subject = catalog.subject(mangaId) ?: return null
         val candidate = CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl) ?: return null
         val existing = currentVerdict(subject.thumbnailUrl)
-        if (existing != null && existing.kind != CoverVerdictKind.ACCEPTED && !isDue(existing)) return existing
-
         val cached = catalog.cachedCovers(mangaId)
+        val cachedTypes = typesOf(cached)
+        if (existing != null &&
+            existing.kind != CoverVerdictKind.ACCEPTED &&
+            !isDue(existing) &&
+            !formatChanged(existing, cachedTypes)
+        ) {
+            return existing
+        }
+
         if (existing?.kind == CoverVerdictKind.ACCEPTED && cached.all { isOriginal(it, existing) }) return existing
         // An original accepted before (under any rule-set version) is not a thumbnail.
         val previousOriginal = store.get(subject.thumbnailUrl)?.takeIf { it.kind == CoverVerdictKind.ACCEPTED }
@@ -326,7 +334,6 @@ class FullSizeCoverService(
                 return record(subject, existing, CoverComparison(CoverVerdictKind.TRANSIENT))
             }
         val statusKind = classify(fetched.status)
-        val cachedTypes = cached.mapTo(HashSet()) { typeOfName(it.name) }
         val comparison =
             when {
                 statusKind != null -> {
@@ -348,7 +355,7 @@ class FullSizeCoverService(
                     it != null && cachedTypes.isNotEmpty() &&
                         cachedTypes != setOf(it)
                 } -> {
-                    CoverComparison(CoverVerdictKind.FORMAT_MISMATCH)
+                    CoverComparison(CoverVerdictKind.FORMAT_MISMATCH, cachedFormats = cachedTypes)
                 }
 
                 else -> {
@@ -420,6 +427,7 @@ class FullSizeCoverService(
                 originalSha256 = originalBytes?.let(CoverVerdictStore::sha256Hex),
                 originalBytes = originalBytes?.size?.toLong(),
                 reason = reason,
+                cachedFormats = comparison.cachedFormats,
             )
         store.put(subject.thumbnailUrl, verdict)
         return verdict
@@ -479,6 +487,28 @@ class FullSizeCoverService(
 
     private fun currentVerdict(thumbnailUrl: String): CoverVerdict? =
         store.get(thumbnailUrl)?.takeIf { it.rulesVersion == CoverOriginalRules.VERSION }
+
+    /**
+     * A format mismatch was judged against the formats cached then; a
+     * refresh that cached another format (same URL) makes it stale at once
+     * instead of after [CoverVerdict.REJECTION_RECHECK]. An empty cache
+     * changes nothing (it refills before the next answer). A mismatch
+     * recorded without its formats is re-checked once.
+     */
+    private fun formatChanged(
+        verdict: CoverVerdict,
+        cachedTypes: Set<String>,
+    ): Boolean =
+        verdict.kind == CoverVerdictKind.FORMAT_MISMATCH &&
+            cachedTypes.isNotEmpty() &&
+            verdict.cachedFormats != cachedTypes
+
+    private fun formatChanged(
+        verdict: CoverVerdict,
+        mangaId: Int,
+    ): Boolean = verdict.kind == CoverVerdictKind.FORMAT_MISMATCH && formatChanged(verdict, typesOf(catalog.cachedCovers(mangaId)))
+
+    private fun typesOf(files: List<File>): Set<String> = files.mapNotNullTo(HashSet()) { typeOfName(it.name) }
 
     private fun isDue(verdict: CoverVerdict): Boolean = verdict.recheckAfterEpochSeconds()?.let { nowEpochSeconds() >= it } ?: false
 

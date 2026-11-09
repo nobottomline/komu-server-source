@@ -53,7 +53,7 @@ class CoverCacheWriterTest {
                 CoverCacheWriter.cachedOrFetched(gate, mangaId, gate.generation(mangaId), dir.path) {
                     // ...the refresh to B clears the cache and B is cached meanwhile...
                     clear(dir)
-                    CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverB.inputStream(), "image/jpeg").first.close()
+                    CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverB.inputStream(), "image/jpeg").stream.close()
                     // ...then A's answer arrives.
                     response(coverA)
                 }
@@ -96,7 +96,9 @@ class CoverCacheWriterTest {
         val dir = File(root, "thumbnails").apply { mkdirs() }
         val generation = gate.generation(mangaId)
         gate.invalidateAll { dir.listFiles()!!.forEach(File::delete) }
-        CoverCacheWriter.save(gate, mangaId, generation, dir, coverA.inputStream(), "image/jpeg").first.close()
+        val saved = CoverCacheWriter.save(gate, mangaId, generation, dir, coverA.inputStream(), "image/jpeg")
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() }, "the fetched bytes still answer the request")
+        assertEquals(false, saved.cached)
         assertTrue(visible(dir).isEmpty())
     }
 }

@@ -250,6 +250,60 @@ class FullSizeCoverServiceTest {
         }
 
     @Test
+    fun `a format mismatch is rechecked as soon as a refresh caches a compatible format`() =
+        runTest {
+            cacheThumbnail()
+            val pngOriginal = png(art)
+            http.responses[originalUrl] = { CoverFetch(200, pngOriginal, "image/png") }
+            val scope = TestScope(StandardTestDispatcher(testScheduler))
+            val service = service(scope)
+            assertEquals(CoverVerdictKind.FORMAT_MISMATCH, service.verify(mangaId)?.kind)
+            assertEquals(setOf("jpg"), CoverVerdictStore(storeRoot).get(thumbnailUrl)?.cachedFormats, "the verdict names the format it judged")
+            assertEquals(CoverServeState.THUMBNAIL, service.state())
+            assertFalse(service.isScheduled(mangaId))
+            assertEquals(CoverVerdictKind.FORMAT_MISMATCH, service.verify(mangaId)?.kind)
+            assertEquals(1, http.calls.size, "the same cached format: not rechecked before it is due")
+
+            // A title refresh (same URL) clears the cache and the refill is a PNG thumbnail.
+            publication.invalidate(mangaId) {
+                File(catalog.temp, "$mangaId.jpg").delete()
+                File(catalog.downloads, "$mangaId.jpg").delete()
+            }
+            val pngThumbnail = png(cropped(art, 175, 238))
+            File(catalog.temp, "$mangaId.png").writeBytes(pngThumbnail)
+            File(catalog.downloads, "$mangaId.png").writeBytes(pngThumbnail)
+
+            // Well before the 30 days, the next answer re-checks and the original is then served.
+            now += 60
+            assertEquals(CoverServeState.PENDING, service.state())
+            assertTrue(service.isScheduled(mangaId))
+            scope.testScheduler.advanceUntilIdle()
+            assertEquals(CoverVerdictKind.ACCEPTED, CoverVerdictStore(storeRoot).get(thumbnailUrl)?.kind)
+            for (dir in listOf(catalog.temp, catalog.downloads)) {
+                assertEquals(listOf("$mangaId.png"), dir.list()!!.filter { it.startsWith("$mangaId.") })
+                assertArrayEquals(pngOriginal, File(dir, "$mangaId.png").readBytes())
+            }
+            val served = service.serveCached()
+            assertEquals(CoverServeState.ORIGINAL, served.state)
+            assertEquals("image/png", served.contentType)
+        }
+
+    @Test
+    fun `a format mismatch recorded without its formats is rechecked once`() =
+        runTest {
+            cacheThumbnail()
+            CoverVerdictStore(storeRoot).put(
+                thumbnailUrl,
+                CoverVerdict(CoverVerdictKind.FORMAT_MISMATCH, CoverOriginalRules.VERSION, now),
+            )
+            http.responses[originalUrl] = { CoverFetch(200, png(art), "image/png") }
+            val service = service(TestScope(StandardTestDispatcher(testScheduler)))
+            assertEquals(CoverServeState.PENDING, service.state())
+            assertEquals(CoverVerdictKind.FORMAT_MISMATCH, service.verify(mangaId)?.kind)
+            assertEquals(CoverServeState.THUMBNAIL, service.state(), "recorded with its formats now: final again")
+        }
+
+    @Test
     fun `every answer is typed from its bytes, the preference off included`() =
         runTest {
             // A PNG behind a .jpg name (an older cache): upstream would say image/jpg.

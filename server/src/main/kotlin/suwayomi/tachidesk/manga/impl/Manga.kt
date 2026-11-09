@@ -45,7 +45,6 @@ import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.suspendTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
-import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.MissingThumbnailException
 import suwayomi.tachidesk.manga.impl.util.network.await
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrNull
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
@@ -476,12 +475,10 @@ object Manga {
         val mangaEntry = transaction { MangaTable.selectAll().where { MangaTable.id eq mangaId }.first() }
 
         if (mangaEntry[MangaTable.inLibrary] && mangaEntry[MangaTable.sourceReference] != LocalSource.ID) {
-            return try {
-                ThumbnailDownloadHelper.getImage(mangaId)
-            } catch (_: MissingThumbnailException) {
-                ThumbnailDownloadHelper.download(mangaId)
-                ThumbnailDownloadHelper.getImage(mangaId)
-            }
+            // Komu (ADR-0084 Review 3): the cached library cover or, when it is
+            // missing, the downloaded bytes, which answer this request even
+            // when a refresh kept them out of the cache (no second lookup).
+            return ThumbnailDownloadHelper.getOrDownloadImage(mangaId)
         }
 
         return fetchMangaThumbnail(mangaId)

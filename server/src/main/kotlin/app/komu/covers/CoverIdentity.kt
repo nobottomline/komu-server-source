@@ -62,6 +62,8 @@ data class CoverComparison(
     val resolutionGain: Double? = null,
     val aspectDeviation: Double? = null,
     val hashDistance: Int? = null,
+    /** For [CoverVerdictKind.FORMAT_MISMATCH]: the cached formats it was judged against. */
+    val cachedFormats: Set<String>? = null,
 )
 
 /**

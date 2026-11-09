@@ -1,6 +1,7 @@
 package suwayomi.tachidesk.manga.impl.download.fileProvider.impl
 
 import app.komu.covers.CoverCacheWriter
+import app.komu.covers.CoverPublicationGate
 import app.komu.covers.FullSizeCovers
 import suwayomi.tachidesk.manga.impl.Manga
 import suwayomi.tachidesk.manga.impl.download.fileProvider.DownloadedFilesProvider
@@ -12,6 +13,7 @@ import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getCachedImageRe
 import suwayomi.tachidesk.server.ApplicationDirs
 import uy.kohesive.injekt.injectLazy
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.InputStream
 
 class MissingThumbnailException : Exception("No thumbnail found")
@@ -20,6 +22,10 @@ private val applicationDirs: ApplicationDirs by injectLazy()
 
 class ThumbnailFileProvider(
     val mangaId: Int,
+    // Komu (ADR-0084 Review 3): the fetch, replaceable in tests to interleave a refresh.
+    private val fetchThumbnail: suspend (Int, CoverPublicationGate.Generation) -> Pair<InputStream, String> = { id, generation ->
+        Manga.fetchMangaThumbnail(id, generation)
+    },
 ) : DownloadedFilesProvider {
     private fun getFilePath(): String? {
         val thumbnailDir = applicationDirs.thumbnailDownloadsRoot
@@ -40,23 +46,51 @@ class ThumbnailFileProvider(
 
     override suspend fun getImage(): RetrieveFile0Args = RetrieveFile0Args(::getImageImpl)
 
+    /**
+     * Komu (ADR-0084 Review 3): the library cover for one request, downloaded
+     * when absent. The answer is the bytes this call fetched whether or not
+     * they were cached: a refresh that overtook the fetch keeps them out of
+     * the cache, so looking the file up again could find nothing.
+     */
+    suspend fun getOrDownloadImage(): Pair<InputStream, String> {
+        if (getFilePath() != null) {
+            try {
+                return getImageImpl()
+            } catch (_: MissingThumbnailException) {
+                // Cleared after the lookup: fetch it below.
+            } catch (_: FileNotFoundException) {
+                // Cleared between the lookup and the open: fetch it below.
+            }
+        }
+        return downloadAndSave().served
+    }
+
     private suspend fun downloadImpl(): Boolean {
         val isExistingFile = getFilePath() != null
         if (isExistingFile) {
             return true
         }
 
-        // Komu (ADR-0084): the library copy is written under the publication
-        // gate, at the generation captured before the cover was fetched.
-        val generation = FullSizeCovers.publication.generation(mangaId)
-        val (inputStream, mime) = Manga.fetchMangaThumbnail(mangaId, generation)
-        makeSureDownloadDirExists()
-        CoverCacheWriter
-            .save(FullSizeCovers.publication, mangaId, generation, File(applicationDirs.thumbnailDownloadsRoot), inputStream, mime)
-            .first
-            .close()
+        return downloadAndSave().run {
+            stream.close()
+            cached
+        }
+    }
 
-        return true
+    // Komu (ADR-0084): the library copy is written under the publication
+    // gate, at the generation captured before the cover was fetched.
+    private suspend fun downloadAndSave(): CoverCacheWriter.Saved {
+        val generation = FullSizeCovers.publication.generation(mangaId)
+        val (inputStream, mime) = fetchThumbnail(mangaId, generation)
+        makeSureDownloadDirExists()
+        return CoverCacheWriter.save(
+            FullSizeCovers.publication,
+            mangaId,
+            generation,
+            File(applicationDirs.thumbnailDownloadsRoot),
+            inputStream,
+            mime,
+        )
     }
 
     override fun download(): FileDownload0Args = FileDownload0Args(::downloadImpl)

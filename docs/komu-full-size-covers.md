@@ -16,6 +16,7 @@ picture, larger.
 | `manga/controller/MangaController.kt` `thumbnail` | serves through `FullSizeCovers.serve`: the cover is opened first and `X-Komu-Cover: original/thumbnail/pending` describes exactly those bytes; `Cache-Control: no-store` while pending |
 | `manga/impl/Manga.kt` `clearThumbnail`, `ThumbnailFileProvider.delete`, `graphql/mutations/ImageMutation.kt` | every cover-cache clear runs under `CoverPublicationGate` (`FullSizeCovers.invalidate`/`invalidateAll`); inside a transaction the clear runs again after commit |
 | `manga/impl/Manga.kt` `fetchMangaThumbnail`, `ThumbnailFileProvider.downloadImpl` | the thumbnail fill, its refill with an accepted original and the library download are written by `CoverCacheWriter` at the generation captured before the fetch (a fetch a refresh overtook answers its request and caches nothing) |
+| `manga/impl/Manga.kt` `getMangaThumbnail`, `ThumbnailFileProvider.getOrDownloadImage` | a library cover answers with the cached file or the bytes its download fetched, never with a second lookup of a file the gate may have refused to write; `download()` reports whether the copy was cached |
 | `server/JavalinSetup.kt` | registers `GET/PUT /api/v1/komu/covers/preferences` |
 
 Everything else lives in `app.komu.covers` and `app.komu.bridge.NativeCoverImage`.
@@ -44,7 +45,9 @@ With the preference off the thumbnail path is byte-for-byte upstream.
 - The cache keeps one name per cover and 2418 types a file by its
   extension, so an original is accepted only in the cached format
   (`FORMAT_MISMATCH` otherwise), and every thumbnail answer is typed from
-  its bytes.
+  its bytes. A `FORMAT_MISMATCH` verdict records the cached formats it was
+  judged against and is re-checked as soon as the cache holds another
+  format (a refresh under the same URL), not after 30 days.
 - `CoverIdentity` accepts an original only when it fills the thumbnail's
   frame with ≥1.15× the linear resolution, its aspect is within the rule's
   tolerance, and a 63-bit DCT hash of a 64×64 luma grid matches (≤10 bits,

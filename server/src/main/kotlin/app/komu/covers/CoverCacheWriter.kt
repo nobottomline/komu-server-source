@@ -50,15 +50,29 @@ object CoverCacheWriter {
         }
         fetcher().use { response ->
             if (response.code != 200) throw Exception("request error! ${response.code}")
-            return save(gate, mangaId, generation, File(saveDir), response.body.byteStream(), response.header("Content-Type"))
+            return save(gate, mangaId, generation, File(saveDir), response.body.byteStream(), response.header("Content-Type")).served
         }
+    }
+
+    /**
+     * What [save] did: the stream to serve to the request that fetched the
+     * image and its MIME type (the cached file when it was written, the
+     * fetched bytes otherwise), and whether the cache now holds them.
+     */
+    class Saved(
+        val stream: InputStream,
+        val mimeType: String,
+        val cached: Boolean,
+    ) {
+        val served: Pair<InputStream, String> get() = stream to mimeType
     }
 
     /**
      * Writes [image] as `<directory>/<mangaId>.<type>` when the manga is
      * still at [generation]; the stream to serve and its MIME type either
-     * way. The name follows the bytes (upstream `saveImage`), so a 2418
-     * reader that picks the type by extension stays right.
+     * way (ADR-0084 Review 3: a caller never looks the file up again, it may
+     * not exist). The name follows the bytes (upstream `saveImage`), so a
+     * 2418 reader that picks the type by extension stays right.
      */
     fun save(
         gate: CoverPublicationGate,
@@ -67,7 +81,7 @@ object CoverCacheWriter {
         directory: File,
         image: InputStream,
         mimeType: String?,
-    ): Pair<InputStream, String> {
+    ): Saved {
         directory.mkdirs()
         // Hidden and unique: never found by a reader looking for "<id>.",
         // never clobbered by a concurrent fetch of the same cover.
@@ -80,16 +94,17 @@ object CoverCacheWriter {
             val mime = type?.mime ?: declared ?: "image/jpeg"
             val target = File(directory, "$mangaId.$extension")
             var opened: InputStream? = null
-            gate.publishIfCurrent(mangaId, generation) {
-                try {
-                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                } catch (_: AtomicMoveNotSupportedException) {
-                    Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            val cached =
+                gate.publishIfCurrent(mangaId, generation) {
+                    try {
+                        Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+                    } catch (_: AtomicMoveNotSupportedException) {
+                        Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                    }
+                    // Opened under the lock: a clear right after cannot pull the file away.
+                    opened = FileInputStream(target).buffered()
                 }
-                // Opened under the lock: a clear right after cannot pull the file away.
-                opened = FileInputStream(target).buffered()
-            }
-            return (opened ?: ByteArrayInputStream(staged.readBytes())) to mime
+            return Saved(opened ?: ByteArrayInputStream(staged.readBytes()), mime, cached)
         } finally {
             staged.delete()
         }

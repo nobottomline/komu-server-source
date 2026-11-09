@@ -32,6 +32,12 @@ data class CoverVerdict(
     val originalBytes: Long? = null,
     /** Why a fetch was refused ([CoverVerdictKind.REFUSED]), for diagnostics. */
     val reason: String? = null,
+    /**
+     * The cached cover formats a [CoverVerdictKind.FORMAT_MISMATCH] was
+     * judged against (ADR-0084 Review 3): the verdict holds only while the
+     * cache keeps exactly these formats.
+     */
+    val cachedFormats: Set<String>? = null,
 ) {
     /** When this verdict should be checked again; `null`: never. */
     fun recheckAfterEpochSeconds(): Long? =
@@ -102,6 +108,7 @@ class CoverVerdictStore(
                 verdict.originalSha256?.let { setProperty("originalSha256", it) }
                 verdict.originalBytes?.let { setProperty("originalBytes", it.toString()) }
                 verdict.reason?.let { setProperty("reason", it.take(200)) }
+                verdict.cachedFormats?.let { setProperty("cachedFormats", it.sorted().joinToString(",")) }
             }
         val staging = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}")
         try {
@@ -137,6 +144,12 @@ class CoverVerdictStore(
                 originalSha256 = properties.getProperty("originalSha256"),
                 originalBytes = properties.getProperty("originalBytes")?.toLongOrNull(),
                 reason = properties.getProperty("reason"),
+                cachedFormats =
+                    properties
+                        .getProperty("cachedFormats")
+                        ?.split(',')
+                        ?.filter { it.isNotEmpty() }
+                        ?.toSet(),
             )
         }.getOrNull() // An unreadable verdict is simply re-verified.
     }
