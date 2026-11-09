@@ -18,6 +18,10 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
+import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /** Every cover-cache write goes through the publication gate (ADR-0084 Review 2). */
 class CoverCacheWriterTest {
@@ -159,9 +163,168 @@ class CoverCacheWriterTest {
         fresh.setLastModified(now - 1_000)
         assertEquals(1, CoverStaging.sweep(staging, CoverStaging.MAXIMUM_AGE_MILLIS, now))
         assertFalse(old.exists())
-        assertTrue(fresh.exists(), "a file a request may still be writing stays")
+        assertTrue(fresh.exists(), "an unregistered file is judged by age only")
         CoverStaging.sweepAtStartup(listOf(dir, File(root, "other/thumbnails")))
         assertTrue(staging.list().orEmpty().isEmpty(), "at start-up no request runs: every staged file goes")
+    }
+
+    // ---- Review 6: a running request's staging file is live, whatever its age
+
+    /** [bytes], handing out at most [step] bytes per read and calling [onRead] with the count read so far. */
+    private class SlowStream(
+        private val bytes: ByteArray,
+        private val step: Int = 16,
+        private val onRead: (Int) -> Unit = {},
+    ) : InputStream() {
+        private var position = 0
+
+        override fun read(): Int {
+            val one = ByteArray(1)
+            return if (read(one, 0, 1) < 0) -1 else one[0].toInt() and 0xFF
+        }
+
+        override fun read(
+            b: ByteArray,
+            off: Int,
+            len: Int,
+        ): Int {
+            onRead(position)
+            if (position >= bytes.size) return -1
+            val n = minOf(len, step, bytes.size - position)
+            System.arraycopy(bytes, position, b, off, n)
+            position += n
+            return n
+        }
+    }
+
+    private fun suspendedOverAnHour(
+        dir: File,
+        memoryLimit: Int,
+    ) {
+        val staging = CoverStaging.directory(dir)
+        var stagedFile: File? = null
+        val saved =
+            CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, coverA.inputStream(), "image/jpeg", memoryLimit) { staged ->
+                stagedFile = staged
+                // The write finished; the app is then suspended for over an hour...
+                val now = System.currentTimeMillis()
+                assertTrue(staged.setLastModified(now - 2 * CoverStaging.MAXIMUM_AGE_MILLIS))
+                // ...and on resume another request stages first, its clock two hours on, so its sweep runs.
+                val orphan = File(staging, "9.orphan.komu-tmp").apply { writeBytes(coverB) }
+                orphan.setLastModified(now - 2 * CoverStaging.MAXIMUM_AGE_MILLIS)
+                CoverStaging.resetSweepSchedule()
+                CoverStaging.stage(dir, mangaId + 1, nowMillis = now + 2 * CoverStaging.MAXIMUM_AGE_MILLIS).close()
+                assertFalse(orphan.exists(), "the sweep ran and removed an unregistered orphan of the same age")
+                CoverStaging.sweep(staging, CoverStaging.MAXIMUM_AGE_MILLIS, now + 2 * CoverStaging.MAXIMUM_AGE_MILLIS)
+                assertTrue(staged.isFile, "the sweep never deletes a running request's staging file")
+                assertTrue(CoverStaging.isLive(staged))
+            }
+        // Only now is the answer read.
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() }, "the request serves its bytes")
+        assertTrue(saved.cached, "and its staging file was still there to publish")
+        assertArrayEquals(coverA, File(dir, "$mangaId.jpg").readBytes())
+        assertFalse(CoverStaging.isLive(stagedFile!!), "released when the request finished")
+        assertTrue(staging.list().orEmpty().isEmpty(), "no staging file left")
+    }
+
+    @Test
+    fun `a request suspended for over an hour after its write keeps its staging file and serves its bytes`() {
+        suspendedOverAnHour(File(root, "thumbnails").apply { mkdirs() }, memoryLimit = CoverCacheWriter.MEMORY_LIMIT_BYTES)
+    }
+
+    @Test
+    fun `a large cover suspended for over an hour after its write keeps its staging file and serves its bytes`() {
+        suspendedOverAnHour(File(root, "thumbnails").apply { mkdirs() }, memoryLimit = 64)
+    }
+
+    @Test
+    fun `a large cover whose staging name is unlinked during the write is still served whole`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val staging = CoverStaging.directory(dir)
+        var unlinked = 0
+        val image =
+            SlowStream(coverA) { position ->
+                // Past the in-memory head, something outside the request removes the name.
+                if (position > 64 && unlinked == 0) unlinked = staging.listFiles().orEmpty().count { it.delete() }
+            }
+        val saved = CoverCacheWriter.save(gate, mangaId, gate.generation(mangaId), dir, image, "image/jpeg", memoryLimit = 64)
+        assertEquals(1, unlinked)
+        assertArrayEquals(coverA, saved.stream.use { it.readAllBytes() }, "the descriptor opened at creation keeps the bytes")
+        assertFalse(saved.cached, "nothing left to publish")
+        assertTrue(visible(dir).isEmpty())
+    }
+
+    @Test
+    fun `sweeps running during many active requests never take their staging files`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val staging = CoverStaging.directory(dir)
+        val requests = 24
+        val covers = (0 until requests).map { jpeg(cropped(art(seed = 10 + it), 175, 238)) }
+        val midWrite = CountDownLatch(requests)
+        val release = CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(requests)
+        try {
+            val results =
+                (0 until requests).map { i ->
+                    pool.submit<Pair<ByteArray, Boolean>> {
+                        val id = 100 + i
+                        var held = false
+                        val image =
+                            SlowStream(covers[i]) { position ->
+                                if (position >= 32 && !held) {
+                                    held = true
+                                    midWrite.countDown()
+                                    release.await()
+                                }
+                            }
+                        // Half are held in memory, half are served through their descriptor.
+                        val limit = if (i % 2 == 0) CoverCacheWriter.MEMORY_LIMIT_BYTES else 16
+                        val saved =
+                            CoverCacheWriter.save(gate, id, gate.generation(id), dir, image, "image/jpeg", limit) { staged ->
+                                staged.setLastModified(0)
+                                CoverStaging.sweep(staging, 0, Long.MAX_VALUE)
+                            }
+                        saved.stream.use { it.readAllBytes() } to saved.cached
+                    }
+                }
+            assertTrue(midWrite.await(30, TimeUnit.SECONDS), "every request is mid-write")
+            repeat(20) {
+                staging.listFiles().orEmpty().forEach { it.setLastModified(0) }
+                CoverStaging.sweep(staging, 0, Long.MAX_VALUE)
+                CoverStaging.sweepAtStartup(listOf(dir))
+            }
+            assertEquals(requests, staging.list().orEmpty().size, "every active staging file survived the sweeps")
+            release.countDown()
+            results.forEachIndexed { i, result ->
+                val (served, cached) = result.get(30, TimeUnit.SECONDS)
+                assertArrayEquals(covers[i], served, "request $i serves its bytes")
+                assertTrue(cached, "request $i published")
+                assertArrayEquals(covers[i], File(dir, "${100 + i}.jpg").readBytes())
+            }
+        } finally {
+            release.countDown()
+            pool.shutdownNow()
+        }
+        assertTrue(staging.list().orEmpty().isEmpty(), "every request released its staging file")
+    }
+
+    @Test
+    fun `the start-up sweep removes a previous process's leftovers and keeps a live request's file`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        val staging = CoverStaging.directory(dir).apply { mkdirs() }
+        // A previous process was killed mid-request: fresh and old leftovers, never registered here.
+        val leftovers =
+            listOf("3.a.komu-tmp", "4.b.komu-tmp").map { name ->
+                File(staging, name).apply { writeBytes(coverA) }
+            }
+        leftovers[1].setLastModified(System.currentTimeMillis() - 2 * CoverStaging.MAXIMUM_AGE_MILLIS)
+        CoverStaging.stage(dir, mangaId).use { live ->
+            live.write(coverA)
+            CoverStaging.sweepAtStartup(listOf(dir))
+            assertTrue(leftovers.none(File::exists), "every unregistered leftover goes, whatever its age")
+            assertTrue(live.file.isFile, "a registered staging file stays")
+        }
+        assertTrue(staging.list().orEmpty().isEmpty())
     }
 
     // ---- Review 4: a cached cover vanishing between lookup and open

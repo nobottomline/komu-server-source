@@ -19,9 +19,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
 import java.io.File
 import java.io.InputStream
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 
 /** A manga whose cover comes from an HTTP source thumbnail URL. */
@@ -466,18 +463,13 @@ class FullSizeCoverService(
         // Never a format under another format's name (verified before; re-checked here).
         if (typeOfName(target.name) != ImageUtil.findImageType { bytes.inputStream() }?.extension) return
         val directory = target.parentFile ?: return
-        val staged = CoverStaging.newFile(directory, mangaId)
         try {
-            staged.writeBytes(bytes)
-            try {
-                Files.move(staged.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            } catch (_: AtomicMoveNotSupportedException) {
-                Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            CoverStaging.stage(directory, mangaId).use { lease ->
+                lease.write(bytes)
+                lease.moveTo(target)
             }
         } catch (error: Exception) {
             logger.warn(error) { "Could not publish the cover of manga $mangaId" }
-        } finally {
-            staged.delete()
         }
     }
 
