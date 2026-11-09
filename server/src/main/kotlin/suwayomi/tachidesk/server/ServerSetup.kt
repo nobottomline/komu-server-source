@@ -60,6 +60,7 @@ import uy.kohesive.injekt.api.get
 import xyz.nulldev.androidcompat.AndroidCompat
 import xyz.nulldev.androidcompat.AndroidCompatInitializer
 import xyz.nulldev.androidcompat.androidCompatModule
+import xyz.nulldev.androidcompat.webkit.CefHelper
 import xyz.nulldev.androidcompat.webkit.KcefWebViewProvider
 import xyz.nulldev.ts.config.ApplicationRootDir
 import xyz.nulldev.ts.config.BASE_LOGGER_NAME
@@ -489,12 +490,16 @@ fun applicationSetup() {
 
     SyncManager.scheduleSyncTask()
 
-    // CEF requires desktop AWT/JAWT and native JCEF libraries. The iOS host
-    // provides WKWebView through AndroidCompat instead and cannot load jawt.
+    // CEF requires desktop AWT/JAWT and native JCEF libraries, which the iOS host
+    // cannot load. There, CEF never starts: mark it failed so any KCEF path (the
+    // browser WebView endpoints) fails at once instead of waiting for it forever.
+    // Extension WebViews on iOS use AndroidCompat's iOS provider factory.
     if (EmbeddedRuntimePlatform.supportsCEF()) {
         GlobalScope.launch {
             CEFManager.init()
         }
+    } else {
+        CefHelper.cefApp.value = Result.failure(CefHelper.CefException("CEF is not available on this platform"))
     }
 
     serverConfig.subscribeTo(
