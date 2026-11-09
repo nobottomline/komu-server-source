@@ -35,7 +35,8 @@ import java.nio.file.Files
  * [CoverEgress] must refuse that loopback fixture under its production
  * address policy.
  *
- * Not reachable over HTTP. The iOS host calls [run] through JNI in
+ * Not part of the server JAR (the `qualification` source set). A DEBUG iOS
+ * host puts `komu-cover-qualification.jar` on the class path and calls [run] through JNI in
  * development builds only (`-KomuCoverQualificationFixture`); it touches a
  * temporary directory and nothing of the server's data.
  */
@@ -43,6 +44,7 @@ object CoverQualification {
     private const val SITE = "qualification.invalid"
     private const val ORIGINAL_ID = 1
     private const val OTHER_ID = 2
+    private const val PNG_ID = 3
 
     /** A JSON report; `"ok": true` when every check passed. Never throws. */
     @JvmStatic
@@ -93,8 +95,8 @@ object CoverQualification {
                     put("nativeAbi", runCatching { NativeCoverImage.abiVersion() }.getOrNull())
 
                     val thumbnail = fetch("q/thumbnail.jpg")
-                    val original = fetch("q/original.png")
-                    val other = fetch("q/other.png")
+                    val original = fetch("q/original.jpg")
+                    val other = fetch("q/other.jpg")
                     val thumbnailInspection = platform?.inspect(thumbnail)
                     val originalInspection = platform?.inspect(original)
                     put("thumbnailSize", thumbnailInspection?.let { "${it.width}x${it.height}" })
@@ -156,6 +158,7 @@ object CoverQualification {
                         mapOf(
                             ORIGINAL_ID to CoverSubject(ORIGINAL_ID, 1L, "https://$SITE", "https://$SITE/wp-content/uploads/q-193x278.jpg"),
                             OTHER_ID to CoverSubject(OTHER_ID, 1L, "https://$SITE", "https://$SITE/wp-content/uploads/other-193x278.jpg"),
+                            PNG_ID to CoverSubject(PNG_ID, 1L, "https://$SITE", "https://$SITE/wp-content/uploads/png-193x278.jpg"),
                         )
                     for (id in subjects.keys) for (dir in listOf(temp, downloads)) File(dir, "$id.jpg").writeBytes(thumbnail)
                     val catalog =
@@ -169,8 +172,9 @@ object CoverQualification {
                         CoverHttp { _, url, allowedHosts, _ ->
                             check(url.toHttpUrl().host in allowedHosts) { "Candidate outside its allowed hosts" }
                             when {
-                                url.endsWith("/q.jpg") -> CoverFetch(200, fetch("q/original.png"), "image/png")
-                                url.endsWith("/other.jpg") -> CoverFetch(200, fetch("q/other.png"), "image/png")
+                                url.endsWith("/q.jpg") -> CoverFetch(200, fetch("q/original.jpg"), "image/jpeg")
+                                url.endsWith("/other.jpg") -> CoverFetch(200, fetch("q/other.jpg"), "image/jpeg")
+                                url.endsWith("/png.jpg") -> CoverFetch(200, fetch("q/original.png"), "image/png")
                                 else -> CoverFetch(404)
                             }
                         }
@@ -204,7 +208,7 @@ object CoverQualification {
                     verifyEqual("originalVerdict", store.get(subjects.getValue(ORIGINAL_ID).thumbnailUrl)?.kind, CoverVerdictKind.ACCEPTED)
                     val served = serve(ORIGINAL_ID)
                     verifyEqual("originalFinalState", served.state, CoverServeState.ORIGINAL)
-                    verifyEqual("originalServedType", served.contentType, "image/png")
+                    verifyEqual("originalServedType", served.contentType, "image/jpeg")
                     verifyEqual("originalServedBytesAreOriginal", served.stream.readAllBytes().contentEquals(original), true)
                     verifyEqual(
                         "originalCacheFiles",
@@ -230,6 +234,13 @@ object CoverQualification {
                     verifyEqual("otherFinalState", serve(OTHER_ID).state, CoverServeState.THUMBNAIL)
                     verifyEqual("otherCacheUnchanged", File(downloads, "$OTHER_ID.jpg").readBytes().contentEquals(thumbnail), true)
                     put("otherBytes", other.size)
+
+                    // The same picture as a PNG under the cached JPEG name: refused,
+                    // so every cache file keeps the format its name declares.
+                    verifyEqual("pngFirstState", serve(PNG_ID).state, CoverServeState.PENDING)
+                    settle(PNG_ID)
+                    verifyEqual("pngVerdict", store.get(subjects.getValue(PNG_ID).thumbnailUrl)?.kind, CoverVerdictKind.FORMAT_MISMATCH)
+                    verifyEqual("pngCacheUnchanged", File(downloads, "$PNG_ID.jpg").readBytes().contentEquals(thumbnail), true)
                 }
             return buildJsonObject {
                 put("ok", ok && report["egressLiteralLoopback"].toString().contains("refused"))

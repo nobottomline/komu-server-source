@@ -151,6 +151,22 @@ sourceSets {
     }
 }
 
+// Komu (ADR-0084 Review 2): development-only qualification entry points.
+// They are never part of the server JAR; `qualificationJar` packages them for
+// a DEBUG app to put on the JVM class path, and the tests use them directly.
+val qualification: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output + sourceSets.main.get().compileClasspath
+    runtimeClasspath += sourceSets.main.get().output + sourceSets.main.get().runtimeClasspath
+}
+sourceSets.test {
+    compileClasspath += qualification.output
+    runtimeClasspath += qualification.output
+}
+// Like tests, the qualification sees main's internal declarations.
+kotlin.target.compilations.named("qualification") {
+    associateWith(kotlin.target.compilations.getByName("main"))
+}
+
 buildConfig {
     className("BuildConfig")
     packageName("suwayomi.tachidesk.server.generated")
@@ -164,7 +180,8 @@ buildConfig {
     buildConfigField("String", "REVISION", quoteWrap(getTachideskRevision()))
     buildConfigField("String", "BUILD_TYPE", quoteWrap(if (System.getenv("ProductBuildType") == "Stable") "Stable" else "Preview"))
     val buildTime =
-        System.getenv("SOURCE_DATE_EPOCH")
+        System
+            .getenv("SOURCE_DATE_EPOCH")
             ?.toLongOrNull()
             ?: Instant.now().epochSecond
     buildConfigField("long", "BUILD_TIME", buildTime.toString())
@@ -178,6 +195,21 @@ buildConfig {
 }
 
 tasks {
+    // The root build makes every Kotlin compile depend on `ktlintFormat`; the
+    // main and test compiles predate that rule, this one would not. Keep the
+    // qualification compile out of source formatting like them.
+    named("compileQualificationKotlin") {
+        setDependsOn(dependsOn.filterNot { it == "ktlintFormat" })
+    }
+
+    register<Jar>("qualificationJar") {
+        archiveFileName.set("komu-cover-qualification.jar")
+        destinationDirectory.set(layout.buildDirectory.dir("qualification"))
+        from(qualification.output)
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
+    }
+
     val packagedServer = named<com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar>("shadowJar")
     val legacyH2Sha256 = "3ad9ac4b6aae9cd9d3ac1c447465e1ed06019b851b893dd6a8d76ddb6d85bca6"
     val verifyLegacyH2MigrationArtifact =

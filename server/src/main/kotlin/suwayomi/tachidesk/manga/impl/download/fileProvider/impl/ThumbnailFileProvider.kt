@@ -1,5 +1,6 @@
 package suwayomi.tachidesk.manga.impl.download.fileProvider.impl
 
+import app.komu.covers.CoverCacheWriter
 import app.komu.covers.FullSizeCovers
 import suwayomi.tachidesk.manga.impl.Manga
 import suwayomi.tachidesk.manga.impl.download.fileProvider.DownloadedFilesProvider
@@ -45,12 +46,15 @@ class ThumbnailFileProvider(
             return true
         }
 
-        val (inputStream, mime) = Manga.fetchMangaThumbnail(mangaId)
-        inputStream.use { image ->
-            makeSureDownloadDirExists()
-            val filePath = getThumbnailDownloadPath(mangaId)
-            ImageResponse.saveImage(filePath, image, mime)
-        }
+        // Komu (ADR-0084): the library copy is written under the publication
+        // gate, at the generation captured before the cover was fetched.
+        val generation = FullSizeCovers.publication.generation(mangaId)
+        val (inputStream, mime) = Manga.fetchMangaThumbnail(mangaId, generation)
+        makeSureDownloadDirExists()
+        CoverCacheWriter
+            .save(FullSizeCovers.publication, mangaId, generation, File(applicationDirs.thumbnailDownloadsRoot), inputStream, mime)
+            .first
+            .close()
 
         return true
     }

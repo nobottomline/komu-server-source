@@ -267,4 +267,65 @@ class CoverEgressTest {
         public.forEach { assertTrue(CoverEgress.isPublicAddress(InetAddress.getByName(it)), it) }
         private.forEach { assertFalse(CoverEgress.isPublicAddress(InetAddress.getByName(it)), it) }
     }
+
+    @Test
+    fun `a source whose client uses a proxy gets no upgrade and nothing reaches the proxy`() {
+        val proxy = Fixture(loopback)
+        try {
+            resolve("cdn.test", "127.0.0.1")
+            cdn.image("/c.jpg", bytes)
+            val proxied = client.newBuilder().proxy(java.net.Proxy(java.net.Proxy.Type.HTTP, proxy.server.address)).build()
+            val error =
+                assertThrows<CoverEgressRefused> {
+                    runBlocking {
+                        fixturePolicy.get(
+                            proxied,
+                            sourceHeaders,
+                            "http://cdn.test:${cdn.port}/c.jpg",
+                            setOf("cdn.test"),
+                            1 shl 20,
+                        )
+                    }
+                }
+            assertEquals("Source requires a proxy", error.message)
+            assertTrue(proxy.requests.isEmpty() && cdn.requests.isEmpty())
+        } finally {
+            proxy.server.stop(0)
+        }
+    }
+
+    @Test
+    fun `an inherited proxy selector is never used, the route is direct`() {
+        val proxy = Fixture(loopback)
+        try {
+            resolve("cdn.test", "127.0.0.1")
+            cdn.image("/c.jpg", bytes)
+            val selector =
+                object : java.net.ProxySelector() {
+                    override fun select(uri: java.net.URI?) = listOf(java.net.Proxy(java.net.Proxy.Type.HTTP, proxy.server.address))
+
+                    override fun connectFailed(
+                        uri: java.net.URI?,
+                        sa: java.net.SocketAddress?,
+                        ioe: java.io.IOException?,
+                    ) = Unit
+                }
+            val selecting = client.newBuilder().proxySelector(selector).build()
+            val fetched =
+                runBlocking {
+                    fixturePolicy.get(
+                        selecting,
+                        sourceHeaders,
+                        "http://cdn.test:${cdn.port}/c.jpg",
+                        setOf("cdn.test"),
+                        1 shl 20,
+                    )
+                }
+            assertArrayEquals(bytes, fetched.bytes)
+            assertTrue(proxy.requests.isEmpty(), "the selector's proxy never sees the request")
+            assertEquals(1, cdn.requests.size)
+        } finally {
+            proxy.server.stop(0)
+        }
+    }
 }

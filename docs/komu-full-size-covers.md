@@ -14,7 +14,8 @@ picture, larger.
 |---|---|
 | `manga/impl/Manga.kt` `fetchHttpSourceMangaThumbnail` | a cover whose original was already accepted refills a cleared cache with that original (`FullSizeCovers.originalResponse`) |
 | `manga/controller/MangaController.kt` `thumbnail` | serves through `FullSizeCovers.serve`: the cover is opened first and `X-Komu-Cover: original/thumbnail/pending` describes exactly those bytes; `Cache-Control: no-store` while pending |
-| `manga/impl/Manga.kt` `clearThumbnail`, `ThumbnailFileProvider.delete`, `graphql/mutations/ImageMutation.kt` | every cover-cache clear runs under `CoverPublicationGate` (`FullSizeCovers.invalidate`/`invalidateAll`) |
+| `manga/impl/Manga.kt` `clearThumbnail`, `ThumbnailFileProvider.delete`, `graphql/mutations/ImageMutation.kt` | every cover-cache clear runs under `CoverPublicationGate` (`FullSizeCovers.invalidate`/`invalidateAll`); inside a transaction the clear runs again after commit |
+| `manga/impl/Manga.kt` `fetchMangaThumbnail`, `ThumbnailFileProvider.downloadImpl` | the thumbnail fill, its refill with an accepted original and the library download are written by `CoverCacheWriter` at the generation captured before the fetch (a fetch a refresh overtook answers its request and caches nothing) |
 | `server/JavalinSetup.kt` | registers `GET/PUT /api/v1/komu/covers/preferences` |
 
 Everything else lives in `app.komu.covers` and `app.komu.bridge.NativeCoverImage`.
@@ -34,9 +35,16 @@ With the preference off the thumbnail path is byte-for-byte upstream.
   allowed host, and connect only to a public unicast address (resolver
   answers checked per hop, the connected peer checked again; loopback,
   RFC 1918, shared, link-local, ULA, multicast, documentation and their
-  IPv4-mapped/compatible/NAT64/6to4 forms refused). A refusal is the final
-  verdict `REFUSED`. Non-2xx answers are read as statuses (Suwayomi's
-  `await` would have turned a 404 into a network error).
+  IPv4-mapped/compatible/NAT64/6to4 forms refused). Routes are direct only:
+  the egress client has `Proxy.NO_PROXY`, and a source whose client sets a
+  proxy is refused. A refusal is the final verdict `REFUSED` with its
+  reason. Non-2xx answers are read as statuses (Suwayomi's `await` would
+  have turned a 404 into a network error); 403 and an HTML page (an
+  unsolved challenge) are retried with backoff.
+- The cache keeps one name per cover and 2418 types a file by its
+  extension, so an original is accepted only in the cached format
+  (`FORMAT_MISMATCH` otherwise), and every thumbnail answer is typed from
+  its bytes.
 - `CoverIdentity` accepts an original only when it fills the thumbnail's
   frame with ≥1.15× the linear resolution, its aspect is within the rule's
   tolerance, and a 63-bit DCT hash of a 64×64 luma grid matches (≤10 bits,
@@ -58,9 +66,11 @@ With the preference off the thumbnail path is byte-for-byte upstream.
 - The preference (`<data root>/komu-covers/preferences.properties`, default
   on) is Komu-owned state; no database schema change.
 
-- `CoverQualification.run` (not reachable over HTTP) drives the production
-  inspector, egress policy and service against a loopback fixture; the iOS
-  host calls it through JNI in development builds to qualify the native
-  decoder inside OpenJ9.
+- `CoverQualification.run` lives in the `qualification` source set, never in
+  the server JAR; `:server:qualificationJar` packages it, and a DEBUG iOS
+  host puts that JAR on the class path and calls it through JNI to qualify
+  the native decoder inside OpenJ9.
+- `CoverCacheWriterArchitectureTest` fails on any other write into the
+  cover-cache directories.
 
 Tests: `server/src/test/kotlin/app/komu/covers/`.

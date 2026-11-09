@@ -30,6 +30,8 @@ data class CoverVerdict(
     val attempts: Int = 1,
     val originalSha256: String? = null,
     val originalBytes: Long? = null,
+    /** Why a fetch was refused ([CoverVerdictKind.REFUSED]), for diagnostics. */
+    val reason: String? = null,
 ) {
     /** When this verdict should be checked again; `null`: never. */
     fun recheckAfterEpochSeconds(): Long? =
@@ -99,6 +101,7 @@ class CoverVerdictStore(
                 setProperty("attempts", verdict.attempts.toString())
                 verdict.originalSha256?.let { setProperty("originalSha256", it) }
                 verdict.originalBytes?.let { setProperty("originalBytes", it.toString()) }
+                verdict.reason?.let { setProperty("reason", it.take(200)) }
             }
         val staging = File(target.parentFile, ".${target.name}.${UUID.randomUUID()}")
         try {
@@ -133,6 +136,7 @@ class CoverVerdictStore(
                 attempts = properties.getProperty("attempts")?.toIntOrNull() ?: 1,
                 originalSha256 = properties.getProperty("originalSha256"),
                 originalBytes = properties.getProperty("originalBytes")?.toLongOrNull(),
+                reason = properties.getProperty("reason"),
             )
         }.getOrNull() // An unreadable verdict is simply re-verified.
     }

@@ -24,8 +24,9 @@ class CoverQualificationTest {
         val files =
             mapOf(
                 "/q/thumbnail.jpg" to jpeg(cropped(art, 193, 278)),
+                "/q/original.jpg" to jpeg(art),
+                "/q/other.jpg" to jpeg(art(seed = 77)),
                 "/q/original.png" to png(art),
-                "/q/other.png" to png(art(seed = 77)),
             )
         val requests = CopyOnWriteArrayList<String>()
         val server =
@@ -49,6 +50,7 @@ class CoverQualificationTest {
             assertEquals("ACCEPTED", report.getValue("originalVerdict").jsonPrimitive.content)
             assertEquals("ORIGINAL", report.getValue("originalFinalState").jsonPrimitive.content)
             assertEquals("DIFFERENT_PICTURE", report.getValue("otherVerdict").jsonPrimitive.content)
+            assertEquals("FORMAT_MISMATCH", report.getValue("pngVerdict").jsonPrimitive.content)
             listOf("egressLiteralLoopback", "egressLocalhostName", "egressHttpsRequired").forEach {
                 assertTrue(
                     report

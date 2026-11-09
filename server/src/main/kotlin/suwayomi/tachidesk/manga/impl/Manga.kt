@@ -7,6 +7,8 @@ package suwayomi.tachidesk.manga.impl
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.covers.CoverCacheWriter
+import app.komu.covers.CoverPublicationGate
 import app.komu.covers.FullSizeCovers
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.HttpException
@@ -29,14 +31,17 @@ import okhttp3.CacheControl
 import okhttp3.Response
 import org.jetbrains.exposed.v1.core.ResultRow
 import org.jetbrains.exposed.v1.core.SortOrder
+import org.jetbrains.exposed.v1.core.Transaction
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.dao.id.EntityID
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.inList
 import org.jetbrains.exposed.v1.core.statements.BatchUpdateStatement
+import org.jetbrains.exposed.v1.core.statements.StatementInterceptor
 import org.jetbrains.exposed.v1.jdbc.batchInsert
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.statements.toExecutable
+import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.suspendTransaction
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
@@ -46,7 +51,6 @@ import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrNull
 import suwayomi.tachidesk.manga.impl.util.source.GetSource.getSourceOrStub
 import suwayomi.tachidesk.manga.impl.util.source.StubSource
 import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.clearCachedImage
-import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getImageResponse
 import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
 import suwayomi.tachidesk.manga.impl.util.updateMangaDownloadDir
 import suwayomi.tachidesk.manga.model.dataclass.ChapterDataClass
@@ -416,16 +420,20 @@ object Manga {
         }
     }
 
-    suspend fun fetchMangaThumbnail(mangaId: Int): Pair<InputStream, String> {
+    suspend fun fetchMangaThumbnail(
+        mangaId: Int,
+        // Komu (ADR-0084): captured before the cover URL is read, so a refresh
+        // that overtakes this fetch keeps it from writing the cache.
+        generation: CoverPublicationGate.Generation = FullSizeCovers.publication.generation(mangaId),
+    ): Pair<InputStream, String> {
         val cacheSaveDir = applicationDirs.tempThumbnailCacheRoot
-        val fileName = mangaId.toString()
 
         val mangaEntry = transaction { MangaTable.selectAll().where { MangaTable.id eq mangaId }.first() }
         val sourceId = mangaEntry[MangaTable.sourceReference]
 
         return when (val source = getSourceOrStub(sourceId)) {
             is HttpSource -> {
-                getImageResponse(cacheSaveDir, fileName) {
+                CoverCacheWriter.cachedOrFetched(FullSizeCovers.publication, mangaId, generation, cacheSaveDir) {
                     fetchHttpSourceMangaThumbnail(source, mangaEntry)
                 }
             }
@@ -447,7 +455,7 @@ object Manga {
             }
 
             is StubSource -> {
-                getImageResponse(cacheSaveDir, fileName) {
+                CoverCacheWriter.cachedOrFetched(FullSizeCovers.publication, mangaId, generation, cacheSaveDir) {
                     val thumbnailUrl =
                         mangaEntry[MangaTable.thumbnail_url]
                             ?: throw NullPointerException("No thumbnail found")
@@ -482,12 +490,23 @@ object Manga {
     fun clearThumbnail(mangaId: Int) {
         val fileName = mangaId.toString()
 
-        // Komu (ADR-0084): serialised with full-size cover publication, so a
-        // verification that started before this clear cannot publish over it.
-        FullSizeCovers.invalidate(mangaId) {
-            clearCachedImage(applicationDirs.tempThumbnailCacheRoot, fileName)
-            clearCachedImage(applicationDirs.thumbnailDownloadsRoot, fileName)
+        // Komu (ADR-0084): serialised with every cover-cache write, so a
+        // verification or fetch that started before this clear cannot write
+        // over it. Inside a transaction the new cover URL is visible to others
+        // only after commit, so the clear runs again then: a fetch that read
+        // the old URL in between cannot leave its cover behind.
+        val clear = {
+            FullSizeCovers.invalidate(mangaId) {
+                clearCachedImage(applicationDirs.tempThumbnailCacheRoot, fileName)
+                clearCachedImage(applicationDirs.thumbnailDownloadsRoot, fileName)
+            }
         }
+        clear()
+        TransactionManager.currentOrNull()?.registerInterceptor(
+            object : StatementInterceptor {
+                override fun afterCommit(transaction: Transaction) = clear()
+            },
+        )
     }
 
     fun getLatestChapter(mangaId: Int): ChapterDataClass? =

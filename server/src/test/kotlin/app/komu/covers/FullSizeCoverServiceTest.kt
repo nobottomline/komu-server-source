@@ -32,7 +32,7 @@ class FullSizeCoverServiceTest {
 
     private val art = art(seed = 3)
     private val thumbnailBytes = jpeg(cropped(art, 175, 238))
-    private val originalBytes = png(art)
+    private val originalBytes = jpeg(art)
 
     private var now = 1_000_000L
 
@@ -111,7 +111,7 @@ class FullSizeCoverServiceTest {
     fun `a legacy cached thumbnail is served at once and upgraded in the background`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val scope = TestScope(StandardTestDispatcher(testScheduler))
             val service = service(scope)
 
@@ -134,7 +134,7 @@ class FullSizeCoverServiceTest {
             assertEquals(setOf("likemanga.in", "www.likemanga.in"), http.hosts.single(), "fetches are bound to the source's site")
             val served = service.serveCached()
             assertEquals(CoverServeState.ORIGINAL, served.state)
-            assertEquals("image/png", served.contentType, "the type comes from the served bytes")
+            assertEquals("image/jpeg", served.contentType, "the type comes from the served bytes")
             assertArrayEquals(originalBytes, served.stream.readAllBytes())
             assertEquals(listOf(originalUrl), http.calls)
         }
@@ -143,7 +143,7 @@ class FullSizeCoverServiceTest {
     fun `the state describes the bytes that were opened even when the cover is replaced meanwhile`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             val opened = catalog.find(catalog.downloads)!!.inputStream()
             // The request opened the thumbnail; the original is verified and
@@ -158,7 +158,7 @@ class FullSizeCoverServiceTest {
     fun `a reader that found the cover name always opens a complete image while the original is published`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             // A reader resolved the name (upstream lists the directory, then opens the path)...
             val found = catalog.find(catalog.temp)!!
@@ -195,7 +195,7 @@ class FullSizeCoverServiceTest {
             assertFalse(service.isScheduled(mangaId), "not due yet: nothing scheduled")
 
             // The source publishes the original later.
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             now += CoverVerdict.REJECTION_RECHECK.inWholeSeconds - 1
             assertEquals(CoverServeState.THUMBNAIL, service.state())
             now += 1
@@ -210,7 +210,7 @@ class FullSizeCoverServiceTest {
     fun `another picture behind the original URL is rejected and nothing is replaced`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, png(art(seed = 99)), "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, jpeg(art(seed = 99)), "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             assertEquals(CoverVerdictKind.DIFFERENT_PICTURE, service.verify(mangaId)?.kind)
             assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
@@ -218,20 +218,60 @@ class FullSizeCoverServiceTest {
         }
 
     @Test
-    fun `a challenge or html page is not an image`() =
+    fun `an unsolved challenge is retried with backoff, never a 30-day rejection`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, "<html>Just a moment</html>".toByteArray(), "text/html") }
-            assertEquals(CoverVerdictKind.NOT_IMAGE, service(TestScope(StandardTestDispatcher(testScheduler))).verify(mangaId)?.kind)
+            val service = service(TestScope(StandardTestDispatcher(testScheduler)))
+            http.responses[originalUrl] = { CoverFetch(200, "<!DOCTYPE html><html>Just a moment...</html>".toByteArray(), "text/html") }
+            assertEquals(CoverVerdictKind.TRANSIENT, service.verify(mangaId)?.kind)
+            assertEquals(CoverServeState.PENDING, service.state(), "an html answer keeps the cover open")
+            now += CoverVerdict.transientBackoff(1).inWholeSeconds
+            http.responses[originalUrl] = { CoverFetch(403) }
+            assertEquals(CoverVerdictKind.TRANSIENT, service.verify(mangaId)?.kind, "a 403 challenge too")
+            assertEquals(2, CoverVerdictStore(storeRoot).get(thumbnailUrl)?.attempts)
+            assertEquals(CoverVerdictKind.TRANSIENT, FullSizeCoverService.classify(403))
+            // Bytes that are neither an image nor html stay a rejection.
+            now += CoverVerdict.transientBackoff(2).inWholeSeconds
+            http.responses[originalUrl] = { CoverFetch(200, byteArrayOf(0, 1, 2, 3), "application/octet-stream") }
+            assertEquals(CoverVerdictKind.NOT_IMAGE, service.verify(mangaId)?.kind)
+            assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
+        }
+
+    @Test
+    fun `an original in another format than the cached name is refused and the cache keeps its format`() =
+        runTest {
+            cacheThumbnail()
+            http.responses[originalUrl] = { CoverFetch(200, png(art), "image/png") }
+            val service = service(TestScope(StandardTestDispatcher(testScheduler)))
+            assertEquals(CoverVerdictKind.FORMAT_MISMATCH, service.verify(mangaId)?.kind)
+            assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
+            assertEquals(CoverServeState.THUMBNAIL, service.state())
+            assertEquals("jpg", FullSizeCoverService.typeOfName("7.JPEG"))
+        }
+
+    @Test
+    fun `every answer is typed from its bytes, the preference off included`() =
+        runTest {
+            // A PNG behind a .jpg name (an older cache): upstream would say image/jpg.
+            File(catalog.downloads, "$mangaId.jpg").writeBytes(png(art))
+            val service = service(TestScope(StandardTestDispatcher(testScheduler)))
+            service.setPreferFullSize(false)
+            val off = service.serveCached()
+            assertEquals(CoverServeState.NOT_APPLICABLE, off.state)
+            assertEquals("image/png", off.contentType)
+            service.setPreferFullSize(true)
+            catalog.subject = CoverSubject(mangaId, sourceId, "https://baozimh.org", "https://c-nc-1.6wm.top/manga/x/a.webp-w320.webp")
+            assertEquals("image/png", service.serveCached().contentType, "a source without a rule too")
         }
 
     @Test
     fun `a refused fetch is a final rejection and keeps the thumbnail`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { throw CoverEgressRefused("Host outside the source's cover host") }
+            http.responses[originalUrl] = { throw CoverEgressRefused("Source requires a proxy") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             assertEquals(CoverVerdictKind.REFUSED, service.verify(mangaId)?.kind)
+            assertEquals("Source requires a proxy", CoverVerdictStore(storeRoot).get(thumbnailUrl)?.reason, "the reason is kept")
             assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
             assertEquals(CoverServeState.THUMBNAIL, service.state())
             assertEquals(CoverVerdictKind.REFUSED, FullSizeCoverService.classify(302), "a redirect without a usable location")
@@ -261,7 +301,7 @@ class FullSizeCoverServiceTest {
             assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
 
             // The exhausted verdict is due again later; the next answer succeeds.
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             now += CoverVerdict.transientBackoff(CoverVerdict.MAXIMUM_TRANSIENT_ATTEMPTS).inWholeSeconds
             assertEquals(CoverServeState.PENDING, service.state())
             scope.testScheduler.advanceUntilIdle()
@@ -278,13 +318,13 @@ class FullSizeCoverServiceTest {
     fun `retried failures of different kinds count together`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             var attempt = 0
             inspector = null // UNVERIFIABLE
             http.responses[originalUrl] = {
                 attempt++
-                if (attempt % 2 == 0) throw IOException("timeout") else CoverFetch(200, originalBytes, "image/png")
+                if (attempt % 2 == 0) throw IOException("timeout") else CoverFetch(200, originalBytes, "image/jpeg")
             }
             repeat(CoverVerdict.MAXIMUM_TRANSIENT_ATTEMPTS) {
                 service.verify(mangaId)
@@ -300,7 +340,7 @@ class FullSizeCoverServiceTest {
         runTest {
             cacheThumbnail()
             inspector = null
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             assertEquals(CoverVerdictKind.UNVERIFIABLE, service.verify(mangaId)?.kind)
             assertArrayEquals(thumbnailBytes, File(catalog.temp, "$mangaId.jpg").readBytes())
@@ -340,7 +380,7 @@ class FullSizeCoverServiceTest {
     fun `verdicts are durable across restarts and an older rule set is re-evaluated`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             assertEquals(CoverVerdictKind.ACCEPTED, service(TestScope(StandardTestDispatcher(testScheduler))).verify(mangaId)?.kind)
 
             val restarted = service(TestScope(StandardTestDispatcher(testScheduler)), CoverVerdictStore(storeRoot))
@@ -368,7 +408,7 @@ class FullSizeCoverServiceTest {
     fun `an original published under an older rule set is not taken for the thumbnail and is reverted on rejection`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             service(TestScope(StandardTestDispatcher(testScheduler))).verify(mangaId)
             val store = CoverVerdictStore(storeRoot)
             store.put(thumbnailUrl, store.get(thumbnailUrl)!!.copy(rulesVersion = CoverOriginalRules.VERSION - 1))
@@ -386,7 +426,7 @@ class FullSizeCoverServiceTest {
     fun `a cleared cache refills with the accepted original directly`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             service.verify(mangaId)
 
@@ -395,12 +435,12 @@ class FullSizeCoverServiceTest {
             assertArrayEquals(originalBytes, refill!!.bytes)
 
             // The source changed the original: the verdict is dropped, the thumbnail used.
-            http.responses[originalUrl] = { CoverFetch(200, png(art(seed = 5)), "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, jpeg(art(seed = 5)), "image/jpeg") }
             assertNull(service.acceptedOriginal(sourceId, base, thumbnailUrl))
             assertNull(CoverVerdictStore(storeRoot).get(thumbnailUrl))
 
             // A refused refill drops the verdict as well.
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             cacheThumbnail()
             assertEquals(CoverVerdictKind.ACCEPTED, service.verify(mangaId)?.kind)
             http.responses[originalUrl] = { throw CoverEgressRefused("Address refused") }
@@ -416,7 +456,7 @@ class FullSizeCoverServiceTest {
             cacheThumbnail()
             http.responses[originalUrl] = {
                 catalog.subject = CoverSubject(mangaId, sourceId, base, "$base/wp-content/uploads/images/new-175x238.jpg")
-                CoverFetch(200, originalBytes, "image/png")
+                CoverFetch(200, originalBytes, "image/jpeg")
             }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             assertEquals(CoverVerdictKind.ACCEPTED, service.verify(mangaId)?.kind)
@@ -427,7 +467,7 @@ class FullSizeCoverServiceTest {
     fun `a refresh between the URL check and the publication wins over the stale verification`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val newer = jpeg(cropped(art(seed = 11), 175, 238))
             // Deterministic interleaving: the refresh lands after the
             // verification checked the URL, before it publishes. The cover
@@ -454,7 +494,7 @@ class FullSizeCoverServiceTest {
     fun `clearing every cover cache during verification also wins`() =
         runTest {
             cacheThumbnail()
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             beforePublish = {
                 publication.invalidateAll { catalog.temp.listFiles()!!.forEach(File::delete) }
                 File(catalog.temp, "$mangaId.jpg").writeBytes(thumbnailBytes)
@@ -468,7 +508,7 @@ class FullSizeCoverServiceTest {
     fun `without a cached thumbnail the reference is fetched with the source client`() =
         runTest {
             http.responses[thumbnailUrl] = { CoverFetch(200, thumbnailBytes, "image/jpeg") }
-            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/png") }
+            http.responses[originalUrl] = { CoverFetch(200, originalBytes, "image/jpeg") }
             val service = service(TestScope(StandardTestDispatcher(testScheduler)))
             assertEquals(CoverVerdictKind.ACCEPTED, service.verify(mangaId)?.kind)
             assertEquals(listOf(thumbnailUrl, originalUrl), http.calls)

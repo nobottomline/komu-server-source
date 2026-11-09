@@ -47,9 +47,10 @@ class CoverEgressRefused(
  *   checked again before the request is written (IP literals and reused
  *   connections included).
  *
- * With an explicitly configured proxy (desktop or test only; the iOS
- * runtime has none) the target is resolved by the proxy, so only the host
- * and scheme checks apply.
+ * Routes are direct only: the egress client has `Proxy.NO_PROXY` (no
+ * inherited `ProxySelector`), and a source whose client sets a proxy is
+ * refused, because a proxy would resolve the destination outside these
+ * checks (ADR-0084 Review 2).
  */
 class CoverEgress(
     private val requireHttps: Boolean = true,
@@ -69,6 +70,9 @@ class CoverEgress(
         allowedHosts: Set<String>,
         maximumBytes: Int,
     ): CoverFetch {
+        // A proxy resolves the destination itself, out of reach of the address
+        // checks below: a source that needs one gets no upgrade.
+        if (client.proxy.let { it != null && it.type() != Proxy.Type.DIRECT }) throw CoverEgressRefused("Source requires a proxy")
         val hosts = allowedHosts.mapTo(HashSet()) { it.lowercase() }
         var current = url.toHttpUrlOrNull() ?: throw CoverEgressRefused("Not an HTTP URL")
         var redirects = 0
@@ -80,6 +84,8 @@ class CoverEgress(
                     .newBuilder()
                     .followRedirects(false)
                     .followSslRedirects(false)
+                    // Direct routes only: never the system or inherited ProxySelector.
+                    .proxy(Proxy.NO_PROXY)
                     .dns(guard)
                     .addNetworkInterceptor(guard)
                     .build()
@@ -147,10 +153,9 @@ class CoverEgress(
 
         override fun intercept(chain: Interceptor.Chain): Response {
             val route = chain.connection()?.route() ?: refuse("No connection route")
-            if (route.proxy.type() == Proxy.Type.DIRECT) {
-                val address = route.socketAddress.address ?: refuse("Unresolved peer")
-                if (!isAllowedAddress(address)) refuse("Peer address refused")
-            }
+            if (route.proxy.type() != Proxy.Type.DIRECT) refuse("Indirect route refused")
+            val address = route.socketAddress.address ?: refuse("Unresolved peer")
+            if (!isAllowedAddress(address)) refuse("Peer address refused")
             return chain.proceed(chain.request())
         }
     }

@@ -156,29 +156,25 @@ class FullSizeCoverService(
         opened: Pair<InputStream, String>,
     ): ServedCover {
         val (stream, contentType) = opened
-        val subject =
-            try {
-                if (!preferences.preferFullSize) null else catalog.subject(mangaId)
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                logger.warn(error) { "Full-size cover state unavailable for manga $mangaId" }
-                null
-            } ?: return ServedCover(stream, contentType, CoverServeState.NOT_APPLICABLE)
-        if (CoverOriginalRules.candidateFor(subject.thumbnailUrl, subject.sourceBaseUrl) == null) {
-            return ServedCover(stream, contentType, CoverServeState.THUMBNAIL)
-        }
+        // Every answer is read once and typed from its bytes, whatever the policy.
         val bytes = stream.use { it.readAllBytes() }
-        val state =
-            try {
-                stateFor(mangaId, subject, bytes)
-            } catch (error: Exception) {
-                if (error is CancellationException) throw error
-                logger.warn(error) { "Full-size cover verdict unreadable for manga $mangaId" }
-                CoverServeState.PENDING // not cacheable: the next request decides
-            }
-        // An installed original keeps the cache file's name, so its type comes from the bytes.
         val type = ImageUtil.findImageType { bytes.inputStream() }?.mime ?: contentType
-        return ServedCover(bytes.inputStream(), type, state)
+        return ServedCover(bytes.inputStream(), type, stateOrFallback(mangaId, bytes))
+    }
+
+    private suspend fun stateOrFallback(
+        mangaId: Int,
+        bytes: ByteArray,
+    ): CoverServeState {
+        try {
+            return serveState(mangaId, bytes)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            logger.warn(error) { "Full-size cover state unavailable for manga $mangaId" }
+        }
+        // Not cacheable when a rule may apply: the next request decides.
+        return if (preferences.preferFullSize) CoverServeState.PENDING else CoverServeState.NOT_APPLICABLE
     }
 
     /** The state of [servedBytes] as the cover of [mangaId]; see [serve]. */
@@ -315,18 +311,49 @@ class FullSizeCoverService(
                 paced(subject.sourceId) { http.get(subject.sourceId, candidate.url, candidate.allowedHosts, MAXIMUM_ORIGINAL_BYTES) }
             } catch (error: CoverEgressRefused) {
                 logger.info { "Original refused for manga $mangaId (${candidate.ruleId}): ${error.message}" }
-                return finish(subject, generation, existing, CoverComparison(CoverVerdictKind.REFUSED), reference, holdsPreviousOriginal)
+                return finish(
+                    subject,
+                    generation,
+                    existing,
+                    CoverComparison(CoverVerdictKind.REFUSED),
+                    reference,
+                    holdsPreviousOriginal,
+                    reason = error.message,
+                )
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
                 logger.debug { "Original not fetched (${error.javaClass.simpleName}) for manga $mangaId" }
                 return record(subject, existing, CoverComparison(CoverVerdictKind.TRANSIENT))
             }
         val statusKind = classify(fetched.status)
+        val cachedTypes = cached.mapTo(HashSet()) { typeOfName(it.name) }
         val comparison =
             when {
-                statusKind != null -> CoverComparison(statusKind)
-                fetched.bytes == null -> CoverComparison(CoverVerdictKind.NOT_IMAGE)
-                else -> compare(reference, fetched.bytes, candidate)
+                statusKind != null -> {
+                    CoverComparison(statusKind)
+                }
+
+                fetched.bytes == null -> {
+                    CoverComparison(CoverVerdictKind.NOT_IMAGE)
+                }
+
+                // An unsolved challenge or error page: retried, never a 30-day rejection.
+                isHtml(fetched) -> {
+                    CoverComparison(CoverVerdictKind.TRANSIENT)
+                }
+
+                // The cache keeps one name per cover and readers (2418 included)
+                // type it by extension, so an original must have the cached format.
+                ImageUtil.findImageType { fetched.bytes.inputStream() }?.extension.let {
+                    it != null && cachedTypes.isNotEmpty() &&
+                        cachedTypes != setOf(it)
+                } -> {
+                    CoverComparison(CoverVerdictKind.FORMAT_MISMATCH)
+                }
+
+                else -> {
+                    compare(reference, fetched.bytes, candidate)
+                }
             }
         val verdict = finish(subject, generation, existing, comparison, reference, holdsPreviousOriginal, fetched.bytes)
         logger.info {
@@ -349,9 +376,10 @@ class FullSizeCoverService(
         reference: ByteArray,
         holdsPreviousOriginal: Boolean,
         originalBytes: ByteArray? = null,
+        reason: String? = null,
     ): CoverVerdict {
         val accepted = comparison.kind == CoverVerdictKind.ACCEPTED
-        val verdict = record(subject, existing, comparison, originalBytes.takeIf { accepted })
+        val verdict = record(subject, existing, comparison, originalBytes.takeIf { accepted }, reason)
         when {
             accepted -> publish(subject, generation, originalBytes!!)
             verdict.kind.isFinal && holdsPreviousOriginal -> publish(subject, generation, reference)
@@ -377,6 +405,7 @@ class FullSizeCoverService(
         previous: CoverVerdict?,
         comparison: CoverComparison,
         originalBytes: ByteArray? = null,
+        reason: String? = null,
     ): CoverVerdict {
         // Failures that will be retried count consecutively whatever their
         // kind (a network error after an undecodable answer is the second
@@ -390,6 +419,7 @@ class FullSizeCoverService(
                 attempts = if (consecutiveFailure) previous!!.attempts + 1 else 1,
                 originalSha256 = originalBytes?.let(CoverVerdictStore::sha256Hex),
                 originalBytes = originalBytes?.size?.toLong(),
+                reason = reason,
             )
         store.put(subject.thumbnailUrl, verdict)
         return verdict
@@ -426,6 +456,8 @@ class FullSizeCoverService(
         bytes: ByteArray,
         mangaId: Int,
     ) {
+        // Never a format under another format's name (verified before; re-checked here).
+        if (typeOfName(target.name) != ImageUtil.findImageType { bytes.inputStream() }?.extension) return
         val directory = target.parentFile ?: return
         val staging = File(directory.parentFile ?: directory, ".komu-cover-staging").apply { mkdirs() }
         val staged = File(staging, "$mangaId.${UUID.randomUUID()}")
@@ -497,18 +529,40 @@ class FullSizeCoverService(
         /** Covers are far below this; a larger body is not an image we want. */
         const val MAXIMUM_ORIGINAL_BYTES = 12 * 1024 * 1024
 
+        /** The image type a cache file name declares (`jpeg` is `jpg`). */
+        internal fun typeOfName(name: String): String? =
+            name
+                .substringAfterLast('.', "")
+                .lowercase()
+                .let { if (it == "jpeg") "jpg" else it }
+                .takeIf { it.isNotEmpty() }
+
+        /** An HTML page (a challenge, an error page) instead of an image. */
+        internal fun isHtml(fetched: CoverFetch): Boolean {
+            if (fetched.contentType?.lowercase()?.startsWith("text/html") == true) return true
+            val head =
+                fetched.bytes
+                    ?.take(64)
+                    ?.toByteArray()
+                    ?.toString(Charsets.ISO_8859_1)
+                    ?.trimStart()
+                    ?.lowercase() ?: return false
+            return listOf("<!doctype html", "<html", "<head", "<!--").any { head.startsWith(it) }
+        }
+
         /** `null` for a success; the verdict for a failed status otherwise. */
         fun classify(status: Int): CoverVerdictKind? =
             when (status) {
                 in 200..299 -> null
 
-                408, 425, 429 -> CoverVerdictKind.TRANSIENT
+                // 403 is how an unsolved Cloudflare challenge answers: retried with backoff.
+                403, 408, 425, 429 -> CoverVerdictKind.TRANSIENT
 
                 413 -> CoverVerdictKind.NOT_IMAGE
 
+                // A redirect without a usable Location.
                 in 300..399 -> CoverVerdictKind.REFUSED
 
-                // a redirect without a usable Location
                 in 400..499 -> CoverVerdictKind.NOT_FOUND
 
                 else -> CoverVerdictKind.TRANSIENT

@@ -43,6 +43,12 @@ enum class CoverVerdictKind(
      */
     REFUSED(true),
 
+    /**
+     * The original is another image format than the cached cover; the
+     * cache keeps one name per cover and readers type it by extension.
+     */
+    FORMAT_MISMATCH(true),
+
     /** Network error, timeout, server error or challenge: retried later. */
     TRANSIENT(false),
 
