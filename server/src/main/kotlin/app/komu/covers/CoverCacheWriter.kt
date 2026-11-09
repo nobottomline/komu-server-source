@@ -13,6 +13,7 @@ import suwayomi.tachidesk.manga.impl.util.storage.ImageUtil
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -40,19 +41,45 @@ object CoverCacheWriter {
         mangaId: Int,
         generation: CoverPublicationGate.Generation,
         saveDir: String,
+        afterLookup: (File) -> Unit = {},
         fetcher: suspend () -> Response,
     ): Pair<InputStream, String> {
-        val fileName = mangaId.toString()
         File(saveDir).mkdirs()
-        val cachedFile = ImageResponse.findFileNameStartingWith(saveDir, fileName)
-        if (cachedFile != null && !cachedFile.endsWith(".tmp")) {
-            return ImageResponse.getCachedImageResponse(cachedFile, "$saveDir/$fileName")
-        }
+        openCached(gate, mangaId, saveDir, afterLookup)?.let { return it }
         fetcher().use { response ->
             if (response.code != 200) throw Exception("request error! ${response.code}")
             return save(gate, mangaId, generation, File(saveDir), response.body.byteStream(), response.header("Content-Type")).served
         }
     }
+
+    /**
+     * The cached cover of [mangaId] in [directory], found and opened under
+     * the manga's gate stripe, so a clear (which takes the same lock) cannot
+     * remove it in between; an open stream keeps the file's bytes after a
+     * later clear. `null` when there is none or it vanished anyway: the
+     * caller fetches it, so a missing file never reaches the client
+     * (ADR-0084 Review 4). [afterLookup] is a test seam between the lookup
+     * and the open.
+     */
+    fun openCached(
+        gate: CoverPublicationGate,
+        mangaId: Int,
+        directory: String,
+        afterLookup: (File) -> Unit = {},
+    ): Pair<InputStream, String>? =
+        gate.withLock(mangaId) {
+            val found =
+                ImageResponse
+                    .findFileNameStartingWith(directory, mangaId.toString())
+                    ?.takeUnless { it.endsWith(".tmp") }
+                    ?: return@withLock null
+            afterLookup(File(found))
+            try {
+                ImageResponse.getCachedImageResponse(found, "$directory/$mangaId")
+            } catch (_: FileNotFoundException) {
+                null
+            }
+        }
 
     /**
      * What [save] did: the stream to serve to the request that fetched the

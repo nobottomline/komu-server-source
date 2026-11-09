@@ -47,6 +47,16 @@ class CoverPublicationGate(
         return locks[i].withLock { Generation(epoch, stripeGenerations[i]) }
     }
 
+    /**
+     * Runs [read] under the manga's stripe lock, so no clear can remove a
+     * cover file between finding it and opening it (ADR-0084 Review 4).
+     * Nothing that waits on the network or the database may run inside.
+     */
+    fun <T> withLock(
+        mangaId: Int,
+        read: () -> T,
+    ): T = locks[index(mangaId)].withLock(read)
+
     /** Runs [clear] (removing the manga's cached cover) and invalidates in-flight verifications of it. */
     fun <T> invalidate(
         mangaId: Int,

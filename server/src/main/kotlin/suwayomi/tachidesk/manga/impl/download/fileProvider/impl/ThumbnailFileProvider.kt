@@ -13,7 +13,6 @@ import suwayomi.tachidesk.manga.impl.util.storage.ImageResponse.getCachedImageRe
 import suwayomi.tachidesk.server.ApplicationDirs
 import uy.kohesive.injekt.injectLazy
 import java.io.File
-import java.io.FileNotFoundException
 import java.io.InputStream
 
 class MissingThumbnailException : Exception("No thumbnail found")
@@ -47,23 +46,17 @@ class ThumbnailFileProvider(
     override suspend fun getImage(): RetrieveFile0Args = RetrieveFile0Args(::getImageImpl)
 
     /**
-     * Komu (ADR-0084 Review 3): the library cover for one request, downloaded
-     * when absent. The answer is the bytes this call fetched whether or not
+     * Komu (ADR-0084 Reviews 3–4): the library cover for one request,
+     * downloaded when absent. The cached copy is found and opened under the
+     * publication gate (`CoverCacheWriter.openCached`), as is the temporary
+     * cache the download reads first; a file that vanished anyway is
+     * fetched. The answer is the bytes this call fetched whether or not
      * they were cached: a refresh that overtook the fetch keeps them out of
      * the cache, so looking the file up again could find nothing.
      */
-    suspend fun getOrDownloadImage(): Pair<InputStream, String> {
-        if (getFilePath() != null) {
-            try {
-                return getImageImpl()
-            } catch (_: MissingThumbnailException) {
-                // Cleared after the lookup: fetch it below.
-            } catch (_: FileNotFoundException) {
-                // Cleared between the lookup and the open: fetch it below.
-            }
-        }
-        return downloadAndSave().served
-    }
+    suspend fun getOrDownloadImage(): Pair<InputStream, String> =
+        CoverCacheWriter.openCached(FullSizeCovers.publication, mangaId, applicationDirs.thumbnailDownloadsRoot)
+            ?: downloadAndSave().served
 
     private suspend fun downloadImpl(): Boolean {
         val isExistingFile = getFilePath() != null

@@ -12,6 +12,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -89,6 +90,66 @@ class CoverCacheWriterTest {
                 ) { error("no fetch") }
             }
         again.close()
+    }
+
+    // ---- Review 4: a cached cover vanishing between lookup and open
+
+    @Test
+    fun `a temp cover cleared between lookup and open is fetched again, never a missing file`() {
+        val dir = File(root, "tmp-thumbnails").apply { mkdirs() }
+        File(dir, "$mangaId.jpg").writeBytes(coverA)
+        var fetched = 0
+        val (served, mime) =
+            runBlocking {
+                CoverCacheWriter.cachedOrFetched(
+                    gate,
+                    mangaId,
+                    gate.generation(mangaId),
+                    dir.path,
+                    fetcher = {
+                        fetched++
+                        response(coverB)
+                    },
+                    // The refresh's clear lands after the lookup found the file.
+                    afterLookup = { found -> gate.invalidate(mangaId) { found.delete() } },
+                )
+            }
+        assertArrayEquals(coverB, served.use { it.readAllBytes() }, "the fresh fetch answers the request")
+        assertEquals("image/jpeg", mime)
+        assertEquals(1, fetched)
+    }
+
+    @Test
+    fun `a clear from another thread waits until the found cover is opened`() {
+        val dir = File(root, "tmp-thumbnails").apply { mkdirs() }
+        File(dir, "$mangaId.jpg").writeBytes(coverA)
+        var clearer: Thread? = null
+        val (served, _) =
+            runBlocking {
+                CoverCacheWriter.cachedOrFetched(
+                    gate,
+                    mangaId,
+                    gate.generation(mangaId),
+                    dir.path,
+                    fetcher = { error("the found cover is served, no fetch") },
+                    afterLookup = { found ->
+                        clearer = Thread { gate.invalidate(mangaId) { found.delete() } }.apply { start() }
+                        clearer!!.join(300)
+                        assertTrue(clearer!!.isAlive, "the clear waits for the open")
+                    },
+                )
+            }
+        assertArrayEquals(coverA, served.use { it.readAllBytes() }, "the opened file is served whole")
+        clearer!!.join(5_000)
+        assertTrue(visible(dir).isEmpty(), "the clear ran after the open")
+    }
+
+    @Test
+    fun `a library cover cleared between lookup and open is reported missing, so it is fetched`() {
+        val dir = File(root, "thumbnails").apply { mkdirs() }
+        File(dir, "$mangaId.png").writeBytes(png(art(seed = 5)))
+        assertNull(CoverCacheWriter.openCached(gate, mangaId, dir.path) { found -> gate.invalidate(mangaId) { found.delete() } })
+        assertNull(CoverCacheWriter.openCached(gate, mangaId, dir.path), "nothing cached")
     }
 
     @Test
