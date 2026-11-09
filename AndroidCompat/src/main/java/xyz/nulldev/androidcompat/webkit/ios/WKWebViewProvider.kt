@@ -111,27 +111,23 @@ class WKWebViewProvider(
     @Volatile
     private var progress = 0
 
+    private var openedAt = 0L
+
     // ------------------------------------------------------------------ lifecycle
 
     override fun init(
         javaScriptInterfaces: MutableMap<String, Any>?,
         privateBrowsing: Boolean,
     ) {
-        when (engine.availability()) {
-            JsExecutor.AVAILABLE -> {
-                Unit
-            }
-
-            JsExecutor.REQUIRES_FOREGROUND -> {
-                throw WebViewUnavailableException(
-                    WebViewUnavailableException.Reason.REQUIRES_FOREGROUND,
-                    "the app is in the background without an execution lease",
-                )
-            }
-
-            else -> {
-                throw WebViewUnavailableException(WebViewUnavailableException.Reason.ENGINE_STOPPED, "the engine is stopped")
-            }
+        val availability = engine.availability()
+        if (availability == JsExecutor.REQUIRES_FOREGROUND) {
+            throw WebViewUnavailableException(
+                WebViewUnavailableException.Reason.REQUIRES_FOREGROUND,
+                "the app is in the background without an execution lease",
+            )
+        }
+        if (availability != JsExecutor.AVAILABLE) {
+            throw WebViewUnavailableException(WebViewUnavailableException.Reason.ENGINE_STOPPED, "the engine is stopped")
         }
         handle = engine.create()
         if (handle == 0L) {
@@ -140,7 +136,9 @@ class WKWebViewProvider(
                 "the engine refused a new session",
             )
         }
+        openedAt = System.nanoTime()
         WKWebViewSessions.open(this)
+        logger.info { "WebView session $handle opened (${WKWebViewSessions.openSessions()} open)" }
         javaScriptInterfaces?.forEach { (name, obj) -> addJavascriptInterface(obj, name) }
     }
 
@@ -181,6 +179,7 @@ class WKWebViewProvider(
         if (handle != 0L) {
             WKWebViewSessions.close(this)
             engine.destroy(handle)
+            logger.info { "WebView session $handle closed after ${(System.nanoTime() - openedAt) / 1_000_000} ms" }
         }
     }
 

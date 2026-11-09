@@ -253,8 +253,11 @@ class WKWebViewProviderContractTest {
         assertEquals(listOf("1"), engine.await(JsExecutor.OP_SET_INTERCEPTION).fields)
         engine.emit(handle, JsExecutor.EV_REQUEST, 0, "https://site.test/api", "POST", "0", "0", "")
         engine.emit(handle, JsExecutor.EV_REQUEST, 7, "https://site.test/blocked-frame", "GET", "0", "0", "")
-        assertEquals("false|POST https://site.test/api main=false", seen.poll(5, TimeUnit.SECONDS))
-        assertEquals("false|GET https://site.test/blocked-frame main=false", seen.poll(5, TimeUnit.SECONDS))
+        // Like Android, requests are intercepted concurrently: no order between them.
+        assertEquals(
+            setOf("false|POST https://site.test/api main=false", "false|GET https://site.test/blocked-frame main=false"),
+            setOf(seen.poll(5, TimeUnit.SECONDS), seen.poll(5, TimeUnit.SECONDS)),
+        )
         val decision = engine.await(JsExecutor.OP_DECIDE)
         assertEquals(7L, decision.id)
         assertEquals(listOf("0"), decision.fields, "a response blocks the held navigation")
