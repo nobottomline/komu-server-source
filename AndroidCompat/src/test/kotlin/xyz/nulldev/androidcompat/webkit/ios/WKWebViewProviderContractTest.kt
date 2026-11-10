@@ -500,14 +500,14 @@ class WKWebViewProviderContractTest {
         val view = newWebView()
         val handle = handleOf(view)
         onMain { view.loadUrl("https://a.test/start") }
-        engine.await(JsExecutor.OP_LOAD_URL)
+        assertEquals("1", engine.await(JsExecutor.OP_LOAD_URL).fields[7], "the load carries its preload's sequence")
         val snapshot =
             listOf(
                 WebCookie.canonical("fromB", "1", "b.test", true, "/", false, true, "Lax", null),
                 WebCookie.canonical("tracker", "1", "third.test", true, "/", false, false, null, null),
             )
         // a.test redirected to b.test (admitted first); the page deleted `gone`; a third-party frame set `tracker`.
-        engine.emit(handle, JsExecutor.EV_COOKIES, 0, "[\"a.test\",\"b.test\"]", CookieWire.encode(snapshot))
+        engine.emit(handle, JsExecutor.EV_COOKIES, 0, "[\"a.test\",\"b.test\"]", CookieWire.encode(snapshot), "1")
         val deadline = System.currentTimeMillis() + 5_000
         while (jar.all().map { it.name } != listOf("fromB") && System.currentTimeMillis() < deadline) Thread.sleep(20)
         assertEquals(listOf("fromB"), jar.all().map { it.name })

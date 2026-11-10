@@ -107,22 +107,36 @@ object RfcCookies {
         }
 }
 
+/** A jar record with the generation it had when read. */
+data class VersionedCookie(
+    val cookie: WebCookie,
+    val generation: Long,
+)
+
 /**
  * The server's cookie jar as the WebView sessions see it. Implemented by the server
  * over its persistent jar (`PersistentCookieStore`) and installed in [WebViewCookies].
+ *
+ * Versioned (Codex recheck 1): every write or removal of an identity bumps its
+ * generation, and [compareAndSet] applies a session's change only when the record
+ * is still the one the session saw, atomically.
  */
 interface WebViewCookieJar {
     /** Unexpired cookies the jar would send to [host] (§5.4 domain rule; the engine applies path and Secure per request). */
-    fun cookiesFor(host: String): List<WebCookie>
+    fun cookiesFor(host: String): List<VersionedCookie>
 
-    /** The jar's cookie with this identity, unexpired, or null. */
-    fun find(key: WebCookie.Key): WebCookie?
+    /** The identity's current generation; 0 when it was never written. */
+    fun generation(key: WebCookie.Key): Long
 
-    /** Stores [cookie], replacing the one with the same identity. */
-    fun put(cookie: WebCookie)
+    /** The latest generation the jar has handed out. */
+    fun epoch(): Long
 
-    /** Removes the cookie with this identity. */
-    fun remove(key: WebCookie.Key)
+    /** Sets (null: removes) the record when its generation is still [expected]; its new generation, or null when it changed. */
+    fun compareAndSet(
+        key: WebCookie.Key,
+        expected: Long,
+        cookie: WebCookie?,
+    ): Long?
 }
 
 /** Where the iOS provider finds the server's jar. */
@@ -153,25 +167,41 @@ class MemoryWebViewCookieJar(
     private val clock: () -> Long = System::currentTimeMillis,
 ) : WebViewCookieJar {
     private val cookies = LinkedHashMap<WebCookie.Key, WebCookie>()
+    private val generations = HashMap<WebCookie.Key, Long>()
+    private var epoch = 0L
 
     @Synchronized
-    override fun cookiesFor(host: String): List<WebCookie> {
+    override fun cookiesFor(host: String): List<VersionedCookie> {
         val now = clock()
-        return cookies.values.filter { !it.isExpired(now) && it.appliesTo(host) }
+        return cookies.values.filter { !it.isExpired(now) && it.appliesTo(host) }.map { VersionedCookie(it, generations[it.key] ?: 0L) }
     }
 
     @Synchronized
-    override fun find(key: WebCookie.Key): WebCookie? = cookies[key]?.takeIf { !it.isExpired(clock()) }
+    override fun generation(key: WebCookie.Key): Long = generations[key] ?: 0L
 
     @Synchronized
-    override fun put(cookie: WebCookie) {
+    override fun epoch(): Long = epoch
+
+    @Synchronized
+    override fun compareAndSet(
+        key: WebCookie.Key,
+        expected: Long,
+        cookie: WebCookie?,
+    ): Long? {
+        if ((generations[key] ?: 0L) != expected) return null
+        if (cookie == null) cookies.remove(key) else cookies[key] = cookie
+        return (++epoch).also { generations[key] = it }
+    }
+
+    /** A server write (a response's Set-Cookie). */
+    @Synchronized
+    fun put(cookie: WebCookie) {
         cookies[cookie.key] = cookie
+        generations[cookie.key] = ++epoch
     }
 
     @Synchronized
-    override fun remove(key: WebCookie.Key) {
-        cookies.remove(key)
-    }
+    fun find(key: WebCookie.Key): WebCookie? = cookies[key]?.takeIf { !it.isExpired(clock()) }
 
     @Synchronized
     fun all(): List<WebCookie> = cookies.values.toList()
@@ -192,37 +222,64 @@ class MemoryWebViewCookieJar(
  *
  * The reconciliation is a set difference against [baseline] — the cookies, within
  * the targets' scope, that the session's store is known to hold (preloaded or
- * reported):
+ * reported), each with the jar generation it was seen at:
  * - a cookie that is new or changed is stored in the jar (host-only stays host-only,
  *   every attribute kept);
- * - a cookie that disappeared or expired is removed from the jar, unless the jar
- *   meanwhile holds another value for it (a later server response wins).
+ * - a cookie that disappeared or expired is removed from the jar;
+ * both only by compare-and-set against the generation the session saw (for a new
+ * identity: unwritten since the session last synchronised). A record a server
+ * response wrote meanwhile (a rotated token) is never overwritten or deleted by
+ * an older report, whatever its value. A report taken before a preload reached
+ * the store does not judge that preload's records.
  * Cookies outside the scope are never written or deleted.
  */
 internal class CookieSync(
     private val jar: () -> WebViewCookieJar?,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    /** What the session's store is known to hold for one identity: the record, its jar generation, the preload that put it there (0: a report). */
+    private data class Seen(
+        val cookie: WebCookie,
+        val generation: Long,
+        val preload: Long,
+    )
+
     private val hosts = LinkedHashSet<String>()
-    private val baseline = HashMap<WebCookie.Key, WebCookie>()
+    private val baseline = HashMap<WebCookie.Key, Seen>()
+    private var nextPreload = 0L
+
+    /** The jar's epoch when this session last synchronised: a record newer than it was written by someone else since. */
+    private var syncedAt = 0L
 
     @Synchronized
     fun targetHosts(): Set<String> = hosts.toSet()
 
-    /** The jar's cookies for [host], copied into the session before a load of it; [host] becomes a target. */
+    /**
+     * The jar's cookies for [host], copied into the session before a load of it;
+     * [host] becomes a target. Returns the preload's sequence number (the engine
+     * reports it back once those cookies are in the session's store) and the cookies.
+     */
     @Synchronized
-    fun preload(host: String?): List<WebCookie> {
-        if (host.isNullOrEmpty()) return emptyList()
+    fun preload(host: String?): Pair<Long, List<WebCookie>> {
+        val sequence = ++nextPreload
+        val jar = jar()
+        if (host.isNullOrEmpty() || jar == null) return sequence to emptyList()
         hosts += host.lowercase()
-        val cookies = jar()?.cookiesFor(host).orEmpty()
-        for (cookie in cookies) baseline[cookie.key] = cookie
-        return cookies
+        if (baseline.isEmpty()) syncedAt = jar.epoch()
+        val cookies = jar.cookiesFor(host)
+        for ((cookie, generation) in cookies) baseline[cookie.key] = Seen(cookie, generation, sequence)
+        return sequence to cookies.map { it.cookie }
     }
 
+    /**
+     * A report of the session's full cookie set. [preloadsDone]: the last preload the
+     * store holds; records of a later preload are not judged by this (older) report.
+     */
     @Synchronized
     fun reconcile(
         admittedHosts: Collection<String>,
         snapshot: List<WebCookie>,
+        preloadsDone: Long = Long.MAX_VALUE,
     ) {
         admittedHosts.forEach { if (it.isNotEmpty()) hosts += it.lowercase() }
         val jar = jar() ?: return
@@ -231,17 +288,22 @@ internal class CookieSync(
         for (cookie in snapshot) {
             if (cookie.isExpired(now) || !inScope(cookie)) continue
             present[cookie.key] = cookie
-            val known = baseline[cookie.key]
-            if (known != null && engineEquivalent(known, cookie)) continue
-            jar.put(cookie)
-            baseline[cookie.key] = cookie
+            val seen = baseline[cookie.key]
+            if (seen != null && (seen.preload > preloadsDone || engineEquivalent(seen.cookie, cookie))) continue
+            // Unchanged in the jar since the session saw it: the page's change applies.
+            // Otherwise a server response wrote it meanwhile and wins.
+            val expected =
+                seen?.generation ?: jar.generation(cookie.key).takeIf { it <= syncedAt }
+            val written = expected?.let { jar.compareAndSet(cookie.key, it, cookie) }
+            baseline[cookie.key] = Seen(cookie, written ?: jar.generation(cookie.key), 0)
         }
-        val gone = baseline.keys.filter { it !in present }
-        for (key in gone) {
-            val seen = baseline.remove(key) ?: continue
-            val current = jar.find(key)
-            if (current == null || current.value == seen.value) jar.remove(key)
+        for (key in baseline.keys.filter { it !in present }) {
+            val seen = baseline.getValue(key)
+            if (seen.preload > preloadsDone) continue // its preload has not reached the store yet
+            baseline.remove(key)
+            jar.compareAndSet(key, seen.generation, null)
         }
+        syncedAt = jar.epoch()
     }
 
     private fun inScope(cookie: WebCookie): Boolean = hosts.any { cookie.appliesTo(it) }

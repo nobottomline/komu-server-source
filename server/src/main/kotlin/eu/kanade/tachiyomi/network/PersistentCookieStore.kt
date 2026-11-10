@@ -21,6 +21,40 @@ class PersistentCookieStore(
 
     private val lock = ReentrantLock()
 
+    // Komu (ADR-0087 Review 1, recheck 1): a generation per cookie identity, bumped
+    // on every write or removal under [lock], so the WebView bridge can apply a
+    // session's change only when the record is unchanged since the session saw it.
+    private val generations = HashMap<Identity, Long>()
+    private var epoch = 0L
+
+    /** RFC 6265 §5.3 identity — used by every write, the restore and the WebView diff. */
+    data class Identity(
+        val name: String,
+        val domain: String,
+        val path: String,
+    )
+
+    private val Cookie.identity: Identity get() = Identity(name, domain, path)
+
+    /** Replaces the cookie with [cookie]'s identity (or adds it); caller holds [lock]. */
+    private fun storeLocked(cookie: Cookie) {
+        val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
+        val pos = cookiesForDomain.indexOfFirst { it.identity == cookie.identity }
+        if (pos == -1) cookiesForDomain.add(cookie) else cookiesForDomain[pos] = cookie
+        cookieMap[cookie.domain] = cookiesForDomain
+        generations[cookie.identity] = ++epoch
+    }
+
+    /** Removes the cookie with [identity]; whether it was there. Caller holds [lock]. */
+    private fun deleteLocked(identity: Identity): Boolean {
+        val cookies = cookieMap[identity.domain] ?: return false
+        val kept = cookies.filterNot { it.identity == identity }
+        if (kept.size == cookies.size) return false
+        cookieMap[identity.domain] = kept
+        generations[identity] = ++epoch
+        return true
+    }
+
     init {
         lock.withLock {
             val domains =
@@ -38,7 +72,7 @@ class PersistentCookieStore(
                                 .mapNotNull { Cookie.parse(url, it) }
                                 .filter { !it.hasExpired() }
                                 .groupBy { it.domain }
-                                .mapValues { it.value.distinctBy { it.name } }
+                                .mapValues { it.value.distinctBy { cookie -> cookie.identity } }
                         nonExpiredCookies.forEach { (domain, cookies) ->
                             cookieMap[domain] = cookies
                             domainsToSave.add(domain)
@@ -61,15 +95,8 @@ class PersistentCookieStore(
             val domainsToSave = mutableSetOf<String>()
             // Append or replace the cookies for this domain.
             for (cookie in cookies) {
-                val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
                 // Komu: replace the cookie with the same identity (RFC 6265 §5.3: name, domain, path).
-                val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
-                if (pos == -1) {
-                    cookiesForDomain.add(cookie)
-                } else {
-                    cookiesForDomain[pos] = cookie
-                }
-                cookieMap[cookie.domain] = cookiesForDomain
+                storeLocked(cookie)
                 domainsToSave.add(cookie.domain)
             }
 
@@ -81,6 +108,7 @@ class PersistentCookieStore(
         lock.withLock {
             val wasNotEmpty = cookieMap.isEmpty()
             prefs.edit().clear().apply()
+            cookieMap.values.flatten().forEach { generations[it.identity] = ++epoch }
             cookieMap.clear()
             wasNotEmpty
         }
@@ -89,7 +117,7 @@ class PersistentCookieStore(
         val url = uri.toURL()
         lock.withLock {
             prefs.edit().remove(url.host).apply()
-            cookieMap.remove(url.host)
+            cookieMap.remove(url.host)?.forEach { generations[it.identity] = ++epoch }
         }
     }
 
@@ -120,10 +148,7 @@ class PersistentCookieStore(
     /** Komu: stores [cookie], replacing the one with the same identity (name, domain, path). */
     fun put(cookie: Cookie) {
         lock.withLock {
-            val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
-            val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
-            if (pos == -1) cookiesForDomain.add(cookie) else cookiesForDomain[pos] = cookie
-            cookieMap[cookie.domain] = cookiesForDomain
+            storeLocked(cookie)
             saveToDisk(setOf(cookie.domain))
         }
     }
@@ -135,13 +160,44 @@ class PersistentCookieStore(
         path: String,
     ) {
         lock.withLock {
-            val cookies = cookieMap[domain] ?: return@withLock
-            val kept = cookies.filterNot { it.name == name && it.path == path }
-            if (kept.size == cookies.size) return@withLock
-            cookieMap[domain] = kept
-            saveToDisk(setOf(domain))
+            if (deleteLocked(Identity(name, domain, path))) saveToDisk(setOf(domain))
         }
     }
+
+    /** Komu: the identity's current generation (0: never written) and the store's latest. */
+    fun generation(identity: Identity): Long = lock.withLock { generations[identity] ?: 0L }
+
+    fun epoch(): Long = lock.withLock { epoch }
+
+    /**
+     * Komu: atomically sets (or, for null, removes) the cookie with [identity], only
+     * when its generation is still [expected] — nobody wrote or removed it since.
+     * Returns the new generation, or null when the record changed.
+     */
+    fun compareAndSet(
+        identity: Identity,
+        expected: Long,
+        cookie: Cookie?,
+    ): Long? =
+        lock.withLock {
+            if ((generations[identity] ?: 0L) != expected) return@withLock null
+            if (cookie == null) {
+                if (deleteLocked(identity)) saveToDisk(setOf(identity.domain)) else generations[identity] = ++epoch
+            } else {
+                storeLocked(cookie)
+                saveToDisk(setOf(cookie.domain))
+            }
+            generations[identity]
+        }
+
+    /** Komu: every stored, unexpired cookie with its generation, read atomically. */
+    fun allVersioned(): List<Pair<Cookie, Long>> =
+        lock.withLock {
+            val now = System.currentTimeMillis()
+            cookieMap.values.flatMap { cookies ->
+                cookies.filter { it.expiresAt > now }.map { it to (generations[it.identity] ?: 0L) }
+            }
+        }
 
     override fun add(
         uri: URI?,
@@ -149,15 +205,8 @@ class PersistentCookieStore(
     ) {
         lock.withLock {
             val cookie = cookie.toCookie(uri?.host) ?: return@withLock
-            val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
             // Komu: replace the cookie with the same identity (RFC 6265 §5.3: name, domain, path).
-            val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
-            if (pos == -1) {
-                cookiesForDomain.add(cookie)
-            } else {
-                cookiesForDomain[pos] = cookie
-            }
-            cookieMap[cookie.domain] = cookiesForDomain
+            storeLocked(cookie)
             saveToDisk(setOf(cookie.domain))
         }
     }
@@ -189,16 +238,7 @@ class PersistentCookieStore(
     ): Boolean =
         lock.withLock {
             val cookie = cookie.toCookie(uri?.host) ?: return@withLock false
-            val cookies = cookieMap[cookie.domain].orEmpty()
-            val index =
-                cookies.indexOfFirst {
-                    it.name == cookie.name &&
-                        it.path == cookie.path
-                }
-            if (index >= 0) {
-                val newList = cookies.toMutableList()
-                newList.removeAt(index)
-                cookieMap[cookie.domain] = newList.toList()
+            if (deleteLocked(cookie.identity)) {
                 saveToDisk(setOf(cookie.domain))
                 true
             } else {

@@ -236,6 +236,7 @@ class WKWebViewProvider(
             return
         }
         beginLoad(url)
+        val (preload, preloaded) = cookies.preload(hostOf(url))
         submit(
             JsExecutor.OP_LOAD_URL,
             fields =
@@ -243,10 +244,11 @@ class WKWebViewProvider(
                     url,
                     headers.entries.joinToString("\n") { "${it.key}: ${it.value}" },
                     sessionUserAgent(),
-                    CookieWire.encode(cookies.preload(hostOf(url))),
+                    CookieWire.encode(preloaded),
                     flags(),
                     method,
                     bodyBase64,
+                    preload.toString(),
                 ),
         )
     }
@@ -266,6 +268,7 @@ class WKWebViewProvider(
     ) {
         val base = baseUrl ?: "about:blank"
         beginLoad(base)
+        val (preload, preloaded) = cookies.preload(hostOf(base))
         submit(
             JsExecutor.OP_LOAD_DATA,
             fields =
@@ -275,9 +278,10 @@ class WKWebViewProvider(
                     mimeType ?: "text/html",
                     encoding ?: "",
                     sessionUserAgent(),
-                    CookieWire.encode(cookies.preload(hostOf(base))),
+                    CookieWire.encode(preloaded),
                     flags(),
                     historyUrl ?: "",
+                    preload.toString(),
                 ),
         )
     }
@@ -539,7 +543,11 @@ class WKWebViewProvider(
             }
 
             JsExecutor.EV_COOKIES -> {
-                cookies.reconcile(CookieWire.decodeHosts(event.field(0)), CookieWire.decode(event.field(1)))
+                cookies.reconcile(
+                    CookieWire.decodeHosts(event.field(0)),
+                    CookieWire.decode(event.field(1)),
+                    event.field(2).toLongOrNull() ?: 0L,
+                )
             }
 
             JsExecutor.EV_MESSAGES_DROPPED -> {

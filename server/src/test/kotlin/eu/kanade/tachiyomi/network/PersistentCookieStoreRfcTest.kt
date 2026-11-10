@@ -12,6 +12,7 @@ import xyz.nulldev.androidcompat.webkit.ios.WebCookie
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -87,12 +88,14 @@ class PersistentCookieStoreRfcTest : ApplicationTest() {
                 WebCookie.canonical("h", "1", site, true, "/p", true, true, "Strict", expiry),
                 WebCookie.canonical("d", "2", site, false, "/", false, false, "Lax", null),
             )
-        cookies.forEach(jar::put)
-        assertEquals(cookies.toSet(), jar.cookiesFor(site).toSet())
-        assertEquals(listOf("d"), jar.cookiesFor("ads.$site").map { it.name })
-        assertEquals(cookies[0], jar.find(cookies[0].key))
-        jar.remove(cookies[0].key)
-        assertNull(jar.find(cookies[0].key))
+        cookies.forEach { assertNotNull(jar.compareAndSet(it.key, jar.generation(it.key), it)) }
+        assertEquals(cookies.toSet(), jar.cookiesFor(site).map { it.cookie }.toSet())
+        assertEquals(listOf("d"), jar.cookiesFor("ads.$site").map { it.cookie.name })
+        val generation = jar.generation(cookies[0].key)
+        store.put(cookies[0].toOkHttp()!!) // a server write meanwhile
+        assertNull(jar.compareAndSet(cookies[0].key, generation, null), "a changed record is not removed")
+        assertNotNull(jar.compareAndSet(cookies[0].key, jar.generation(cookies[0].key), null))
+        assertTrue(jar.cookiesFor(site).none { it.cookie.name == "h" })
         cookies.forEach { assertEquals(it, it.toOkHttp()!!.toWebCookie()) }
     }
 
@@ -106,5 +109,20 @@ class PersistentCookieStoreRfcTest : ApplicationTest() {
         assertEquals(false, stored["wide"]?.hostOnly, "red before Review 1: stored as host-only")
         assertTrue("plain=1" !in manager.getCookie("https://ads.$site/"))
         assertTrue("wide=1" in manager.getCookie("https://ads.$site/"))
+    }
+
+    /** Codex recheck 1: a restart keeps both cookies of the same name on two paths. */
+    @Test
+    fun aRestartKeepsSameNamedCookiesOnTwoPaths() {
+        val url = "https://$site/".toHttpUrl()
+        store.addAll(
+            url,
+            listOf(
+                Cookie.parse(url, "a=root; Path=/; Max-Age=3600")!!,
+                Cookie.parse(url, "a=api; Path=/api; Max-Age=3600")!!,
+            ),
+        )
+        val restarted = PersistentCookieStore(Injekt.get<android.app.Application>())
+        assertEquals(setOf("/" to "root", "/api" to "api"), restarted.all().filter { it.domain == site }.map { it.path to it.value }.toSet(), "red before recheck 1: distinctBy(name) dropped one")
     }
 }

@@ -32,7 +32,7 @@ package app.komu.bridge;
  * {@code xyz.nulldev.androidcompat.webkit.ios.WebEngineFrames}.
  */
 public final class JsExecutor {
-    public static final int ABI_VERSION = 4;
+    public static final int ABI_VERSION = 5;
 
     // availability()
     public static final int AVAILABLE = 0;
@@ -41,8 +41,8 @@ public final class JsExecutor {
 
     // submit() operations
     // Cookies travel as a JSON array of objects (WebCookies.kt `CookieWire`).
-    public static final int OP_LOAD_URL = 1;          // url, headers, userAgent, cookies, flags, method, body
-    public static final int OP_LOAD_DATA = 2;         // baseUrl, data, mimeType, encoding, userAgent, cookies, flags, historyUrl
+    public static final int OP_LOAD_URL = 1;          // url, headers, userAgent, cookies, flags, method, body, preload sequence
+    public static final int OP_LOAD_DATA = 2;         // baseUrl, data, mimeType, encoding, userAgent, cookies, flags, historyUrl, preload sequence
     public static final int OP_EVALUATE = 3;          // id = callback id; script
     public static final int OP_ADD_INTERFACE = 4;     // name, methods (JSON array)
     public static final int OP_REMOVE_INTERFACE = 5;  // name
@@ -68,7 +68,7 @@ public final class JsExecutor {
     public static final int EV_BRIDGE_CALL = 5;    // interface, method, arguments (JSON array), cost
     public static final int EV_WEB_MESSAGE = 6;    // id = reply id; listener, message, origin, isMainFrame, cost
     public static final int EV_REQUEST = 7;        // id = decision id (0: observation); url, method, isMainFrame, isRedirect, headers
-    public static final int EV_COOKIES = 8;        // admitted target hosts (JSON array), the session's cookies (JSON array)
+    public static final int EV_COOKIES = 8;        // admitted target hosts (JSON array), the session's cookies (JSON array), last preload in the store
     public static final int EV_PROCESS_GONE = 9;   // didCrash, reason
     public static final int EV_MESSAGES_DROPPED = 10; // count: page messages dropped over the session's budget
 
