@@ -22,8 +22,10 @@ private val logger = KotlinLogging.logger {}
  *
  * - **Admission.** At most [maxActive] sessions run at once (each WKWebView has its
  *   own WebContent process). A further session waits, without blocking any thread:
- *   its commands are buffered until a running session ends. The extension's own
- *   timeout bounds the wait.
+ *   its commands are buffered until a running session ends (its loads are declared
+ *   to the engine at once, so its egress binding exists while it waits). The
+ *   extension's own timeout bounds the wait. A session the engine ended while it
+ *   waited never runs.
  * - **Event pump.** One daemon thread drains the engine's event queue and hands
  *   each event to its provider, which posts page events to the WebView's looper and
  *   runs request interception and JavaScript-interface calls on [background].
@@ -65,20 +67,36 @@ internal object WKWebViewSessions {
             if (grantNow) granted += provider.handle else waiting.addLast(provider)
             startPumpLocked()
         }
-        if (grantNow) provider.activate()
+        if (grantNow && !provider.activate()) release(provider)
     }
 
     /** The session ended: frees its slot for the next waiting session. */
     fun close(provider: WKWebViewProvider) {
-        var next: WKWebViewProvider? = null
-        synchronized(lock) {
-            providers.remove(provider.handle)
-            waiting.remove(provider)
-            if (granted.remove(provider.handle)) {
+        synchronized(lock) { providers.remove(provider.handle) }
+        release(provider)
+    }
+
+    /**
+     * The engine ended the session (process gone, egress binding revoked, execution
+     * lost): a waiting session leaves the queue and never runs; a running one keeps
+     * its slot until the extension destroys it.
+     */
+    fun ended(provider: WKWebViewProvider) {
+        synchronized(lock) { waiting.remove(provider) }
+    }
+
+    /** Frees [provider]'s slot (if it held one) and hands it to the next waiting session that can still run. */
+    private fun release(provider: WKWebViewProvider) {
+        var freed: WKWebViewProvider? = provider
+        while (freed != null) {
+            val next: WKWebViewProvider?
+            synchronized(lock) {
+                waiting.remove(freed)
+                if (!granted.remove(freed.handle)) return
                 next = waiting.removeFirstOrNull()?.also { granted += it.handle }
             }
+            freed = next?.takeUnless { it.activate() }
         }
-        next?.activate()
     }
 
     fun openSessions(): Int = synchronized(lock) { providers.size }

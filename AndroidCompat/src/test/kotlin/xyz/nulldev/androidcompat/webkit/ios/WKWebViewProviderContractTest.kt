@@ -95,10 +95,12 @@ class WKWebViewProviderContractTest {
     private lateinit var main: Handler
     private lateinit var mainLooper: Looper
     private val views = mutableListOf<WebView>()
+    private val jar = MemoryWebViewCookieJar()
 
     @BeforeTest
     fun setUp() {
         engine = FakeEngine()
+        WebViewCookies.install(jar)
         WebViewProviders.installIOSEngineForTesting(engine)
         WebView.setProviderFactory(WebViewProviders.factoryFor("ios"))
         val ready = CountDownLatch(1)
@@ -119,6 +121,7 @@ class WKWebViewProviderContractTest {
         views.forEach { v -> onMain { v.destroy() } }
         mainLooper.quit()
         WebViewProviders.installIOSEngineForTesting(null)
+        WebViewCookies.install(null)
     }
 
     private fun <T> onMain(block: () -> T): T {
@@ -327,6 +330,9 @@ class WKWebViewProviderContractTest {
         onMain { views.forEach { it.loadUrl("https://site.test/${handleOf(it)}") } }
         val loads = (1..WKWebViewSessions.maxActive).map { engine.await(JsExecutor.OP_LOAD_URL) }
         assertEquals(WKWebViewSessions.maxActive, loads.size)
+        val declared = engine.await(JsExecutor.OP_BIND)
+        assertEquals(handleOf(views.last()), declared.handle, "the waiting session's load is declared to the engine at once")
+        assertEquals(listOf("https://site.test/${handleOf(views.last())}"), declared.fields)
         assertEquals(null, engine.commands.poll(300, TimeUnit.MILLISECONDS), "the extra session waits")
         onMain { views.first().destroy() }
         val late = engine.await(JsExecutor.OP_LOAD_URL)
@@ -449,17 +455,121 @@ class WKWebViewProviderContractTest {
         assertEquals("true|7", done.poll(5, TimeUnit.SECONDS))
     }
 
+    /**
+     * Codex P1 (ADR-0063 §6): a waiting session's binding exists before it runs. The
+     * engine ends it while it waits (its task work stopped, its lease ended); a slot
+     * that frees afterwards never activates it, and goes to the next session.
+     */
     @Test
-    fun cookieRulesFollowTheTargetSite() {
-        assertTrue(CookieLines.domainMatches("www.site.test", "site.test"))
-        assertTrue(CookieLines.domainMatches("site.test", "site.test"))
-        assertFalse(CookieLines.domainMatches("site.test", "ads.test"))
-        assertFalse(CookieLines.domainMatches("evilsite.test", "site.test"))
+    fun aWaitingSessionEndedByTheEngineNeverActivates() {
+        val views = (1..WKWebViewSessions.maxActive + 2).map { newWebView() }
+        onMain { views.forEach { it.loadUrl("https://site.test/${handleOf(it)}") } }
+        repeat(WKWebViewSessions.maxActive) { engine.await(JsExecutor.OP_LOAD_URL) }
+        val waiting = views[WKWebViewSessions.maxActive]
+        val next = views.last()
+        assertEquals(handleOf(waiting), engine.await(JsExecutor.OP_BIND).handle)
+        assertEquals(handleOf(next), engine.await(JsExecutor.OP_BIND).handle)
+        engine.emit(handleOf(waiting), JsExecutor.EV_PROCESS_GONE, 0, "0", "revoked")
+        Thread.sleep(300)
+        onMain { views.first().destroy() }
+        val late = engine.await(JsExecutor.OP_LOAD_URL)
+        assertEquals(handleOf(next), late.handle, "the slot skips the ended session")
+        val stray = generateSequence { engine.commands.poll(300, TimeUnit.MILLISECONDS) }.toList()
+        assertTrue(stray.none { it.handle == handleOf(waiting) && it.op == JsExecutor.OP_LOAD_URL }, "the ended session never loads: $stray")
+    }
+
+    @Test
+    fun loadsCarryTheJarsCookiesForTheirHostWithEveryAttribute() {
+        jar.put(WebCookie.canonical("sid", "1", "site.test", true, "/", true, true, "Strict", 4_000_000_000_000L))
+        jar.put(WebCookie.canonical("pref", "2", "site.test", false, "/p", false, false, null, null))
+        val view = newWebView()
+        onMain { view.loadUrl("https://site.test/") }
+        val site = CookieWire.decode(engine.await(JsExecutor.OP_LOAD_URL).fields[3]).associateBy { it.name }
+        assertEquals(true, site["sid"]?.hostOnly)
+        assertEquals("Strict", site["sid"]?.sameSite)
+        assertEquals(4_000_000_000_000L, site["sid"]?.expiresAt)
+        assertEquals(false, site["pref"]?.hostOnly)
+        onMain { view.loadUrl("https://ads.site.test/") }
+        val sub = CookieWire.decode(engine.await(JsExecutor.OP_LOAD_URL).fields[3]).map { it.name }
+        assertEquals(listOf("pref"), sub, "the host-only cookie is not copied for a subdomain")
+    }
+
+    @Test
+    fun cookieEventsReconcileAdditionsAndDeletionsForAdmittedHosts() {
+        jar.put(WebCookie.canonical("gone", "1", "a.test", true, "/", false, false, null, null))
+        val view = newWebView()
+        val handle = handleOf(view)
+        onMain { view.loadUrl("https://a.test/start") }
+        engine.await(JsExecutor.OP_LOAD_URL)
+        val snapshot =
+            listOf(
+                WebCookie.canonical("fromB", "1", "b.test", true, "/", false, true, "Lax", null),
+                WebCookie.canonical("tracker", "1", "third.test", true, "/", false, false, null, null),
+            )
+        // a.test redirected to b.test (admitted first); the page deleted `gone`; a third-party frame set `tracker`.
+        engine.emit(handle, JsExecutor.EV_COOKIES, 0, "[\"a.test\",\"b.test\"]", CookieWire.encode(snapshot))
+        val deadline = System.currentTimeMillis() + 5_000
+        while (jar.all().map { it.name } != listOf("fromB") && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals(listOf("fromB"), jar.all().map { it.name })
+        assertEquals(true, jar.all().single().httpOnly)
+    }
+
+    /**
+     * Codex P1: a page flooding messages at a slow callback. Neither side holds more
+     * than the budget: this side refuses what exceeds it (returning the credit at once)
+     * and every handled message returns its cost; a drop reaches the client as a typed
+     * error.
+     */
+    @Test
+    fun pageMessagesAreCreditBoundedAndDropsAreTypedErrors() {
+        val view = newWebView()
+        val handle = handleOf(view)
+        val gate = CountDownLatch(1)
+        val handled = java.util.concurrent.atomic.AtomicInteger()
+        val slow =
+            object {
+                @JavascriptInterface
+                fun post(message: String) {
+                    gate.await(10, TimeUnit.SECONDS)
+                    handled.incrementAndGet()
+                }
+            }
+        val errors = LinkedBlockingQueue<Int>()
+        onMain {
+            view.webViewClient =
+                object : WebViewClient() {
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?,
+                    ) {
+                        errors += error!!.errorCode
+                    }
+                }
+            view.addJavascriptInterface(slow, "app")
+        }
+        engine.await(JsExecutor.OP_ADD_INTERFACE)
+        val big = "x".repeat(1 shl 20)
+        val cost = (1L shl 20).toString()
+        repeat(12) { engine.emit(handle, JsExecutor.EV_BRIDGE_CALL, 0, "app", "post", "[\"$big\"]", cost) }
+        assertEquals(WebViewClient.ERROR_TOO_MANY_REQUESTS, errors.poll(5, TimeUnit.SECONDS), "over the budget: a typed error")
+        val refused = generateSequence { engine.commands.poll(500, TimeUnit.MILLISECONDS) }.filter { it.op == JsExecutor.OP_ACK }.count()
+        assertEquals(12 - 4, refused, "4 MiB in hand at most: the rest is refused and its credit returned at once")
+        gate.countDown()
+        val deadline = System.currentTimeMillis() + 5_000
+        while (handled.get() < 4 && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        assertEquals(4, handled.get())
+        val returned = generateSequence { engine.commands.poll(500, TimeUnit.MILLISECONDS) }.filter { it.op == JsExecutor.OP_ACK }.toList()
+        assertEquals(List(4) { listOf(cost) }, returned.map { it.fields }, "each handled message returns its cost")
+        // The engine's own drop report reaches the client the same way.
+        errors.clear()
+        engine.emit(handle, JsExecutor.EV_MESSAGES_DROPPED, 0, "37")
+        assertEquals(WebViewClient.ERROR_TOO_MANY_REQUESTS, errors.poll(5, TimeUnit.SECONDS))
     }
 
     @Test
     fun engineFramesRoundTrip() {
-        val event = WebEngineEvent(5, JsExecutor.EV_COOKIES, 9, listOf("https://a.test/", "a=1; Domain=a.test", "ü \u0000 😀"))
+        val event = WebEngineEvent(5, JsExecutor.EV_COOKIES, 9, listOf("[\"a.test\"]", "[]", "ü \u0000 😀"))
         assertEquals(
             listOf(event, event),
             WebEngineFrames.decodeEvents(WebEngineFrames.encodeEvent(event) + WebEngineFrames.encodeEvent(event)),

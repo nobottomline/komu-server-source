@@ -41,6 +41,11 @@ class CookieManagerImpl : CookieManager() {
             }
 
         HttpCookie.parse(value).forEach {
+            // Komu: an explicit Domain attribute makes a domain cookie whatever its
+            // leading dot (RFC 6265 §5.2.3); the store reads a dot-less domain as
+            // host-only, which is what a cookie without Domain is.
+            val domain = it.domain
+            if (domain != null && !domain.startsWith(".")) it.domain = ".$domain"
             cookieHandler.cookieStore.add(uri, it)
         }
     }

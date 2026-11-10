@@ -35,11 +35,8 @@ import org.chromium.support_lib_boundary.util.BoundaryInterfaceReflectionUtil
 import xyz.nulldev.androidcompat.webkit.KcefWebSettings
 import xyz.nulldev.androidcompat.webkit.WebViewUnavailableException
 import java.lang.reflect.InvocationHandler
-import java.net.CookieHandler
-import java.net.HttpCookie
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicLong
 
 private val logger = KotlinLogging.logger {}
@@ -66,10 +63,18 @@ private val logger = KotlinLogging.logger {}
  * - JavaScript-interface methods return `undefined` to the page.
  * - Object keys of evaluation results come sorted.
  *
- * Cookies: before each load the server's cookies for the target site are copied
- * into the session's own (non-persistent) website data store; cookies the session
- * sets are copied back only when they would be sent to the target site (the
- * loaded host, the data base host, or a host the main frame committed to).
+ * Cookies ([CookieSync]): before each load the server's cookies for the load's host
+ * are copied into the session's own (non-persistent) website data store with every
+ * RFC 6265 attribute; the session's cookie set is reconciled back into the server's
+ * jar (additions, changes and deletions) for its target hosts only.
+ *
+ * Page messages (`@JavascriptInterface` calls, web messages) are credit-bounded:
+ * the engine drops what exceeds the session's budget, this side returns each
+ * message's cost once handled, and a drop reaches the client as
+ * `onReceivedError(ERROR_TOO_MANY_REQUESTS)`.
+ *
+ * Egress (ADR-0063 §6): a session waiting for a slot declares each load to the
+ * engine at once ([JsExecutor.OP_BIND]), so its binding exists before it runs.
  */
 class WKWebViewProvider(
     private val view: WebView,
@@ -100,7 +105,8 @@ class WKWebViewProvider(
     private val evaluations = ConcurrentHashMap<Long, ValueCallback<String>>()
     private val interfaces = ConcurrentHashMap<String, Any>()
     private val messageListeners = ConcurrentHashMap<String, InvocationHandler>()
-    private val targetHosts = CopyOnWriteArraySet<String>()
+    private val cookies = CookieSync({ WebViewCookies.jarOrWarn() })
+    private val budget = MessageBudget()
 
     @Volatile
     private var interceptionEnabled = false
@@ -142,15 +148,25 @@ class WKWebViewProvider(
         javaScriptInterfaces?.forEach { (name, obj) -> addJavascriptInterface(obj, name) }
     }
 
-    /** Called once a session slot is granted: sends the commands buffered until then. */
-    internal fun activate() {
+    /**
+     * Called once a session slot is granted: sends the commands buffered until then.
+     * False when the session ended while it waited (destroyed, or ended by the engine,
+     * e.g. its task binding was revoked): it never runs, and the slot goes on.
+     */
+    internal fun activate(): Boolean {
         synchronized(lock) {
-            if (destroyed) return
+            if (destroyed || gone) {
+                pending.clear()
+                return false
+            }
             active = true
             for ((op, id, fields) in pending) engine.submit(handle, op, id, fields)
             pending.clear()
+            return true
         }
     }
+
+    internal fun hasEnded(): Boolean = synchronized(lock) { destroyed || gone }
 
     private fun submit(
         op: Int,
@@ -161,6 +177,11 @@ class WKWebViewProvider(
             if (destroyed || gone) return
             if (!active) {
                 pending += Triple(op, id, fields)
+                // ADR-0063 §6: the engine admits and binds the load now, so ending the
+                // task work it reaches ends this session before it ever runs.
+                if (op == JsExecutor.OP_LOAD_URL || op == JsExecutor.OP_LOAD_DATA) {
+                    engine.submit(handle, JsExecutor.OP_BIND, 0L, listOf(fields.firstOrNull().orEmpty()))
+                }
                 return
             }
             engine.submit(handle, op, id, fields)
@@ -222,7 +243,7 @@ class WKWebViewProvider(
                     url,
                     headers.entries.joinToString("\n") { "${it.key}: ${it.value}" },
                     sessionUserAgent(),
-                    cookiesFor(url),
+                    CookieWire.encode(cookies.preload(hostOf(url))),
                     flags(),
                     method,
                     bodyBase64,
@@ -254,7 +275,7 @@ class WKWebViewProvider(
                     mimeType ?: "text/html",
                     encoding ?: "",
                     sessionUserAgent(),
-                    cookiesFor(base),
+                    CookieWire.encode(cookies.preload(hostOf(base))),
                     flags(),
                     historyUrl ?: "",
                 ),
@@ -264,7 +285,6 @@ class WKWebViewProvider(
     private fun beginLoad(url: String) {
         currentUrl = url
         progress = 0
-        hostOf(url)?.let { targetHosts += it }
     }
 
     /** The session's single User-Agent: what the extension set, else the server's default. */
@@ -460,7 +480,6 @@ class WKWebViewProvider(
             JsExecutor.EV_PAGE_STARTED -> {
                 val url = event.field(0)
                 currentUrl = url
-                hostOf(url)?.let { targetHosts += it }
                 onLooper { viewClient.onPageStarted(view, url, null) }
             }
 
@@ -493,11 +512,21 @@ class WKWebViewProvider(
             }
 
             JsExecutor.EV_BRIDGE_CALL -> {
-                val target = interfaces[event.field(0)] ?: return
+                val cost = event.field(3).toLongOrNull() ?: 0L
+                val target = interfaces[event.field(0)]
+                if (target == null || !budget.take(cost)) {
+                    if (target != null) reportDropped(1)
+                    acknowledge(cost, taken = false)
+                    return
+                }
                 val method = event.field(1)
                 val arguments = event.field(2)
                 bridgeQueue.execute {
-                    if (!isDestroyed()) JsBridge.invoke(target, method, arguments)
+                    try {
+                        if (!isDestroyed()) JsBridge.invoke(target, method, arguments)
+                    } finally {
+                        acknowledge(cost, taken = true)
+                    }
                 }
             }
 
@@ -510,11 +539,16 @@ class WKWebViewProvider(
             }
 
             JsExecutor.EV_COOKIES -> {
-                importCookies(event.fields)
+                cookies.reconcile(CookieWire.decodeHosts(event.field(0)), CookieWire.decode(event.field(1)))
+            }
+
+            JsExecutor.EV_MESSAGES_DROPPED -> {
+                reportDropped(event.field(0).toIntOrNull() ?: 1)
             }
 
             JsExecutor.EV_PROCESS_GONE -> {
                 synchronized(lock) { gone = true }
+                WKWebViewSessions.ended(this)
                 evaluations.clear()
                 val reason = event.field(1)
                 logger.info { "WebView session ended by the engine: $reason" }
@@ -576,8 +610,36 @@ class WKWebViewProvider(
         }
     }
 
+    /** Returns a message's cost to the engine (and to this side's budget when it was taken). */
+    private fun acknowledge(
+        cost: Long,
+        taken: Boolean,
+    ) {
+        if (taken) budget.release(cost)
+        submit(JsExecutor.OP_ACK, fields = listOf(cost.toString()))
+    }
+
+    /** Page messages were dropped over the session's budget: a typed error, like Android's for too many requests. */
+    private fun reportDropped(count: Int) {
+        logger.warn { "WebView session $handle dropped $count page message(s) over its budget" }
+        val request = KomuWebResourceRequest(currentUrl.orEmpty(), "GET", false, false, emptyMap())
+        val error =
+            object : WebResourceError() {
+                override fun getErrorCode(): Int = WebViewClient.ERROR_TOO_MANY_REQUESTS
+
+                override fun getDescription(): CharSequence = "$count JavaScript message(s) dropped: the page sends faster than the extension handles them"
+            }
+        onLooper { viewClient.onReceivedError(view, request, error) }
+    }
+
     private fun deliverWebMessage(event: WebEngineEvent) {
-        val listener = messageListeners[event.field(0)] ?: return
+        val cost = event.field(4).toLongOrNull() ?: 0L
+        val listener = messageListeners[event.field(0)]
+        if (listener == null || !budget.take(cost)) {
+            if (listener != null) reportDropped(1)
+            acknowledge(cost, taken = false)
+            return
+        }
         val replyId = event.id
         val message =
             BoundaryInterfaceReflectionUtil.createInvocationHandlerFor(WebMessageDelegate(event.field(1)))
@@ -587,39 +649,21 @@ class WKWebViewProvider(
             )
         val origin = Uri.parse(event.field(2))
         val isMainFrame = event.field(3) == "1"
-        onLooper {
-            BoundaryInterfaceReflectionUtil
-                .castToSuppLibClass(WebMessageListenerBoundaryInterface::class.java, listener)!!
-                .onPostMessage(view, message, origin, isMainFrame, reply)
-        }
-    }
-
-    // ------------------------------------------------------------------ cookies
-
-    private fun cookieStore() = (CookieHandler.getDefault() as? java.net.CookieManager)?.cookieStore
-
-    /** The server's cookies for [url]'s site, as Set-Cookie lines (one per line). */
-    private fun cookiesFor(url: String): String {
-        if (hostOf(url) == null) return ""
-        val cookies = runCatching { cookieStore()?.get(URI(url)) }.getOrNull().orEmpty()
-        return cookies.joinToString("\n") { CookieLines.format(it) }
-    }
-
-    /** Cookies the session set, kept only when they would be sent to a target host. */
-    private fun importCookies(fields: List<String>) {
-        val store = cookieStore() ?: return
-        var index = 0
-        while (index + 1 < fields.size) {
-            val url = fields[index]
-            val line = fields[index + 1]
-            index += 2
-            val cookies = runCatching { HttpCookie.parse(line) }.getOrNull() ?: continue
-            for (cookie in cookies) {
-                val domain = (cookie.domain ?: hostOf(url) ?: continue).removePrefix(".").lowercase()
-                if (targetHosts.none { CookieLines.domainMatches(it, domain) }) continue
-                runCatching { store.add(URI(url), cookie) }
+        val delivered =
+            handler.post {
+                try {
+                    if (!isDestroyed()) {
+                        BoundaryInterfaceReflectionUtil
+                            .castToSuppLibClass(WebMessageListenerBoundaryInterface::class.java, listener)!!
+                            .onPostMessage(view, message, origin, isMainFrame, reply)
+                    }
+                } catch (t: Throwable) {
+                    logger.warn(t) { "WebView message listener failed" }
+                } finally {
+                    acknowledge(cost, taken = true)
+                }
             }
-        }
+        if (!delivered) acknowledge(cost, taken = true)
     }
 
     companion object {
@@ -688,22 +732,36 @@ internal class KomuWebResourceRequest(
     override fun getRequestHeaders(): Map<String, String> = headers
 }
 
-internal object CookieLines {
-    fun format(cookie: HttpCookie): String =
-        buildString {
-            append(cookie.name).append('=').append(cookie.value ?: "")
-            cookie.domain?.let { append("; Domain=").append(it) }
-            append("; Path=").append(cookie.path ?: "/")
-            if (cookie.maxAge >= 0) append("; Max-Age=").append(cookie.maxAge)
-            if (cookie.secure) append("; Secure")
-            if (cookie.isHttpOnly) append("; HttpOnly")
-        }
+/**
+ * This side's guard on a session's page messages, mirroring the engine's budget
+ * (`JsExecutor.m`): at most [MAX_MESSAGES] messages or [MAX_BYTES] of them in
+ * hand at once; a single message always fits when none is in hand.
+ */
+internal class MessageBudget {
+    private var messages = 0
+    private var bytes = 0L
 
-    /** RFC 6265 §5.1.3: whether a cookie for [domain] is sent to [host]. */
-    fun domainMatches(
-        host: String,
-        domain: String,
-    ): Boolean = host == domain || host.endsWith(".$domain")
+    @Synchronized
+    fun take(cost: Long): Boolean {
+        if (messages > 0 && (messages >= MAX_MESSAGES || bytes + cost > MAX_BYTES)) return false
+        messages++
+        bytes += cost
+        return true
+    }
+
+    @Synchronized
+    fun release(cost: Long) {
+        messages = maxOf(0, messages - 1)
+        bytes = maxOf(0L, bytes - cost)
+    }
+
+    @Synchronized
+    fun inHand(): Pair<Int, Long> = messages to bytes
+
+    companion object {
+        const val MAX_MESSAGES = 256
+        const val MAX_BYTES = 4L shl 20
+    }
 }
 
 /** Android's allowed-origin-rule syntax: `*`, or `scheme://host[:port]` with an optional `*.` host prefix. */

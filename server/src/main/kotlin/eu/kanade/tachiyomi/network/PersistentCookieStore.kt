@@ -62,8 +62,8 @@ class PersistentCookieStore(
             // Append or replace the cookies for this domain.
             for (cookie in cookies) {
                 val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
-                // Find a cookie with the same name. Replace it if found, otherwise add a new one.
-                val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name }
+                // Komu: replace the cookie with the same identity (RFC 6265 §5.3: name, domain, path).
+                val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
                 if (pos == -1) {
                     cookiesForDomain.add(cookie)
                 } else {
@@ -100,13 +100,48 @@ class PersistentCookieStore(
         }
     }
 
+    // Komu (ADR-0086 Review 1): RFC 6265 §5.4 — a host-only cookie goes to its own
+    // host only, a domain cookie to its domain and subdomains (never to a host that
+    // merely ends with the same letters), on a matching path, Secure over HTTPS only,
+    // and never after it expired.
     fun get(url: HttpUrl): List<Cookie> =
         lock.withLock {
-            cookieMap.entries
-                .filter {
-                    url.host.endsWith(it.key)
-                }.flatMap { it.value }
+            val now = System.currentTimeMillis()
+            cookieMap.values.flatMap { cookies -> cookies.filter { it.expiresAt > now && it.matches(url) } }
         }
+
+    /** Komu: every stored, unexpired cookie (the WebView cookie bridge). */
+    fun all(): List<Cookie> =
+        lock.withLock {
+            val now = System.currentTimeMillis()
+            cookieMap.values.flatMap { cookies -> cookies.filter { it.expiresAt > now } }
+        }
+
+    /** Komu: stores [cookie], replacing the one with the same identity (name, domain, path). */
+    fun put(cookie: Cookie) {
+        lock.withLock {
+            val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
+            val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
+            if (pos == -1) cookiesForDomain.add(cookie) else cookiesForDomain[pos] = cookie
+            cookieMap[cookie.domain] = cookiesForDomain
+            saveToDisk(setOf(cookie.domain))
+        }
+    }
+
+    /** Komu: removes the cookie with this identity. */
+    fun remove(
+        name: String,
+        domain: String,
+        path: String,
+    ) {
+        lock.withLock {
+            val cookies = cookieMap[domain] ?: return@withLock
+            val kept = cookies.filterNot { it.name == name && it.path == path }
+            if (kept.size == cookies.size) return@withLock
+            cookieMap[domain] = kept
+            saveToDisk(setOf(domain))
+        }
+    }
 
     override fun add(
         uri: URI?,
@@ -115,8 +150,8 @@ class PersistentCookieStore(
         lock.withLock {
             val cookie = cookie.toCookie(uri?.host) ?: return@withLock
             val cookiesForDomain = cookieMap[cookie.domain].orEmpty().toMutableList()
-            // Find a cookie with the same name. Replace it if found, otherwise add a new one.
-            val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name }
+            // Komu: replace the cookie with the same identity (RFC 6265 §5.3: name, domain, path).
+            val pos = cookiesForDomain.indexOfFirst { it.name == cookie.name && it.path == cookie.path }
             if (pos == -1) {
                 cookiesForDomain.add(cookie)
             } else {
@@ -215,8 +250,10 @@ class PersistentCookieStore(
                 if (isHttpOnly) {
                     it.httpOnly()
                 }
-                if (domain != null && !domain.startsWith('.')) {
-                    it.hostOnlyDomain(domain.removePrefix("."))
+                // Komu: without a Domain the cookie is host-only (RFC 6265 §5.3 step 6),
+                // as java.net.CookieManager and Android's CookieManager store it.
+                if (domain == null || !domain.startsWith('.')) {
+                    it.hostOnlyDomain((domain ?: urlDomain!!).removePrefix("."))
                 }
             }.build()
     }
