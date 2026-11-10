@@ -208,111 +208,194 @@ class MemoryWebViewCookieJar(
 }
 
 /**
- * One session's cookie reconciliation with the server's jar.
+ * Komu ADR-0087 Recheck 2: one cookie identity's three-way merge, a pure function.
  *
- * The session's store starts empty (its own non-persistent data store). Before each
- * load the jar's cookies for the load's host are copied in ([preload]). The engine
- * reports the session's full cookie set together with its admitted target hosts
- * whenever either changes ([reconcile]); the hosts are admitted before any of
- * their traffic, so a redirect's target is a target host before its cookies arrive.
+ * - [base]: the record last known to be present in BOTH the jar and the session's
+ *   store (null: none is known to be in both);
+ * - [server]: the jar's record now (null: absent), at [serverGeneration];
+ * - [view]: the session's record in a snapshot (null: absent).
+ *
+ * Rules (records compared in full, as WebKit stores them):
+ * 1. view = server: converged; base := server.
+ * 2. server = base, view ≠ server: the page changed it. The jar takes the page's
+ *    record — a deletion only here, when the store lacks it and the jar still
+ *    holds exactly the base — by compare-and-set against [serverGeneration];
+ *    base := view once that succeeds.
+ * 3. otherwise (the server changed since base, or both did): the server wins; its
+ *    record (or its absence) is pushed into the store; base does not move until a
+ *    snapshot shows the store holding it.
+ */
+internal object CookieMerge {
+    sealed interface JarAction {
+        data object None : JarAction
+
+        /** Store [cookie] (null: remove) if the identity is still at [expected]. */
+        data class CompareAndSet(
+            val cookie: WebCookie?,
+            val expected: Long,
+        ) : JarAction
+    }
+
+    sealed interface ViewAction {
+        data object None : ViewAction
+
+        data class Set(
+            val cookie: WebCookie,
+        ) : ViewAction
+
+        data object Delete : ViewAction
+    }
+
+    data class Outcome(
+        val jar: JarAction,
+        val view: ViewAction,
+        /** The base after the actions succeed. */
+        val base: WebCookie?,
+    )
+
+    /** Equal as WebKit stores them: it represents SameSite Lax and Strict only, so None reads back as unspecified. */
+    fun same(
+        a: WebCookie?,
+        b: WebCookie?,
+    ): Boolean {
+        if (a == null || b == null) return a == null && b == null
+        return a == b || a.copy(sameSite = a.sameSite.takeUnless { it == "None" }) == b.copy(sameSite = b.sameSite.takeUnless { it == "None" })
+    }
+
+    fun reduce(
+        base: WebCookie?,
+        server: WebCookie?,
+        serverGeneration: Long,
+        view: WebCookie?,
+    ): Outcome =
+        when {
+            same(view, server) -> Outcome(JarAction.None, ViewAction.None, server)
+            same(server, base) -> Outcome(JarAction.CompareAndSet(view, serverGeneration), ViewAction.None, view)
+            else -> Outcome(JarAction.None, server?.let { ViewAction.Set(it) } ?: ViewAction.Delete, base)
+        }
+}
+
+/** Cookies for a session's store: records to set and identities to delete, in that order. */
+data class CookiePush(
+    val set: List<WebCookie>,
+    val delete: List<WebCookie>,
+) {
+    fun isEmpty(): Boolean = set.isEmpty() && delete.isEmpty()
+
+    companion object {
+        val NONE = CookiePush(emptyList(), emptyList())
+    }
+}
+
+/**
+ * One session's cookie reconciliation with the server's jar (Komu ADR-0087 Recheck 2).
  *
  * Target hosts: hosts the extension loaded, a data load's base host, and hosts the
- * main frame navigated to (redirects and `window.open` included). Sub-frame hosts
- * are not targets, so a third-party frame's cookies never enter the jar.
+ * main frame navigated to (redirects and `window.open` included), reported by the
+ * engine before their traffic. Sub-frame hosts are not targets, so a third-party
+ * frame's cookies never enter the jar. Cookies outside the targets' scope are never
+ * written or deleted.
  *
- * The reconciliation is a set difference against [baseline] — the cookies, within
- * the targets' scope, that the session's store is known to hold (preloaded or
- * reported), each with the jar generation it was seen at:
- * - a cookie that is new or changed is stored in the jar (host-only stays host-only,
- *   every attribute kept);
- * - a cookie that disappeared or expired is removed from the jar;
- * both only by compare-and-set against the generation the session saw (for a new
- * identity: unwritten since the session last synchronised). A record a server
- * response wrote meanwhile (a rotated token) is never overwritten or deleted by
- * an older report, whatever its value. A report taken before a preload reached
- * the store does not judge that preload's records.
- * Cookies outside the scope are never written or deleted.
+ * Every identity in scope is merged by [CookieMerge.reduce] from its base (the
+ * record last seen in both the jar and the session's store), the jar's record and
+ * the snapshot's. Jar writes are compare-and-set against the generation read in
+ * the same pass, so a server response that lands meanwhile wins; a refused write
+ * leaves the base where it was. Server changes are pushed into the store
+ * ([CookiePush], before a load and after a snapshot), so the two converge; the base
+ * only moves when a snapshot shows the store holding the record.
+ *
+ * The engine applies preloads, pushes and snapshots in one serial order per session,
+ * so a snapshot shows every push submitted before it.
  */
 internal class CookieSync(
     private val jar: () -> WebViewCookieJar?,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    /** What the session's store is known to hold for one identity: the record, its jar generation, the preload that put it there (0: a report). */
-    private data class Seen(
-        val cookie: WebCookie,
-        val generation: Long,
-        val preload: Long,
-    )
-
     private val hosts = LinkedHashSet<String>()
-    private val baseline = HashMap<WebCookie.Key, Seen>()
+    private val base = HashMap<WebCookie.Key, WebCookie>()
     private var nextPreload = 0L
-
-    /** The jar's epoch when this session last synchronised: a record newer than it was written by someone else since. */
-    private var syncedAt = 0L
 
     @Synchronized
     fun targetHosts(): Set<String> = hosts.toSet()
 
+    /** Bases on record (tests). */
+    @Synchronized
+    internal fun baseFor(key: WebCookie.Key): WebCookie? = base[key]
+
     /**
-     * The jar's cookies for [host], copied into the session before a load of it;
-     * [host] becomes a target. Returns the preload's sequence number (the engine
-     * reports it back once those cookies are in the session's store) and the cookies.
+     * Before a load of [host], which becomes a target: the server's changes since the
+     * base for that host's cookies, to push into the store (records the store already
+     * holds are not rewritten, so an unreported page change is not lost). Returns the
+     * preload's sequence number and the push.
      */
     @Synchronized
-    fun preload(host: String?): Pair<Long, List<WebCookie>> {
+    fun preload(host: String?): Pair<Long, CookiePush> {
         val sequence = ++nextPreload
         val jar = jar()
-        if (host.isNullOrEmpty() || jar == null) return sequence to emptyList()
-        hosts += host.lowercase()
-        if (baseline.isEmpty()) syncedAt = jar.epoch()
-        val cookies = jar.cookiesFor(host)
-        for ((cookie, generation) in cookies) baseline[cookie.key] = Seen(cookie, generation, sequence)
-        return sequence to cookies.map { it.cookie }
+        if (host.isNullOrEmpty() || jar == null) return sequence to CookiePush.NONE
+        val target = host.lowercase()
+        hosts += target
+        val now = clock()
+        val server = jar.cookiesFor(target).filter { !it.cookie.isExpired(now) }.associateBy { it.cookie.key }
+        val set = server.values.map { it.cookie }.filter { !CookieMerge.same(base[it.key], it) }
+        val delete = base.values.filter { it.appliesTo(target) && it.key !in server }
+        return sequence to CookiePush(set, delete)
     }
 
     /**
-     * A report of the session's full cookie set. [preloadsDone]: the last preload the
-     * store holds; records of a later preload are not judged by this (older) report.
+     * A snapshot of the session's full cookie set, taken after every push submitted
+     * before it. Applies the page's changes to the jar and returns the server's changes
+     * to push into the store.
      */
     @Synchronized
     fun reconcile(
         admittedHosts: Collection<String>,
         snapshot: List<WebCookie>,
-        preloadsDone: Long = Long.MAX_VALUE,
-    ) {
+        @Suppress("UNUSED_PARAMETER") preloadsDone: Long = Long.MAX_VALUE,
+    ): CookiePush {
         admittedHosts.forEach { if (it.isNotEmpty()) hosts += it.lowercase() }
-        val jar = jar() ?: return
+        val jar = jar() ?: return CookiePush.NONE
         val now = clock()
-        val present = HashMap<WebCookie.Key, WebCookie>()
-        for (cookie in snapshot) {
-            if (cookie.isExpired(now) || !inScope(cookie)) continue
-            present[cookie.key] = cookie
-            val seen = baseline[cookie.key]
-            if (seen != null && (seen.preload > preloadsDone || engineEquivalent(seen.cookie, cookie))) continue
-            // Unchanged in the jar since the session saw it: the page's change applies.
-            // Otherwise a server response wrote it meanwhile and wins.
-            val expected =
-                seen?.generation ?: jar.generation(cookie.key).takeIf { it <= syncedAt }
-            val written = expected?.let { jar.compareAndSet(cookie.key, it, cookie) }
-            baseline[cookie.key] = Seen(cookie, written ?: jar.generation(cookie.key), 0)
+        val view = snapshot.filter { !it.isExpired(now) && inScope(it) }.associateBy { it.key }
+        val server = HashMap<WebCookie.Key, VersionedCookie>()
+        for (host in hosts) {
+            for (record in jar.cookiesFor(host)) if (!record.cookie.isExpired(now)) server[record.cookie.key] = record
         }
-        for (key in baseline.keys.filter { it !in present }) {
-            val seen = baseline.getValue(key)
-            if (seen.preload > preloadsDone) continue // its preload has not reached the store yet
-            baseline.remove(key)
-            jar.compareAndSet(key, seen.generation, null)
+        val set = ArrayList<WebCookie>()
+        val delete = ArrayList<WebCookie>()
+        for (key in (base.keys + view.keys + server.keys).toSet()) {
+            var serverRecord = server[key]
+            var outcome = merge(key, serverRecord, view[key], jar)
+            if (outcome.jar is CookieMerge.JarAction.CompareAndSet) {
+                val action = outcome.jar as CookieMerge.JarAction.CompareAndSet
+                if (jar.compareAndSet(key, action.expected, action.cookie) == null) {
+                    // A server write landed meanwhile: it wins. Merge again against it.
+                    serverRecord = jar.cookiesFor(key.domain).firstOrNull { it.cookie.key == key && !it.cookie.isExpired(now) }
+                    outcome = merge(key, serverRecord, view[key], jar)
+                    if (outcome.jar !is CookieMerge.JarAction.None) {
+                        // Changed again while we looked: leave everything for the next snapshot.
+                        continue
+                    }
+                }
+            }
+            when (val action = outcome.view) {
+                is CookieMerge.ViewAction.Set -> set += action.cookie
+                CookieMerge.ViewAction.Delete -> view[key]?.let { delete += it }
+                CookieMerge.ViewAction.None -> Unit
+            }
+            if (outcome.base == null) base.remove(key) else base[key] = outcome.base
         }
-        syncedAt = jar.epoch()
+        return CookiePush(set, delete)
     }
 
-    private fun inScope(cookie: WebCookie): Boolean = hosts.any { cookie.appliesTo(it) }
+    private fun merge(
+        key: WebCookie.Key,
+        server: VersionedCookie?,
+        view: WebCookie?,
+        jar: WebViewCookieJar,
+    ): CookieMerge.Outcome = CookieMerge.reduce(base[key], server?.cookie, server?.generation ?: jar.generation(key), view)
 
-    /** Equal as WebKit stores them: it represents SameSite Lax and Strict only, so None reads back as unspecified. */
-    private fun engineEquivalent(
-        a: WebCookie,
-        b: WebCookie,
-    ): Boolean = a == b || a.copy(sameSite = a.sameSite.takeUnless { it == "None" }) == b.copy(sameSite = b.sameSite.takeUnless { it == "None" })
+    private fun inScope(cookie: WebCookie): Boolean = hosts.any { cookie.appliesTo(it) }
 }
 
 /** The wire form of cookies between the provider and the engine (a JSON array of objects). */

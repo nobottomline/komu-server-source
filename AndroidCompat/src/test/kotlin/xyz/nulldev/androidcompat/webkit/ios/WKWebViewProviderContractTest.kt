@@ -515,6 +515,9 @@ class WKWebViewProviderContractTest {
         val handle = handleOf(view)
         onMain { view.loadUrl("https://a.test/start") }
         assertEquals("1", engine.await(JsExecutor.OP_LOAD_URL).fields[7], "the load carries its preload's sequence")
+        // Recheck 2: the engine's snapshot after the preload shows the store holding `gone` (its base).
+        val gone = WebCookie.canonical("gone", "1", "a.test", true, "/", false, false, null, null)
+        engine.emit(handle, JsExecutor.EV_COOKIES, 0, "[\"a.test\"]", CookieWire.encode(listOf(gone)), "1")
         val snapshot =
             listOf(
                 WebCookie.canonical("fromB", "1", "b.test", true, "/", false, true, "Lax", null),
@@ -526,6 +529,13 @@ class WKWebViewProviderContractTest {
         while (jar.all().map { it.name } != listOf("fromB") && System.currentTimeMillis() < deadline) Thread.sleep(20)
         assertEquals(listOf("fromB"), jar.all().map { it.name })
         assertEquals(true, jar.all().single().httpOnly)
+
+        // Recheck 2: a server change the store lacks is pushed back into it (OP_SET_COOKIES).
+        jar.put(WebCookie.canonical("srv", "2", "b.test", true, "/", false, false, null, null))
+        engine.emit(handle, JsExecutor.EV_COOKIES, 0, "[\"a.test\",\"b.test\"]", CookieWire.encode(snapshot), "1")
+        val push = engine.await(JsExecutor.OP_SET_COOKIES)
+        assertEquals(listOf("srv"), CookieWire.decode(push.fields[0]).map { it.name })
+        assertEquals(emptyList(), CookieWire.decode(push.fields[1]))
     }
 
     /**

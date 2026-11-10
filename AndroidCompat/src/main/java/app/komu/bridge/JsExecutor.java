@@ -32,7 +32,7 @@ package app.komu.bridge;
  * {@code xyz.nulldev.androidcompat.webkit.ios.WebEngineFrames}.
  */
 public final class JsExecutor {
-    public static final int ABI_VERSION = 6;
+    public static final int ABI_VERSION = 7;
 
     // availability()
     public static final int AVAILABLE = 0;
@@ -64,6 +64,11 @@ public final class JsExecutor {
     public static final int OP_BIND = 15;             // url ("about:blank" or a data load's base for a hostless one)
     /** The JVM finished with a bridge call or web message: returns its cost to the session's budget. */
     public static final int OP_ACK = 16;              // cost
+    /**
+     * Server changes for the session's cookie store (Recheck 2): set, then delete, in the
+     * session's single cookie order (after every earlier preload, before every later snapshot).
+     */
+    public static final int OP_SET_COOKIES = 17;      // cookies to set (JSON array), cookies to delete (JSON array)
 
     // nextEvents() kinds
     public static final int EV_PAGE_STARTED = 1;   // url
@@ -73,7 +78,7 @@ public final class JsExecutor {
     public static final int EV_BRIDGE_CALL = 5;    // interface, method, arguments (JSON array), cost
     public static final int EV_WEB_MESSAGE = 6;    // id = reply id; listener, message, origin, isMainFrame, cost
     public static final int EV_REQUEST = 7;        // id = decision id (0: observation); url, method, isMainFrame, isRedirect, headers
-    public static final int EV_COOKIES = 8;        // admitted target hosts (JSON array), the session's cookies (JSON array), last preload in the store
+    public static final int EV_COOKIES = 8;        // admitted target hosts (JSON array), the session's cookies (JSON array), last preload applied before the snapshot
     public static final int EV_PROCESS_GONE = 9;   // didCrash, reason
     public static final int EV_MESSAGES_DROPPED = 10; // count: page messages dropped over the session's budget
 

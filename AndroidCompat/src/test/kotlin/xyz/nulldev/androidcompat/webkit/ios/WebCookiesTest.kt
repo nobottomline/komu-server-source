@@ -67,14 +67,14 @@ class WebCookiesTest {
         jar.put(cookie("pref", "site.test", hostOnly = false))
         val sync = CookieSync({ jar }, { now })
 
-        val forSite = roundTrip(sync.preload("site.test").second).associateBy { it.name }
+        val forSite = roundTrip(sync.preload("site.test").second.set).associateBy { it.name }
         assertEquals(true, forSite["sid"]?.hostOnly, "host-only: no Domain attribute added")
         assertEquals(false, forSite["pref"]?.hostOnly)
         assertFalse(forSite.getValue("sid").appliesTo("ads.site.test"), "the engine would not send it to a subdomain")
 
-        val forSubdomain = roundTrip(CookieSync({ jar }, { now }).preload("ads.site.test").second).map { it.name }
+        val forSubdomain = roundTrip(CookieSync({ jar }, { now }).preload("ads.site.test").second.set).map { it.name }
         assertEquals(listOf("pref"), forSubdomain, "a host-only cookie is not copied for a subdomain; a domain cookie is")
-        assertEquals(emptyList(), CookieSync({ jar }, { now }).preload("evilsite.test").second, "a mere suffix is not a subdomain")
+        assertEquals(emptyList(), CookieSync({ jar }, { now }).preload("evilsite.test").second.set, "a mere suffix is not a subdomain")
 
         // Red control: 2.4.2457 wrote Domain for every cookie.
         val legacy = Legacy(jar).preload("site.test").single { it.name == "sid" }
@@ -114,7 +114,8 @@ class WebCookiesTest {
         jar.put(cookie("gone", "site.test"))
         jar.put(cookie("kept", "site.test"))
         val sync = CookieSync({ jar }, { now })
-        val preloaded = sync.preload("site.test").second
+        val preloaded = sync.preload("site.test").second.set
+        sync.reconcile(listOf("site.test"), preloaded) // the engine's snapshot after the preload: both hold them
         sync.reconcile(listOf("site.test"), preloaded.filter { it.name != "gone" })
         assertNull(jar.find(cookie("gone", "site.test").key), "deleted by the page: deleted in the jar")
         assertNotNull(jar.find(cookie("kept", "site.test").key))
@@ -132,7 +133,7 @@ class WebCookiesTest {
         val jar = MemoryWebViewCookieJar { now }
         jar.put(cookie("short", "site.test", expiresAt = now + day))
         val sync = CookieSync({ jar }, { now })
-        sync.preload("site.test").second
+        sync.reconcile(listOf("site.test"), sync.preload("site.test").second.set)
         // The page set it again with an Expires in the past (the engine may still list it).
         sync.reconcile(listOf("site.test"), listOf(cookie("short", "site.test", expiresAt = now - 1000)))
         assertNull(jar.find(cookie("short", "site.test").key))
@@ -211,7 +212,7 @@ class WebCookiesTest {
         val jar = MemoryWebViewCookieJar { now }
         jar.put(cookie("cf", "site.test", sameSite = "None"))
         val sync = CookieSync({ jar }, { now })
-        val preloaded = sync.preload("site.test").second
+        val preloaded = sync.preload("site.test").second.set
         // WebKit stores only Lax and Strict: it reports None as unspecified.
         sync.reconcile(listOf("site.test"), preloaded.map { it.copy(sameSite = null) })
         assertEquals("None", jar.find(cookie("cf", "site.test").key)?.sameSite, "no churn, the jar's attribute kept")
@@ -220,7 +221,7 @@ class WebCookiesTest {
     @Test
     fun withoutAJarNothingIsExchanged() {
         val sync = CookieSync({ null }, { now })
-        assertEquals(emptyList(), sync.preload("site.test").second)
+        assertEquals(CookiePush.NONE, sync.preload("site.test").second)
         sync.reconcile(listOf("site.test"), listOf(cookie("a", "site.test")))
     }
 
@@ -237,13 +238,8 @@ class WebCookiesTest {
         assertNotNull(jar.find(cookie("auth", "site.test").key), "the server cookie survives")
         sync.reconcile(listOf("site.test"), listOf(cookie("auth", "site.test")), preloadsDone = sequence)
         assertNotNull(jar.find(cookie("auth", "site.test").key))
-
-        // Red control: the same report taken as covering the preload (no sequence) deletes it.
-        val red = MemoryWebViewCookieJar { now }.apply { put(cookie("auth", "site.test")) }
-        val unordered = CookieSync({ red }, { now })
-        unordered.preload("site.test")
-        unordered.reconcile(listOf("site.test"), emptyList())
-        assertNull(red.find(cookie("auth", "site.test").key), "red control: deleted without the preload sequence")
+        // Recheck 2: the store never confirmed holding it before the empty report, so no
+        // report order can delete it (the base had not reached it).
     }
 
     @Test
@@ -258,8 +254,9 @@ class WebCookiesTest {
         sync.reconcile(listOf("site.test"), listOf(cookie("token", "site.test", value = "v2"), cookie("fresh", "site.test", value = "page")))
         assertEquals("v3", jar.find(cookie("token", "site.test").key)?.value, "the rotated token wins")
         assertEquals("server", jar.find(cookie("fresh", "site.test").key)?.value)
-        // A later change by the page, after it saw the conflict, applies.
-        sync.reconcile(listOf("site.test"), listOf(cookie("token", "site.test", value = "v4")))
+        // Recheck 2: once the store holds the server's v3 (pushed back), a later change by the page applies.
+        sync.reconcile(listOf("site.test"), listOf(cookie("token", "site.test", value = "v3"), cookie("fresh", "site.test", value = "server")))
+        sync.reconcile(listOf("site.test"), listOf(cookie("token", "site.test", value = "v4"), cookie("fresh", "site.test", value = "server")))
         assertEquals("v4", jar.find(cookie("token", "site.test").key)?.value)
 
         // Red control: an unconditional write (the Review 1 model) puts v2 back over v3.

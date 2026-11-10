@@ -243,6 +243,7 @@ class WKWebViewProvider(
         }
         beginLoad(url)
         val (preload, preloaded) = cookies.preload(hostOf(url))
+        pushDeletions(preloaded)
         submit(
             JsExecutor.OP_LOAD_URL,
             fields =
@@ -250,7 +251,7 @@ class WKWebViewProvider(
                     url,
                     headers.entries.joinToString("\n") { "${it.key}: ${it.value}" },
                     sessionUserAgent(),
-                    CookieWire.encode(preloaded),
+                    CookieWire.encode(preloaded.set),
                     flags(),
                     method,
                     bodyBase64,
@@ -275,6 +276,7 @@ class WKWebViewProvider(
         val base = baseUrl ?: "about:blank"
         beginLoad(base)
         val (preload, preloaded) = cookies.preload(hostOf(base))
+        pushDeletions(preloaded)
         submit(
             JsExecutor.OP_LOAD_DATA,
             fields =
@@ -284,12 +286,17 @@ class WKWebViewProvider(
                     mimeType ?: "text/html",
                     encoding ?: "",
                     sessionUserAgent(),
-                    CookieWire.encode(preloaded),
+                    CookieWire.encode(preloaded.set),
                     flags(),
                     historyUrl ?: "",
                     preload.toString(),
                 ),
         )
+    }
+
+    /** Server deletions since the base go to the store ahead of the load's preload. */
+    private fun pushDeletions(push: CookiePush) {
+        if (push.delete.isNotEmpty()) submit(JsExecutor.OP_SET_COOKIES, fields = listOf("[]", CookieWire.encode(push.delete)))
     }
 
     private fun beginLoad(url: String) {
@@ -549,11 +556,16 @@ class WKWebViewProvider(
             }
 
             JsExecutor.EV_COOKIES -> {
-                cookies.reconcile(
-                    CookieWire.decodeHosts(event.field(0)),
-                    CookieWire.decode(event.field(1)),
-                    event.field(2).toLongOrNull() ?: 0L,
-                )
+                val push =
+                    cookies.reconcile(
+                        CookieWire.decodeHosts(event.field(0)),
+                        CookieWire.decode(event.field(1)),
+                        event.field(2).toLongOrNull() ?: 0L,
+                    )
+                // Recheck 2: the server's changes go back into the store, so the two converge.
+                if (!push.isEmpty()) {
+                    submit(JsExecutor.OP_SET_COOKIES, fields = listOf(CookieWire.encode(push.set), CookieWire.encode(push.delete)))
+                }
             }
 
             JsExecutor.EV_MESSAGES_DROPPED -> {
