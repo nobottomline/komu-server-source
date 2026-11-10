@@ -277,7 +277,7 @@ class WebCookiesTest {
 
         // Red control: the Review 1 rule compared values only and removed it.
         val red = MemoryWebViewCookieJar { now }.apply { put(cookie("sid", "site.test", value = "same", expiresAt = now + 30 * day)) }
-        if (red.find(cookie("sid", "site.test").key)?.value == "same") red.compareAndSet(cookie("sid", "site.test").key, red.generation(cookie("sid", "site.test").key), null)
+        if (red.find(cookie("sid", "site.test").key)?.value == "same") red.compareAndSet(cookie("sid", "site.test").key, red.read(cookie("sid", "site.test").key), null)
         assertNull(red.find(cookie("sid", "site.test").key), "red control: value-only comparison deletes the renewed record")
     }
 }

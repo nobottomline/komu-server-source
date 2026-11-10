@@ -21,9 +21,11 @@ package app.komu.bridge;
  *       observed requests, cookies, process loss) is an event in one native queue
  *       that a single JVM thread drains with {@link #nextEvents}. The iOS main thread
  *       only appends to that queue and never calls into the JVM.</li>
- *   <li>Page messages (bridge calls, web messages) are credit-bounded per session:
- *       each carries its cost, the JVM returns it with {@link #OP_ACK} once it has
- *       handled the message, and the engine drops messages over the session's
+ *   <li>Page messages — every script message, whatever its name: bridge calls, web
+ *       messages and request observations (ABI 8, Recheck 3) — are credit-bounded per
+ *       session: the engine admits each against the session's budget before encoding
+ *       or holding it, each carries its cost, the JVM returns it with {@link #OP_ACK}
+ *       once it has handled the message, and the engine drops messages over the
  *       budget (reported as {@link #EV_MESSAGES_DROPPED}; sustained flooding ends
  *       the session). Neither side holds more than the budget.</li>
  * </ul>
@@ -32,7 +34,7 @@ package app.komu.bridge;
  * {@code xyz.nulldev.androidcompat.webkit.ios.WebEngineFrames}.
  */
 public final class JsExecutor {
-    public static final int ABI_VERSION = 7;
+    public static final int ABI_VERSION = 8;
 
     // availability()
     public static final int AVAILABLE = 0;
@@ -62,7 +64,7 @@ public final class JsExecutor {
     public static final int OP_RELOAD = 14;
     /** A load the session will run once it has a slot: admitted (and bound, ADR-0063) now, run later. */
     public static final int OP_BIND = 15;             // url ("about:blank" or a data load's base for a hostless one)
-    /** The JVM finished with a bridge call or web message: returns its cost to the session's budget. */
+    /** The JVM finished with a page message (bridge call, web message, observation): returns its cost to the session's budget. */
     public static final int OP_ACK = 16;              // cost
     /**
      * Server changes for the session's cookie store (Recheck 2): set, then delete, in the
@@ -77,7 +79,7 @@ public final class JsExecutor {
     public static final int EV_EVAL_RESULT = 4;    // id = callback id; JSON
     public static final int EV_BRIDGE_CALL = 5;    // interface, method, arguments (JSON array), cost
     public static final int EV_WEB_MESSAGE = 6;    // id = reply id; listener, message, origin, isMainFrame, cost
-    public static final int EV_REQUEST = 7;        // id = decision id (0: observation); url, method, isMainFrame, isRedirect, headers
+    public static final int EV_REQUEST = 7;        // id = decision id (0: observation); url, method, isMainFrame, isRedirect, headers[, cost: observations only]
     public static final int EV_COOKIES = 8;        // admitted target hosts (JSON array), the session's cookies (JSON array), last preload applied before the snapshot
     public static final int EV_PROCESS_GONE = 9;   // didCrash, reason
     public static final int EV_MESSAGES_DROPPED = 10; // count: page messages dropped over the session's budget

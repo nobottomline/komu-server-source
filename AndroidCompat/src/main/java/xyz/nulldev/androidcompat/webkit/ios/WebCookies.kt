@@ -114,27 +114,45 @@ data class VersionedCookie(
 )
 
 /**
+ * One identity's state in the jar, read atomically (Komu ADR-0087 Recheck 3): its
+ * unexpired record, or null when it is absent, and its generation. Absence is a
+ * versioned state too: a removal bumps the generation and leaves it as a tombstone,
+ * so "absent at g" and "absent at g + 1" differ. Never written: absent at 0.
+ */
+data class JarState(
+    val cookie: WebCookie?,
+    val generation: Long,
+) {
+    fun matches(other: JarState): Boolean = generation == other.generation && (cookie == null) == (other.cookie == null)
+}
+
+/**
  * The server's cookie jar as the WebView sessions see it. Implemented by the server
  * over its persistent jar (`PersistentCookieStore`) and installed in [WebViewCookies].
  *
  * Versioned (Codex recheck 1): every write or removal of an identity bumps its
- * generation, and [compareAndSet] applies a session's change only when the record
- * is still the one the session saw, atomically.
+ * generation. Recheck 3: an identity's record (or absence) and generation are read
+ * together, in one locked call ([read]), and [compareAndSet] takes that whole state
+ * as its expectation; read, compare and write never span two calls.
  */
 interface WebViewCookieJar {
     /** Unexpired cookies the jar would send to [host] (§5.4 domain rule; the engine applies path and Secure per request). */
     fun cookiesFor(host: String): List<VersionedCookie>
 
-    /** The identity's current generation; 0 when it was never written. */
-    fun generation(key: WebCookie.Key): Long
+    /** The identity's state — record or absence, and generation — read atomically. */
+    fun read(key: WebCookie.Key): JarState
 
     /** The latest generation the jar has handed out. */
     fun epoch(): Long
 
-    /** Sets (null: removes) the record when its generation is still [expected]; its new generation, or null when it changed. */
+    /**
+     * Sets (null: removes) the record when the identity is still exactly in the
+     * [expected] state (same generation, present or absent alike), atomically; its new
+     * generation, or null when it changed.
+     */
     fun compareAndSet(
         key: WebCookie.Key,
-        expected: Long,
+        expected: JarState,
         cookie: WebCookie?,
     ): Long?
 }
@@ -177,7 +195,7 @@ class MemoryWebViewCookieJar(
     }
 
     @Synchronized
-    override fun generation(key: WebCookie.Key): Long = generations[key] ?: 0L
+    override fun read(key: WebCookie.Key): JarState = JarState(cookies[key]?.takeIf { !it.isExpired(clock()) }, generations[key] ?: 0L)
 
     @Synchronized
     override fun epoch(): Long = epoch
@@ -185,12 +203,12 @@ class MemoryWebViewCookieJar(
     @Synchronized
     override fun compareAndSet(
         key: WebCookie.Key,
-        expected: Long,
+        expected: JarState,
         cookie: WebCookie?,
     ): Long? {
-        if ((generations[key] ?: 0L) != expected) return null
+        if (!read(key).matches(expected)) return null
         if (cookie == null) cookies.remove(key) else cookies[key] = cookie
-        return (++epoch).also { generations[key] = it }
+        return (++epoch).also { generations[key] = it } // a removal leaves its generation: a tombstone
     }
 
     /** A server write (a response's Set-Cookie). */
@@ -198,6 +216,13 @@ class MemoryWebViewCookieJar(
     fun put(cookie: WebCookie) {
         cookies[cookie.key] = cookie
         generations[cookie.key] = ++epoch
+    }
+
+    /** A server removal (an expiring Set-Cookie): the identity's tombstone generation. */
+    @Synchronized
+    fun remove(key: WebCookie.Key) {
+        cookies.remove(key)
+        generations[key] = ++epoch
     }
 
     @Synchronized
@@ -212,14 +237,15 @@ class MemoryWebViewCookieJar(
  *
  * - [base]: the record last known to be present in BOTH the jar and the session's
  *   store (null: none is known to be in both);
- * - [server]: the jar's record now (null: absent), at [serverGeneration];
+ * - [server]: the jar's state now — its record (null: absent) and generation, read
+ *   together;
  * - [view]: the session's record in a snapshot (null: absent).
  *
  * Rules (records compared in full, as WebKit stores them):
  * 1. view = server: converged; base := server.
  * 2. server = base, view ≠ server: the page changed it. The jar takes the page's
  *    record — a deletion only here, when the store lacks it and the jar still
- *    holds exactly the base — by compare-and-set against [serverGeneration];
+ *    holds exactly the base — by compare-and-set against the state read;
  *    base := view once that succeeds.
  * 3. otherwise (the server changed since base, or both did): the server wins; its
  *    record (or its absence) is pushed into the store; base does not move until a
@@ -229,10 +255,10 @@ internal object CookieMerge {
     sealed interface JarAction {
         data object None : JarAction
 
-        /** Store [cookie] (null: remove) if the identity is still at [expected]. */
+        /** Store [cookie] (null: remove) if the identity is still exactly in the [expected] state. */
         data class CompareAndSet(
             val cookie: WebCookie?,
-            val expected: Long,
+            val expected: JarState,
         ) : JarAction
     }
 
@@ -264,14 +290,13 @@ internal object CookieMerge {
 
     fun reduce(
         base: WebCookie?,
-        server: WebCookie?,
-        serverGeneration: Long,
+        server: JarState,
         view: WebCookie?,
     ): Outcome =
         when {
-            same(view, server) -> Outcome(JarAction.None, ViewAction.None, server)
-            same(server, base) -> Outcome(JarAction.CompareAndSet(view, serverGeneration), ViewAction.None, view)
-            else -> Outcome(JarAction.None, server?.let { ViewAction.Set(it) } ?: ViewAction.Delete, base)
+            same(view, server.cookie) -> Outcome(JarAction.None, ViewAction.None, server.cookie)
+            same(server.cookie, base) -> Outcome(JarAction.CompareAndSet(view, server), ViewAction.None, view)
+            else -> Outcome(JarAction.None, server.cookie?.let { ViewAction.Set(it) } ?: ViewAction.Delete, base)
         }
 }
 
@@ -297,10 +322,12 @@ data class CookiePush(
  * written or deleted.
  *
  * Every identity in scope is merged by [CookieMerge.reduce] from its base (the
- * record last seen in both the jar and the session's store), the jar's record and
- * the snapshot's. Jar writes are compare-and-set against the generation read in
- * the same pass, so a server response that lands meanwhile wins; a refused write
- * leaves the base where it was. Server changes are pushed into the store
+ * record last seen in both the jar and the session's store), the jar's state and
+ * the snapshot's. The jar's state — record or absence, and generation — is read in
+ * one locked call per identity ([WebViewCookieJar.read]; Recheck 3: the record from
+ * the host snapshot and a separately read generation could straddle a server write),
+ * and a jar write is compare-and-set against exactly that state, so a server
+ * response that lands meanwhile wins; a refused write leaves the base where it was. Server changes are pushed into the store
  * ([CookiePush], before a load and after a snapshot), so the two converge; the base
  * only moves when a snapshot shows the store holding the record.
  *
@@ -357,21 +384,21 @@ internal class CookieSync(
         val jar = jar() ?: return CookiePush.NONE
         val now = clock()
         val view = snapshot.filter { !it.isExpired(now) && inScope(it) }.associateBy { it.key }
-        val server = HashMap<WebCookie.Key, VersionedCookie>()
+        // The identities the jar holds for the targets (which keys to merge; their
+        // states are read per identity below, atomically).
+        val serverKeys = HashSet<WebCookie.Key>()
         for (host in hosts) {
-            for (record in jar.cookiesFor(host)) if (!record.cookie.isExpired(now)) server[record.cookie.key] = record
+            for (record in jar.cookiesFor(host)) if (!record.cookie.isExpired(now)) serverKeys += record.cookie.key
         }
         val set = ArrayList<WebCookie>()
         val delete = ArrayList<WebCookie>()
-        for (key in (base.keys + view.keys + server.keys).toSet()) {
-            var serverRecord = server[key]
-            var outcome = merge(key, serverRecord, view[key], jar)
+        for (key in (base.keys + view.keys + serverKeys).toSet()) {
+            var outcome = merge(key, jar.read(key), view[key])
             if (outcome.jar is CookieMerge.JarAction.CompareAndSet) {
                 val action = outcome.jar as CookieMerge.JarAction.CompareAndSet
                 if (jar.compareAndSet(key, action.expected, action.cookie) == null) {
                     // A server write landed meanwhile: it wins. Merge again against it.
-                    serverRecord = jar.cookiesFor(key.domain).firstOrNull { it.cookie.key == key && !it.cookie.isExpired(now) }
-                    outcome = merge(key, serverRecord, view[key], jar)
+                    outcome = merge(key, jar.read(key), view[key])
                     if (outcome.jar !is CookieMerge.JarAction.None) {
                         // Changed again while we looked: leave everything for the next snapshot.
                         continue
@@ -390,10 +417,9 @@ internal class CookieSync(
 
     private fun merge(
         key: WebCookie.Key,
-        server: VersionedCookie?,
+        server: JarState,
         view: WebCookie?,
-        jar: WebViewCookieJar,
-    ): CookieMerge.Outcome = CookieMerge.reduce(base[key], server?.cookie, server?.generation ?: jar.generation(key), view)
+    ): CookieMerge.Outcome = CookieMerge.reduce(base[key], server, view)
 
     private fun inScope(cookie: WebCookie): Boolean = hosts.any { cookie.appliesTo(it) }
 }

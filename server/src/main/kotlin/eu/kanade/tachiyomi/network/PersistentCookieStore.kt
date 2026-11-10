@@ -170,17 +170,34 @@ class PersistentCookieStore(
     fun epoch(): Long = lock.withLock { epoch }
 
     /**
+     * Komu (ADR-0087 Recheck 3): the identity's unexpired cookie (null: absent) and its
+     * generation, read together under [lock]. A removal keeps the identity's generation
+     * (a tombstone), so absence is versioned like a record.
+     */
+    fun read(identity: Identity): Pair<Cookie?, Long> = lock.withLock { readLocked(identity) }
+
+    private fun readLocked(identity: Identity): Pair<Cookie?, Long> {
+        val now = System.currentTimeMillis()
+        val cookie = cookieMap[identity.domain]?.firstOrNull { it.identity == identity && it.expiresAt > now }
+        return cookie to (generations[identity] ?: 0L)
+    }
+
+    /**
      * Komu: atomically sets (or, for null, removes) the cookie with [identity], only
-     * when its generation is still [expected] — nobody wrote or removed it since.
-     * Returns the new generation, or null when the record changed.
+     * when the identity is still in the state the caller read — the same generation,
+     * and present or absent as it was ([expectedPresent]). Read, compare and write
+     * happen under one hold of [lock]. Returns the new generation, or null when the
+     * state changed.
      */
     fun compareAndSet(
         identity: Identity,
+        expectedPresent: Boolean,
         expected: Long,
         cookie: Cookie?,
     ): Long? =
         lock.withLock {
-            if ((generations[identity] ?: 0L) != expected) return@withLock null
+            val (current, generation) = readLocked(identity)
+            if (generation != expected || (current != null) != expectedPresent) return@withLock null
             if (cookie == null) {
                 if (deleteLocked(identity)) saveToDisk(setOf(identity.domain)) else generations[identity] = ++epoch
             } else {

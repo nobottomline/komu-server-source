@@ -16,7 +16,7 @@ waited for it forever on the main looper (reproduced on 2.4.2449).
 |---|---|---|
 | Provider selection, typed failure | `xyz.nulldev.androidcompat.webkit.WebViewProviders`, `WebViewUnavailableException` | Komu |
 | iOS provider | `xyz.nulldev.androidcompat.webkit.ios.WKWebViewProvider` (+ `WKWebViewSessions`, `WebEngine`) | Komu; restores the archived provider of `archive/pre-v2.3-master-20260814` on a new engine protocol |
-| JNI surface | `app.komu.bridge.JsExecutor` (ABI 6) | Komu; native side `Modules/Sources/JNIBridge/JsExecutor.m` in the app |
+| JNI surface | `app.komu.bridge.JsExecutor` (ABI 8) | Komu; native side `Modules/Sources/JNIBridge/JsExecutor.m` in the app |
 | AndroidX WebKit glue | `org.chromium.support_lib_*` | upstream #2357 (`f9fa6628`), plus Komu boundary interfaces and the provider hand-off in `SupportLibWebViewChromiumFactory` |
 | `evaluateJavascript` as JSON | KCEF | upstream #2428 (`f54d716d`), #2517 (`9017f68f`) |
 | CEF marked unavailable on iOS | `ServerSetup` | Komu |
@@ -52,9 +52,16 @@ fork already does for other `android.webkit` classes.
   deletions (expiry included) into the jar for those hosts only. Sub-frame hosts
   never become targets. WebKit stores SameSite Lax and Strict only; None reads
   back as unspecified and is kept in the jar.
+- Cookie versions (Recheck 3): `WebViewCookieJar.read` returns an identity's record
+  or absence with its generation in one locked call (`PersistentCookieStore.read`);
+  removals leave a tombstone generation, so absence is versioned too, and
+  `compareAndSet` takes that whole state as its expectation. `CookieSync` merges
+  each identity against the state read this way, never against a record from the
+  host snapshot plus a generation read later.
 - Page messages (Review 1): credit-bounded per session (256 messages or 4 MiB in
-  the JVM's hands; one message always fits). Each bridge call and web message
-  carries its cost and returns it with `OP_ACK` once handled; refused messages
+  the JVM's hands; one message always fits). Each bridge call, web message and
+  (Recheck 3, ABI 8) request observation carries its cost and returns it with
+  `OP_ACK` once handled — an observation also when no client observes; refused messages
   reach the client as `onReceivedError(ERROR_TOO_MANY_REQUESTS)`; 512 refusals end
   the session (`onRenderProcessGone`).
 - Egress (Review 1, Komu ADR-0063 §6): a session waiting for one of the three

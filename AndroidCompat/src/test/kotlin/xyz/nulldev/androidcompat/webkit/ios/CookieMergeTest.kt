@@ -37,7 +37,7 @@ class CookieMergeTest {
         var combinations = 0
         for (base in values) for (server in values) for (view in values) {
             combinations++
-            val outcome = CookieMerge.reduce(base, server, generation, view)
+            val outcome = CookieMerge.reduce(base, JarState(server, generation), view)
             val case = "base=$base server=$server view=$view"
             when {
                 server == view -> {
@@ -46,7 +46,7 @@ class CookieMergeTest {
                     assertEquals(server, outcome.base, "converged: base is the record both hold; $case")
                 }
                 server == base -> {
-                    assertEquals(CookieMerge.JarAction.CompareAndSet(view, generation), outcome.jar, "the page's change, by CAS; $case")
+                    assertEquals(CookieMerge.JarAction.CompareAndSet(view, JarState(server, generation)), outcome.jar, "the page's change, by CAS; $case")
                     assertEquals(CookieMerge.ViewAction.None, outcome.view, case)
                     assertEquals(view, outcome.base, case)
                 }
@@ -62,7 +62,7 @@ class CookieMergeTest {
             if (action is CookieMerge.JarAction.CompareAndSet && action.cookie == null) {
                 deletions++
                 assertTrue(view == null && server != null && server == base, "deletion only from the base; $case")
-                assertEquals(generation, action.expected)
+                assertEquals(JarState(server, generation), action.expected, "the CAS expects exactly the state read")
             }
             // The jar is written only with the store's own record.
             if (action is CookieMerge.JarAction.CompareAndSet && action.cookie != null) assertEquals(view, action.cookie, case)
@@ -75,7 +75,7 @@ class CookieMergeTest {
     fun sameSiteNoneEqualsUnspecifiedAsWebKitStoresIt() {
         val stored = cookie("a", sameSite = "None")
         val reported = cookie("a")
-        val outcome = CookieMerge.reduce(stored, stored, 3, reported)
+        val outcome = CookieMerge.reduce(stored, JarState(stored, 3), reported)
         assertEquals(CookieMerge.JarAction.None, outcome.jar)
         assertEquals(CookieMerge.ViewAction.None, outcome.view)
     }

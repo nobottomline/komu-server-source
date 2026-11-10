@@ -88,15 +88,40 @@ class PersistentCookieStoreRfcTest : ApplicationTest() {
                 WebCookie.canonical("h", "1", site, true, "/p", true, true, "Strict", expiry),
                 WebCookie.canonical("d", "2", site, false, "/", false, false, "Lax", null),
             )
-        cookies.forEach { assertNotNull(jar.compareAndSet(it.key, jar.generation(it.key), it)) }
+        cookies.forEach { assertNotNull(jar.compareAndSet(it.key, jar.read(it.key), it)) }
         assertEquals(cookies.toSet(), jar.cookiesFor(site).map { it.cookie }.toSet())
         assertEquals(listOf("d"), jar.cookiesFor("ads.$site").map { it.cookie.name })
-        val generation = jar.generation(cookies[0].key)
+        val state = jar.read(cookies[0].key)
         store.put(cookies[0].toOkHttp()!!) // a server write meanwhile
-        assertNull(jar.compareAndSet(cookies[0].key, generation, null), "a changed record is not removed")
-        assertNotNull(jar.compareAndSet(cookies[0].key, jar.generation(cookies[0].key), null))
+        assertNull(jar.compareAndSet(cookies[0].key, state, null), "a changed record is not removed")
+        assertNotNull(jar.compareAndSet(cookies[0].key, jar.read(cookies[0].key), null))
         assertTrue(jar.cookiesFor(site).none { it.cookie.name == "h" })
         cookies.forEach { assertEquals(it, it.toOkHttp()!!.toWebCookie()) }
+    }
+
+    /**
+     * ADR-0087 Recheck 3: an identity's record or absence and its generation are read
+     * together, removal leaves a tombstone generation, and the compare-and-set expects
+     * the whole state (absent at g is neither absent at g + 1 nor present at g).
+     */
+    @Test
+    fun absenceIsAVersionedStateTheCompareAndSetExpects() {
+        val jar = KomuWebViewCookieJar(store)
+        val v1 = WebCookie.canonical("t", "v1", site, true, "/", true, true, "Strict", null)
+        assertEquals(0L, jar.read(v1.key).generation, "never written: absent at 0")
+        assertNotNull(jar.compareAndSet(v1.key, jar.read(v1.key), v1))
+        store.remove("t", site, "/")
+        val absent = jar.read(v1.key)
+        assertNull(absent.cookie)
+        assertTrue(absent.generation > 0, "a removal leaves a tombstone generation")
+        store.put(v1.copy(value = "v3").toOkHttp()!!)
+        assertNull(jar.compareAndSet(v1.key, absent, v1.copy(value = "v2")), "a REST write after the read wins")
+        assertEquals("v3", jar.read(v1.key).cookie?.value)
+        store.remove("t", site, "/")
+        assertNull(jar.compareAndSet(v1.key, absent, v1.copy(value = "v2")), "absent then is not absent now")
+        assertNull(jar.compareAndSet(v1.key, jar.read(v1.key).copy(cookie = v1), null), "absent is not present at the same generation")
+        assertNotNull(jar.compareAndSet(v1.key, jar.read(v1.key), v1.copy(value = "v2")))
+        assertEquals("v2", jar.read(v1.key).cookie?.value)
     }
 
     @Test

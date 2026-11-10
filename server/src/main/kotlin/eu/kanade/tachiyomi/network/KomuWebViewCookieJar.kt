@@ -8,6 +8,7 @@ package eu.kanade.tachiyomi.network
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import okhttp3.Cookie
+import xyz.nulldev.androidcompat.webkit.ios.JarState
 import xyz.nulldev.androidcompat.webkit.ios.VersionedCookie
 import xyz.nulldev.androidcompat.webkit.ios.WebCookie
 import xyz.nulldev.androidcompat.webkit.ios.WebViewCookieJar
@@ -27,17 +28,17 @@ class KomuWebViewCookieJar(
             .map { (cookie, generation) -> VersionedCookie(cookie.toWebCookie(), generation) }
             .filter { it.cookie.appliesTo(host) }
 
-    override fun generation(key: WebCookie.Key): Long = store.generation(key.identity)
+    override fun read(key: WebCookie.Key): JarState = store.read(key.identity).let { (cookie, generation) -> JarState(cookie?.toWebCookie(), generation) }
 
     override fun epoch(): Long = store.epoch()
 
     override fun compareAndSet(
         key: WebCookie.Key,
-        expected: Long,
+        expected: JarState,
         cookie: WebCookie?,
     ): Long? {
         val okhttp = cookie?.let { it.toOkHttp() ?: return null }
-        return store.compareAndSet(key.identity, expected, okhttp)
+        return store.compareAndSet(key.identity, expected.cookie != null, expected.generation, okhttp)
     }
 
     companion object {

@@ -271,6 +271,37 @@ class WKWebViewProviderContractTest {
         assertEquals(listOf("0"), decision.fields, "a response blocks the held navigation")
     }
 
+    /**
+     * ADR-0087 Recheck 3 (ABI 8): an observation is a page message the engine charged
+     * to the session's budget; its cost comes back by OP_ACK once the client has seen
+     * it, and also when no client observes.
+     */
+    @Test
+    fun observationsReturnTheirCostOnceHandled() {
+        val view = newWebView()
+        val handle = handleOf(view)
+        val seen = LinkedBlockingQueue<String>()
+        onMain {
+            view.webViewClient =
+                object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView,
+                        request: WebResourceRequest,
+                    ): WebResourceResponse? {
+                        seen += request.url.toString()
+                        return null
+                    }
+                }
+        }
+        engine.await(JsExecutor.OP_SET_INTERCEPTION)
+        engine.emit(handle, JsExecutor.EV_REQUEST, 0, "https://site.test/api", "GET", "0", "0", "", "4321")
+        assertEquals("https://site.test/api", seen.poll(5, TimeUnit.SECONDS))
+        assertEquals(listOf("4321"), engine.await(JsExecutor.OP_ACK).fields, "the observation's cost returns")
+        onMain { view.webViewClient = WebViewClient() }
+        engine.emit(handle, JsExecutor.EV_REQUEST, 0, "https://site.test/late", "GET", "0", "0", "", "77")
+        assertEquals(listOf("77"), engine.await(JsExecutor.OP_ACK).fields, "returned when nobody observes too")
+    }
+
     @Test
     fun aDefaultClientDoesNotArmInterceptionAndHeldNavigationsAreAllowed() {
         val view = newWebView()

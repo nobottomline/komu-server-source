@@ -608,8 +608,16 @@ class WKWebViewProvider(
 
     private fun intercept(event: WebEngineEvent) {
         val decision = event.id
+        // ABI 8 (Recheck 3): an observation is a page message; its cost comes back by OP_ACK.
+        val cost = if (decision == 0L) event.field(5).toLongOrNull() else null
         if (!interceptionEnabled) {
             if (decision != 0L) submit(JsExecutor.OP_DECIDE, decision, listOf("1"))
+            cost?.let { acknowledge(it, taken = false) }
+            return
+        }
+        if (cost != null && !budget.take(cost)) {
+            reportDropped(1)
+            acknowledge(cost, taken = false)
             return
         }
         val headers =
@@ -633,6 +641,7 @@ class WKWebViewProvider(
                 }
             runCatching { response?.data?.close() }
             if (decision != 0L) submit(JsExecutor.OP_DECIDE, decision, listOf(if (response == null) "1" else "0"))
+            cost?.let { acknowledge(it, taken = true) }
         }
     }
 
