@@ -26,5 +26,11 @@ class WebViewUnavailableException(
 
         /** The engine is shutting down (server stop, memory pressure). */
         ENGINE_STOPPED,
+
+        /**
+         * The host OS is older than iOS 17: no per-session egress proxy, so no WebView
+         * session can have its traffic admitted (Komu ADR-0087, Recheck 1).
+         */
+        REQUIRES_IOS_17,
     }
 }

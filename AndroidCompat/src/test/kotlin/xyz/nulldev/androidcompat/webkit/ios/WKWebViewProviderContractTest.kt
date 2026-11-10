@@ -57,7 +57,12 @@ class WKWebViewProviderContractTest {
 
         override fun availability() = availability
 
-        @Synchronized override fun create(): Long = ++next
+        @Volatile var createCalls = 0
+
+        @Synchronized override fun create(): Long {
+            createCalls += 1
+            return ++next
+        }
 
         override fun destroy(handle: Long) {
             destroyed += handle
@@ -345,6 +350,15 @@ class WKWebViewProviderContractTest {
         val failure = runCatching { newWebView() }.exceptionOrNull()
         val typed = assertIs<WebViewUnavailableException>(failure)
         assertEquals(WebViewUnavailableException.Reason.REQUIRES_FOREGROUND, typed.reason)
+    }
+
+    @Test
+    fun aHostBeforeIOS17FailsFastWithATypedError() {
+        // Komu ADR-0087 Recheck 1: without the per-session egress proxy no session runs.
+        engine.availability = JsExecutor.REQUIRES_IOS_17
+        val typed = assertIs<WebViewUnavailableException>(runCatching { newWebView() }.exceptionOrNull())
+        assertEquals(WebViewUnavailableException.Reason.REQUIRES_IOS_17, typed.reason)
+        assertEquals(0, engine.createCalls, "no native session was created")
     }
 
     @Test

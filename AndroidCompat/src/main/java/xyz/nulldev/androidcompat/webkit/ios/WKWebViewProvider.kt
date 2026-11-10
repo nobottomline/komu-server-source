@@ -126,6 +126,12 @@ class WKWebViewProvider(
         privateBrowsing: Boolean,
     ) {
         val availability = engine.availability()
+        if (availability == JsExecutor.REQUIRES_IOS_17) {
+            throw WebViewUnavailableException(
+                WebViewUnavailableException.Reason.REQUIRES_IOS_17,
+                "extension WebViews need iOS 17 or later",
+            )
+        }
         if (availability == JsExecutor.REQUIRES_FOREGROUND) {
             throw WebViewUnavailableException(
                 WebViewUnavailableException.Reason.REQUIRES_FOREGROUND,

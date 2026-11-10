@@ -16,7 +16,7 @@ waited for it forever on the main looper (reproduced on 2.4.2449).
 |---|---|---|
 | Provider selection, typed failure | `xyz.nulldev.androidcompat.webkit.WebViewProviders`, `WebViewUnavailableException` | Komu |
 | iOS provider | `xyz.nulldev.androidcompat.webkit.ios.WKWebViewProvider` (+ `WKWebViewSessions`, `WebEngine`) | Komu; restores the archived provider of `archive/pre-v2.3-master-20260814` on a new engine protocol |
-| JNI surface | `app.komu.bridge.JsExecutor` (ABI 4) | Komu; native side `Modules/Sources/JNIBridge/JsExecutor.m` in the app |
+| JNI surface | `app.komu.bridge.JsExecutor` (ABI 6) | Komu; native side `Modules/Sources/JNIBridge/JsExecutor.m` in the app |
 | AndroidX WebKit glue | `org.chromium.support_lib_*` | upstream #2357 (`f9fa6628`), plus Komu boundary interfaces and the provider hand-off in `SupportLibWebViewChromiumFactory` |
 | `evaluateJavascript` as JSON | KCEF | upstream #2428 (`f54d716d`), #2517 (`9017f68f`) |
 | CEF marked unavailable on iOS | `ServerSetup` | Komu |
@@ -60,6 +60,13 @@ fork already does for other `android.webkit` classes.
 - Egress (Review 1, Komu ADR-0063 §6): a session waiting for one of the three
   slots declares each load at once (`OP_BIND`); if the engine ends it while it
   waits, it never activates and the slot goes on.
+- Egress (Recheck 1, enforced natively): every connection of a session's WebKit
+  networking — sub-resources, beacons and WebSockets included — goes through the
+  session's authenticated loopback proxy, which admits it like a navigation, so
+  Stop ends sub-resource traffic too; loopback, private and link-local targets
+  and ports other than 80/443 are refused. Before iOS 17 there is no such proxy
+  API: `availability()` reports `REQUIRES_IOS_17` and the WebView constructor
+  throws `WebViewUnavailableException` with that reason.
 - Not supported: touch input into the page (`dispatchTouchEvent`), interactive
   verification (Turnstile), `WebMessagePort`s.
 

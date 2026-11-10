@@ -32,12 +32,17 @@ package app.komu.bridge;
  * {@code xyz.nulldev.androidcompat.webkit.ios.WebEngineFrames}.
  */
 public final class JsExecutor {
-    public static final int ABI_VERSION = 5;
+    public static final int ABI_VERSION = 6;
 
     // availability()
     public static final int AVAILABLE = 0;
     public static final int REQUIRES_FOREGROUND = 1;
     public static final int STOPPED = 2;
+    /**
+     * The host has no per-session egress proxy API (before iOS 17), so it cannot route
+     * a session's sub-resources through its admission chokepoint and runs none.
+     */
+    public static final int REQUIRES_IOS_17 = 3;
 
     // submit() operations
     // Cookies travel as a JSON array of objects (WebCookies.kt `CookieWire`).
@@ -100,7 +105,7 @@ public final class JsExecutor {
 
     public static native int abiVersion();
 
-    /** {@link #AVAILABLE}, {@link #REQUIRES_FOREGROUND} or {@link #STOPPED}; never blocks. */
+    /** {@link #AVAILABLE}, {@link #REQUIRES_FOREGROUND}, {@link #STOPPED} or {@link #REQUIRES_IOS_17}; never blocks. */
     public static native int availability();
 
     /** A new session handle, or 0 when the engine refuses new sessions. Never blocks. */
