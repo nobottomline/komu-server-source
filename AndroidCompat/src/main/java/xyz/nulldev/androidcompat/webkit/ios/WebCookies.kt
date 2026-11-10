@@ -23,7 +23,7 @@ import kotlinx.serialization.json.longOrNull
 private val logger = KotlinLogging.logger {}
 
 /**
- * Komu (ADR-0086 Review 1): one cookie as RFC 6265 §5.3 stores it, exchanged between
+ * Komu (ADR-0087 Review 1): one cookie as RFC 6265 §5.3 stores it, exchanged between
  * the server's jar and a WebView session's own cookie store.
  *
  * - [domain] is canonical: lower case, no leading dot.

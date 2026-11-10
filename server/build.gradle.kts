@@ -210,7 +210,7 @@ tasks {
         isReproducibleFileOrder = true
     }
 
-    // Komu (ADR-0086 Review 1): the WebView contract diagnostic, for DEBUG app builds.
+    // Komu (ADR-0087 Review 1): the WebView contract diagnostic, for DEBUG app builds.
     register<Jar>("webviewQualificationJar") {
         archiveFileName.set("komu-webview-qualification.jar")
         destinationDirectory.set(layout.buildDirectory.dir("qualification"))

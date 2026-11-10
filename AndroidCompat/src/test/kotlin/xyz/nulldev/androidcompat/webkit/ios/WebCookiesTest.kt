@@ -8,7 +8,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * ADR-0086 Review 1: the WebView cookie bridge keeps RFC 6265 semantics between the
+ * ADR-0087 Review 1: the WebView cookie bridge keeps RFC 6265 semantics between the
  * server's jar and a session's store. Each scenario runs against the current model
  * and, as a red control, against [Legacy] — the transfer as 2.4.2457 shipped it
  * (`Domain` always written, only additions and changes exported, filtered by the

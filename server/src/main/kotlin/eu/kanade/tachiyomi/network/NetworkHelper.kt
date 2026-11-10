@@ -45,7 +45,7 @@ class NetworkHelper(
         CookieHandler.setDefault(
             CookieManager(cookieStore, CookiePolicy.ACCEPT_ALL),
         )
-        // Komu (ADR-0086): the iOS WebView sessions exchange cookies with this jar.
+        // Komu (ADR-0087): the iOS WebView sessions exchange cookies with this jar.
         xyz.nulldev.androidcompat.webkit.ios.WebViewCookies
             .install(KomuWebViewCookieJar(cookieStore))
     }

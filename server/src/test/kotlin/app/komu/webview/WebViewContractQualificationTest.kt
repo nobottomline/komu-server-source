@@ -18,7 +18,7 @@ class WebViewContractQualificationTest {
         }
     }
 
-    /** ADR-0086 Review 1: the diagnostic lives outside the main source set, so the server JAR cannot carry it. */
+    /** ADR-0087 Review 1: the diagnostic lives outside the main source set, so the server JAR cannot carry it. */
     @Test
     fun theDiagnosticIsNotInTheMainSourceSet() {
         val location =

@@ -21,12 +21,12 @@ import java.nio.file.Path
 private val logger = KotlinLogging.logger {}
 
 /**
- * Runs the WebView contract stub extension inside the embedded runtime (ADR-0086),
+ * Runs the WebView contract stub extension inside the embedded runtime (ADR-0087),
  * where no REST client holds the session capability: loads the stub JAR through the
  * production extension class loader and runs its scenarios against the iOS WebView
  * provider and the app's native engine.
  *
- * Not part of the server JAR (the `qualification` source set, ADR-0086 Review 1):
+ * Not part of the server JAR (the `qualification` source set, ADR-0087 Review 1):
  * `:server:webviewQualificationJar` packages it, a DEBUG iOS host puts that JAR on
  * the class path (`-KomuServerQualificationJar`) and calls [run] through JNI
  * (`-KomuWebViewContract`). A release build has neither the class nor a caller,

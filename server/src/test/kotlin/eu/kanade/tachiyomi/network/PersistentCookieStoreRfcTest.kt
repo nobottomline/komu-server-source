@@ -16,7 +16,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * ADR-0086 Review 1: the server jar the WebView bridge reconciles into keeps RFC 6265
+ * ADR-0087 Review 1: the server jar the WebView bridge reconciles into keeps RFC 6265
  * semantics — host-only stays host-only (also for OkHttp's own requests), identity is
  * (name, domain, path), expired cookies are never sent, and the WebView side sees
  * every attribute.

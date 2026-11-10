@@ -100,7 +100,7 @@ class PersistentCookieStore(
         }
     }
 
-    // Komu (ADR-0086 Review 1): RFC 6265 §5.4 — a host-only cookie goes to its own
+    // Komu (ADR-0087 Review 1): RFC 6265 §5.4 — a host-only cookie goes to its own
     // host only, a domain cookie to its domain and subdomains (never to a host that
     // merely ends with the same letters), on a matching path, Secure over HTTPS only,
     // and never after it expired.

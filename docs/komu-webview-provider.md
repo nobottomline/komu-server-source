@@ -1,6 +1,6 @@
 # iOS WebView provider (Komu, November 2026)
 
-Decision record: Komu ADR-0086 (`docs/architecture/server/0086-ios-webview-provider.md`
+Decision record: Komu ADR-0087 (`docs/architecture/server/0087-ios-webview-provider.md`
 in the app repository). Research: `docs/problems/tachimanga-server-comparison-2026-11.md`.
 
 ## What it closes

@@ -12,7 +12,7 @@ import xyz.nulldev.androidcompat.webkit.ios.WebCookie
 import xyz.nulldev.androidcompat.webkit.ios.WebViewCookieJar
 
 /**
- * Komu (ADR-0086 Review 1): the server's persistent jar as the iOS WebView sessions
+ * Komu (ADR-0087 Review 1): the server's persistent jar as the iOS WebView sessions
  * see it. OkHttp's [Cookie] already carries every RFC 6265 attribute (host-only,
  * path, Secure, HttpOnly, SameSite, expiry), so nothing is lost either way.
  */
