@@ -205,7 +205,16 @@ tasks {
     register<Jar>("qualificationJar") {
         archiveFileName.set("komu-cover-qualification.jar")
         destinationDirectory.set(layout.buildDirectory.dir("qualification"))
-        from(qualification.output)
+        from(qualification.output) { exclude("app/komu/webview/**") }
+        isPreserveFileTimestamps = false
+        isReproducibleFileOrder = true
+    }
+
+    // Komu (ADR-0086 Review 1): the WebView contract diagnostic, for DEBUG app builds.
+    register<Jar>("webviewQualificationJar") {
+        archiveFileName.set("komu-webview-qualification.jar")
+        destinationDirectory.set(layout.buildDirectory.dir("qualification"))
+        from(qualification.output) { include("app/komu/webview/**") }
         isPreserveFileTimestamps = false
         isReproducibleFileOrder = true
     }
