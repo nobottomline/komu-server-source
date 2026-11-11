@@ -8,6 +8,7 @@ import suwayomi.tachidesk.test.ApplicationTest
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import xyz.nulldev.androidcompat.webkit.CookieManagerImpl
+import xyz.nulldev.androidcompat.webkit.ios.JarState
 import xyz.nulldev.androidcompat.webkit.ios.WebCookie
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -123,6 +124,45 @@ class PersistentCookieStoreRfcTest : ApplicationTest() {
         assertNotNull(jar.compareAndSet(v1.key, jar.read(v1.key), v1.copy(value = "v2")))
         assertEquals("v2", jar.read(v1.key).cookie?.value)
     }
+
+    /**
+     * ADR-0087 Recheck 4 (Codex P2): every removal kept its identity's generation
+     * forever, so a page cycling unique cookie names grew the JVM's memory until
+     * restart. Tombstones are bounded; an evicted one raises the floor, and a CAS
+     * against an expectation the floor passed conflicts (the server wins).
+     */
+    @Test
+    fun tombstonesAreBoundedAndAnEvictedOneConflicts() {
+        val store = PersistentCookieStore(Injekt.get<android.app.Application>(), tombstoneLimit = 4096)
+        val jar = KomuWebViewCookieJar(store)
+        val domain = "tomb$tag.test"
+        fun cookie(name: String) = WebCookie.canonical(name, "v", domain, true, "/", false, false, null, null)
+        val never = cookie("never-written").key
+        val neverRead = jar.read(never)
+        val first = cookie("first")
+        assertNotNull(jar.compareAndSet(first.key, jar.read(first.key), first))
+        store.remove("first", domain, "/")
+        val tombstone = jar.read(first.key)
+        assertNull(tombstone.cookie)
+        // A page creates and deletes 100,000 unique cookies.
+        repeat(100_000) { i ->
+            val c = cookie("c$i")
+            assertNotNull(jar.compareAndSet(c.key, jar.read(c.key), c))
+            assertNotNull(jar.compareAndSet(c.key, jar.read(c.key), null))
+        }
+        val (kept, floor) = store.tombstoneState()
+        assertTrue(kept <= 4096, "tombstones bounded: $kept")
+        assertTrue(floor > tombstone.generation, "evictions raised the floor")
+        assertNull(jar.compareAndSet(first.key, tombstone, cookie("first")), "an evicted tombstone's expectation conflicts")
+        assertNull(jar.compareAndSet(never, neverRead, cookie("never-written")), "so does one read before the floor rose")
+        assertNotNull(jar.compareAndSet(first.key, jar.read(first.key), cookie("first")), "a fresh read succeeds")
+        store.removeAll()
+        assertEquals(0 to jar.read(first.key).generation, store.tombstoneState().first to store.tombstoneState().second,
+            "removeAll clears tombstones and raises the floor to the newest generation")
+        assertNull(jar.compareAndSet(first.key, absentAt(floor), cookie("x")), "an older expectation conflicts after removeAll")
+    }
+
+    private fun absentAt(generation: Long) = JarState(null, generation)
 
     @Test
     fun androidsCookieManagerStoresHostOnlyWithoutDomainAndDomainCookiesWithIt() {

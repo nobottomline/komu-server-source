@@ -58,6 +58,11 @@ fork already does for other `android.webkit` classes.
   `compareAndSet` takes that whole state as its expectation. `CookieSync` merges
   each identity against the state read this way, never against a record from the
   host snapshot plus a generation read later.
+- Tombstones (Recheck 4): `PersistentCookieStore` keeps at most 4,096 of them (oldest
+  evicted first). An evicted tombstone raises a floor generation that every absent
+  identity without a tombstone reports, so an older expectation conflicts and the
+  server wins; `removeAll()` clears the tombstones and moves the floor past every
+  generation handed out. Memory is bounded by the records plus the limit.
 - Page messages (Review 1): credit-bounded per session (256 messages or 4 MiB in
   the JVM's hands; one message always fits). Each bridge call, web message and
   (Recheck 3, ABI 8) request observation carries its cost and returns it with

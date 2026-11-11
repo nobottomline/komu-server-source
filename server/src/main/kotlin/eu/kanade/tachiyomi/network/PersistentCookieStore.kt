@@ -15,6 +15,8 @@ import kotlin.time.Duration.Companion.seconds
 // from TachiWeb-Server
 class PersistentCookieStore(
     context: Context,
+    /** Komu (ADR-0087 Recheck 4): removed identities whose generation is kept. */
+    private val tombstoneLimit: Int = 4096,
 ) : CookieStore {
     private val cookieMap = mutableMapOf<String, List<Cookie>>()
     private val prefs = context.getSharedPreferences("cookie_store", Context.MODE_PRIVATE)
@@ -24,8 +26,34 @@ class PersistentCookieStore(
     // Komu (ADR-0087 Review 1, recheck 1): a generation per cookie identity, bumped
     // on every write or removal under [lock], so the WebView bridge can apply a
     // session's change only when the record is unchanged since the session saw it.
+    // Recheck 4: stored records keep theirs in [generations]; a removal leaves a
+    // tombstone, at most [tombstoneLimit] of them (oldest evicted first). An evicted
+    // tombstone raises [floor], the generation every absent identity without a
+    // tombstone reports, so an expectation older than the floor conflicts (the server
+    // wins) and memory stays bounded by the records plus the limit.
     private val generations = HashMap<Identity, Long>()
+    private val tombstones = LinkedHashMap<Identity, Long>()
+    private var floor = 0L
     private var epoch = 0L
+
+    /** An identity's generation: its record's, its tombstone's, or the floor. Caller holds [lock]. */
+    private fun generationLocked(identity: Identity): Long = generations[identity] ?: tombstones[identity] ?: floor
+
+    /** [identity] is absent from now on, at a new generation. Caller holds [lock]. */
+    private fun tombstoneLocked(identity: Identity) {
+        generations.remove(identity)
+        tombstones.remove(identity)
+        tombstones[identity] = ++epoch
+        while (tombstones.size > tombstoneLimit) {
+            val eldest = tombstones.entries.iterator()
+            val evicted = eldest.next()
+            eldest.remove()
+            floor = maxOf(floor, evicted.value)
+        }
+    }
+
+    /** Tombstones kept and the floor (tests). */
+    internal fun tombstoneState(): Pair<Int, Long> = lock.withLock { tombstones.size to floor }
 
     /** RFC 6265 §5.3 identity — used by every write, the restore and the WebView diff. */
     data class Identity(
@@ -42,6 +70,7 @@ class PersistentCookieStore(
         val pos = cookiesForDomain.indexOfFirst { it.identity == cookie.identity }
         if (pos == -1) cookiesForDomain.add(cookie) else cookiesForDomain[pos] = cookie
         cookieMap[cookie.domain] = cookiesForDomain
+        tombstones.remove(cookie.identity)
         generations[cookie.identity] = ++epoch
     }
 
@@ -51,7 +80,7 @@ class PersistentCookieStore(
         val kept = cookies.filterNot { it.identity == identity }
         if (kept.size == cookies.size) return false
         cookieMap[identity.domain] = kept
-        generations[identity] = ++epoch
+        tombstoneLocked(identity)
         return true
     }
 
@@ -108,8 +137,12 @@ class PersistentCookieStore(
         lock.withLock {
             val wasNotEmpty = cookieMap.isEmpty()
             prefs.edit().clear().apply()
-            cookieMap.values.flatten().forEach { generations[it.identity] = ++epoch }
+            // Recheck 4: no tombstone survives; the floor moves past every generation
+            // handed out, so every earlier expectation conflicts.
             cookieMap.clear()
+            generations.clear()
+            tombstones.clear()
+            floor = ++epoch
             wasNotEmpty
         }
 
@@ -117,7 +150,7 @@ class PersistentCookieStore(
         val url = uri.toURL()
         lock.withLock {
             prefs.edit().remove(url.host).apply()
-            cookieMap.remove(url.host)?.forEach { generations[it.identity] = ++epoch }
+            cookieMap.remove(url.host)?.forEach { tombstoneLocked(it.identity) }
         }
     }
 
@@ -165,7 +198,7 @@ class PersistentCookieStore(
     }
 
     /** Komu: the identity's current generation (0: never written) and the store's latest. */
-    fun generation(identity: Identity): Long = lock.withLock { generations[identity] ?: 0L }
+    fun generation(identity: Identity): Long = lock.withLock { generationLocked(identity) }
 
     fun epoch(): Long = lock.withLock { epoch }
 
@@ -179,7 +212,7 @@ class PersistentCookieStore(
     private fun readLocked(identity: Identity): Pair<Cookie?, Long> {
         val now = System.currentTimeMillis()
         val cookie = cookieMap[identity.domain]?.firstOrNull { it.identity == identity && it.expiresAt > now }
-        return cookie to (generations[identity] ?: 0L)
+        return cookie to generationLocked(identity)
     }
 
     /**
@@ -199,12 +232,12 @@ class PersistentCookieStore(
             val (current, generation) = readLocked(identity)
             if (generation != expected || (current != null) != expectedPresent) return@withLock null
             if (cookie == null) {
-                if (deleteLocked(identity)) saveToDisk(setOf(identity.domain)) else generations[identity] = ++epoch
+                if (deleteLocked(identity)) saveToDisk(setOf(identity.domain)) else tombstoneLocked(identity)
             } else {
                 storeLocked(cookie)
                 saveToDisk(setOf(cookie.domain))
             }
-            generations[identity]
+            generationLocked(identity)
         }
 
     /** Komu: every stored, unexpired cookie with its generation, read atomically. */
@@ -212,7 +245,7 @@ class PersistentCookieStore(
         lock.withLock {
             val now = System.currentTimeMillis()
             cookieMap.values.flatMap { cookies ->
-                cookies.filter { it.expiresAt > now }.map { it to (generations[it.identity] ?: 0L) }
+                cookies.filter { it.expiresAt > now }.map { it to generationLocked(it.identity) }
             }
         }
 
