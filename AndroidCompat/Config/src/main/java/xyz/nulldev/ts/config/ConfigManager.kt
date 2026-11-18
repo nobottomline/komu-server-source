@@ -11,7 +11,6 @@ import ch.qos.logback.classic.Level
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigObject
-import com.typesafe.config.ConfigParseOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
 import com.typesafe.config.parser.ConfigDocumentFactory
@@ -53,11 +52,13 @@ open class ConfigManager(
 
     // Komu (review 5): a file parse reads any open failure as a missing
     // file, i.e. an empty user config. Only `ENOENT` is absent; any other
-    // error throws.
+    // error throws. The text is parsed with the file's include semantics
+    // (review 6): a relative `include` resolves next to server.conf.
     private fun getUserConfig(): Config =
-        UserConfigFile.read(userConfigFile.toPath())?.let {
-            ConfigFactory.parseString(it, ConfigParseOptions.defaults().setOriginDescription(userConfigFile.path))
-        } ?: ConfigFactory.empty()
+        UserConfigFile.read(userConfigFile.toPath())?.let(::parseUserConfigText) ?: ConfigFactory.empty()
+
+    private fun parseUserConfigText(text: String): Config =
+        ConfigFactory.parseString(text, UserConfigFile.parseOptions(userConfigFile.toPath()))
 
     /** The user config document; an absent file is an empty one. */
     private fun userConfigDocument(): ConfigDocument =
@@ -185,7 +186,7 @@ open class ConfigManager(
         // extensionRepos during extensionStores upgrades.
         val migratedUserConfigDoc =
             migrate(userConfigDocument(), internalConfig)
-        val migratedUserConfig = ConfigFactory.parseString(migratedUserConfigDoc.render())
+        val migratedUserConfig = parseUserConfigText(migratedUserConfigDoc.render())
 
         var newUserConfigDoc: ConfigDocument = createConfigDocumentFromReference()
         migratedUserConfig

@@ -33,15 +33,14 @@ import suwayomi.tachidesk.util.HAScheduler
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
+import xyz.nulldev.ts.config.DirectoryBarrier
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 import java.util.UUID
 import kotlin.time.Duration.Companion.days
 
@@ -84,10 +83,8 @@ internal fun publishArchiveDurably(
     return target
 }
 
-/** `fsync` of a directory (opening one for reading is allowed on Darwin and Linux). */
-internal fun syncDirectory(directory: Path) {
-    FileChannel.open(directory, StandardOpenOption.READ).use { it.force(true) }
-}
+/** `fsync` of a directory where the platform has one (a no-op on Windows, [DirectoryBarrier]). */
+internal fun syncDirectory(directory: Path) = DirectoryBarrier.sync(directory)
 
 object ProtoBackupExport : ProtoBackupBase() {
     private val logger = KotlinLogging.logger { }

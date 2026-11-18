@@ -126,4 +126,30 @@ class ServerConfFileTest {
         assertEquals("server.port = 1\n", Files.readString(file))
         assertEquals(listOf("server.conf"), directory.toFile().list()!!.toList())
     }
+
+    /** Review 6: a relative include in server.conf keeps file semantics when read and migrated. */
+    @Test
+    fun `a relative include is read and survives a migration`(
+        @TempDir directory: Path,
+    ) {
+        val file = directory.resolve("server.conf")
+        Files.writeString(file, "include \"repos.conf\"\nserver.port = 4999\n")
+        Files.writeString(directory.resolve("repos.conf"), "server.extensionStores = [\"https://example.org/index.min.json\"]\n")
+        val stores = listOf("https://example.org/index.min.json")
+
+        val manager = ConfigManager(file.toFile())
+        assertEquals(stores, manager.config.getStringList("server.extensionStores"))
+
+        manager.updateUserConfig { this }
+        assertEquals(stores, ConfigManager(file.toFile()).config.getStringList("server.extensionStores"))
+        assertEquals(4999, ConfigManager(file.toFile()).config.getInt("server.port"))
+    }
+
+    @Test
+    fun `the directory barrier syncs on Unix-like systems`(
+        @TempDir directory: Path,
+    ) {
+        assertTrue(xyz.nulldev.ts.config.DirectoryBarrier.isSupported)
+        xyz.nulldev.ts.config.DirectoryBarrier.sync(directory)
+    }
 }

@@ -7,6 +7,13 @@ package xyz.nulldev.ts.config
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import com.typesafe.config.ConfigFactory
+import com.typesafe.config.ConfigIncludeContext
+import com.typesafe.config.ConfigIncluder
+import com.typesafe.config.ConfigIncluderFile
+import com.typesafe.config.ConfigObject
+import com.typesafe.config.ConfigParseOptions
+import java.io.File
 import java.io.InputStream
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -29,7 +36,10 @@ import java.util.UUID
  * - a missing file is created exclusively (`CREATE_NEW`), never over one
  *   that appeared meanwhile;
  * - a rewrite goes to a synced temporary sibling that is renamed over the
- *   file, then the directory is synced.
+ *   file, then the directory is synced where the platform has a directory
+ *   barrier ([DirectoryBarrier]);
+ * - its text is parsed with the file's semantics ([parseOptions]): a
+ *   relative `include` resolves next to the file (review 6).
  */
 object UserConfigFile {
     fun interface Attributes {
@@ -38,6 +48,38 @@ object UserConfigFile {
 
     val systemAttributes =
         Attributes { Files.readAttributes(it, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS) }
+
+    /**
+     * Options to parse the text of [file] as `ConfigFactory.parseFile` would:
+     * the origin is the file and a relative `include "name"` or
+     * `include file("name")` resolves in its directory (missing includes are
+     * ignored, as there). Reading the text separately keeps the strict
+     * `ENOENT` / I/O error distinction of [read].
+     */
+    fun parseOptions(file: Path): ConfigParseOptions =
+        ConfigParseOptions
+            .defaults()
+            .setOriginDescription(file.toString())
+            .setIncluder(RelativeIncluder(file.toAbsolutePath().parent.toFile()))
+
+    private class RelativeIncluder(
+        private val directory: File,
+    ) : ConfigIncluder,
+        ConfigIncluderFile {
+        override fun withFallback(fallback: ConfigIncluder): ConfigIncluder = this
+
+        override fun include(
+            context: ConfigIncludeContext,
+            what: String,
+        ): ConfigObject = ConfigFactory.parseFileAnySyntax(resolve(File(what)), context.parseOptions()).root()
+
+        override fun includeFile(
+            context: ConfigIncludeContext,
+            what: File,
+        ): ConfigObject = ConfigFactory.parseFile(resolve(what), context.parseOptions()).root()
+
+        private fun resolve(what: File): File = if (what.isAbsolute) what else File(directory, what.path)
+    }
 
     /** Whether something exists at [file]; throws for any error but `ENOENT`. */
     fun exists(
@@ -101,7 +143,21 @@ object UserConfigFile {
         syncDirectory(directory)
     }
 
-    private fun syncDirectory(directory: Path) {
+    private fun syncDirectory(directory: Path) = DirectoryBarrier.sync(directory)
+}
+
+/**
+ * Komu: makes a rename (or creation) in [sync]'s directory durable. On
+ * Unix-like systems (iOS, macOS, Linux) that is an `fsync` of the directory,
+ * which the JDK allows by opening it for reading. Windows cannot open a
+ * directory as a file channel and has no directory flush; NTFS journals the
+ * rename itself, so the barrier is a documented no-op there (review 6).
+ */
+object DirectoryBarrier {
+    val isSupported: Boolean = !System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true)
+
+    fun sync(directory: Path) {
+        if (!isSupported) return
         FileChannel.open(directory, StandardOpenOption.READ).use { it.force(true) }
     }
 }
