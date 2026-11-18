@@ -71,8 +71,10 @@ object DownloadManager {
     private val downloaderSchedulingLock = Any()
     private var downloadsRequested = false
 
-    private const val DOWNLOAD_QUEUE_KEY = "downloadQueueKey"
-    private val sharedPreferences =
+    internal const val DOWNLOAD_QUEUE_KEY = "downloadQueueKey"
+
+    // Internal for tests: the instance the queue is persisted through.
+    internal val sharedPreferences =
         Injekt.get<Application>().getSharedPreferences(DownloadManager::class.jvmName, Context.MODE_PRIVATE)
 
     private fun loadDownloadQueue(): List<Int> =
@@ -82,7 +84,39 @@ object DownloadManager {
                 it.toInt()
             }.orEmpty()
 
+    /**
+     * Komu (review 5): the persisted queue is restored into memory before
+     * the first mutation of the queue, whoever makes it. The host opens
+     * requests as soon as it committed the library, while
+     * [restoreAndResumeDownloads] runs once the server noticed the commit;
+     * an enqueue in between used to save a queue holding only its own chapter
+     * over the persisted one. Restoring loads entries only; downloads start
+     * on a mutation that adds work or in [restoreAndResumeDownloads].
+     */
+    private val queueRestoreLock = Any()
+
+    @Volatile
+    private var queueRestored = false
+
+    private fun ensureQueueRestored() {
+        if (queueRestored) return
+        synchronized(queueRestoreLock) {
+            if (queueRestored) return
+            val restored = loadDownloadQueue()
+            logger.debug { "ensureQueueRestored: restoring ${restored.size} queued chapters" }
+            addMultipleToQueue(chapterPairs(EnqueueInput(restored)), startDownloads = false)
+            queueRestored = true
+        }
+    }
+
+    /** Tests: the next mutation restores the persisted queue again. */
+    internal fun forgetQueueRestoreForTesting() {
+        queueRestored = false
+    }
+
     private fun saveDownloadQueue() {
+        // Never persist a queue that does not hold the restored entries.
+        if (!queueRestored) return
         sharedPreferences
             .edit()
             .putStringSet(DOWNLOAD_QUEUE_KEY, downloadQueue.map { it.chapterId.toString() }.toSet())
@@ -103,10 +137,11 @@ object DownloadManager {
     fun restoreAndResumeDownloads() {
         scope.launch {
             logger.debug { "restoreAndResumeDownloads: Restore download queue..." }
-            enqueue(EnqueueInput(loadDownloadQueue()))
+            ensureQueueRestored()
 
             if (downloadQueue.size > 0) {
                 logger.info { "restoreAndResumeDownloads: Restored download queue, starting downloads..." }
+                start()
             }
         }
     }
@@ -362,6 +397,12 @@ object DownloadManager {
 
     fun enqueue(input: EnqueueInput) {
         if (input.chapterIds.isNullOrEmpty()) return
+        ensureQueueRestored()
+        addMultipleToQueue(chapterPairs(input))
+    }
+
+    private fun chapterPairs(input: EnqueueInput): List<Pair<MangaDataClass, ChapterDataClass>> {
+        if (input.chapterIds.isNullOrEmpty()) return emptyList()
 
         val chapters =
             transaction {
@@ -381,29 +422,29 @@ object DownloadManager {
                     .associateBy { it.id }
             }
 
-        val inputPairs =
-            transaction {
-                chapters.map {
-                    Pair(
-                        // this should be safe because mangas is created above from chapters
-                        mangas[it[ChapterTable.manga].value]!!,
-                        ChapterTable.toDataClass(it),
-                    )
-                }
+        return transaction {
+            chapters.map {
+                Pair(
+                    // this should be safe because mangas is created above from chapters
+                    mangas[it[ChapterTable.manga].value]!!,
+                    ChapterTable.toDataClass(it),
+                )
             }
-
-        addMultipleToQueue(inputPairs)
+        }
     }
 
     /**
      * Tries to add multiple inputs to queue
      * If any of inputs was actually added to queue, starts the queue
      */
-    private fun addMultipleToQueue(inputs: List<Pair<MangaDataClass, ChapterDataClass>>) {
+    private fun addMultipleToQueue(
+        inputs: List<Pair<MangaDataClass, ChapterDataClass>>,
+        startDownloads: Boolean = true,
+    ) {
         val size = downloadQueue.size
         val addedChapters = inputs.mapNotNull { addToQueue(it.first, it.second) }
         if (addedChapters.isNotEmpty()) {
-            start()
+            if (startDownloads) start()
             notifyAllClients(
                 false,
                 addedChapters.mapIndexed { index, item ->
@@ -459,6 +500,7 @@ object DownloadManager {
 
     fun dequeue(input: EnqueueInput) {
         if (input.chapterIds.isNullOrEmpty()) return
+        ensureQueueRestored()
         dequeue(downloadQueue.filter { it.chapterId in input.chapterIds }.toSet())
     }
 
@@ -466,6 +508,7 @@ object DownloadManager {
         chapterIndex: Int,
         mangaId: Int,
     ) {
+        ensureQueueRestored()
         dequeue(downloadQueue.filter { it.mangaId == mangaId && it.chapterIndex == chapterIndex }.toSet())
     }
 
@@ -473,6 +516,7 @@ object DownloadManager {
         mangaIds: List<Int>,
         chaptersToIgnore: List<Int> = emptyList(),
     ) {
+        ensureQueueRestored()
         dequeue(downloadQueue.filter { it.mangaId in mangaIds && it.chapterId !in chaptersToIgnore }.toSet())
     }
 
@@ -493,6 +537,7 @@ object DownloadManager {
         mangaId: Int,
         to: Int,
     ) {
+        ensureQueueRestored()
         val download =
             downloadQueue.find { it.mangaId == mangaId && it.chapterIndex == chapterIndex }
                 ?: return
@@ -508,6 +553,7 @@ object DownloadManager {
     }
 
     fun reorder(reorders: List<ChapterDownloadReorder>) {
+        ensureQueueRestored()
         val updates =
             reorders.mapNotNull {
                 val download = reorder(it) ?: return@mapNotNull null
@@ -566,6 +612,7 @@ object DownloadManager {
         logger.debug { "clear" }
 
         stop()
+        ensureQueueRestored()
         val removedDownloads = downloadQueue.toList().map { DownloadUpdate(DownloadUpdateType.DEQUEUED, it, -1) }
         downloadQueue.clear()
         triggerSaveDownloadQueue()
