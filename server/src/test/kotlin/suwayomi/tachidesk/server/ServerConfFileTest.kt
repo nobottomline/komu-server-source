@@ -91,7 +91,8 @@ class ServerConfFileTest {
         val manager = ConfigManager(file.toFile())
         Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("-w-------"))
         try {
-            assertFailsWith<IOException> { manager.updateUserConfig { this } }
+            // Lightbend's file parse reports the read error (review 7: never an empty config).
+            assertFailsWith<com.typesafe.config.ConfigException.IO> { manager.updateUserConfig { this } }
         } finally {
             Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"))
         }
@@ -127,29 +128,108 @@ class ServerConfFileTest {
         assertEquals(listOf("server.conf"), directory.toFile().list()!!.toList())
     }
 
-    /** Review 6: a relative include in server.conf keeps file semantics when read and migrated. */
-    @Test
-    fun `a relative include is read and survives a migration`(
-        @TempDir directory: Path,
+    private val stores = listOf("https://example.org/index.min.json")
+    private val storesLine = "server.extensionStores = [\"https://example.org/index.min.json\"]\n"
+
+    /** Writes [serverConf] and its included files, then checks load and migration. */
+    private fun assertStoresSurviveLoadAndMigration(
+        directory: Path,
+        serverConf: String,
     ) {
         val file = directory.resolve("server.conf")
-        Files.writeString(file, "include \"repos.conf\"\nserver.port = 4999\n")
-        Files.writeString(directory.resolve("repos.conf"), "server.extensionStores = [\"https://example.org/index.min.json\"]\n")
-        val stores = listOf("https://example.org/index.min.json")
-
+        Files.writeString(file, serverConf + "server.port = 4999\n")
         val manager = ConfigManager(file.toFile())
-        assertEquals(stores, manager.config.getStringList("server.extensionStores"))
+        assertEquals(stores, manager.config.getStringList("server.extensionStores"), "load")
 
         manager.updateUserConfig { this }
-        assertEquals(stores, ConfigManager(file.toFile()).config.getStringList("server.extensionStores"))
-        assertEquals(4999, ConfigManager(file.toFile()).config.getInt("server.port"))
+        val reloaded = ConfigManager(file.toFile())
+        assertEquals(stores, reloaded.config.getStringList("server.extensionStores"), "after migration: ${Files.readString(file)}")
+        assertEquals(4999, reloaded.config.getInt("server.port"))
+        assertEquals(
+            listOf("server.conf"),
+            directory.toFile().list()!!.filter { it.startsWith(".") || it == "server.conf" },
+            "no temporary file is left",
+        )
+    }
+
+    /** Review 7: an include nested in an included file resolves next to that file. */
+    @Test
+    fun `a nested relative include resolves next to the including file`(
+        @TempDir directory: Path,
+    ) {
+        Files.createDirectories(directory.resolve("conf"))
+        Files.writeString(directory.resolve("conf/repos.conf"), "include \"stores.conf\"\n")
+        Files.writeString(directory.resolve("conf/stores.conf"), storesLine)
+        assertStoresSurviveLoadAndMigration(directory, "include \"conf/repos.conf\"\n")
     }
 
     @Test
-    fun `the directory barrier syncs on Unix-like systems`(
+    fun `a required nested include resolves and loads`(
         @TempDir directory: Path,
     ) {
-        assertTrue(xyz.nulldev.ts.config.DirectoryBarrier.isSupported)
+        Files.createDirectories(directory.resolve("conf"))
+        Files.writeString(directory.resolve("conf/repos.conf"), "include required(\"stores.conf\")\n")
+        Files.writeString(directory.resolve("conf/stores.conf"), storesLine)
+        assertStoresSurviveLoadAndMigration(directory, "include required(\"conf/repos.conf\")\n")
+    }
+
+    @Test
+    fun `an absolute file include without extension finds the conf file`(
+        @TempDir directory: Path,
+    ) {
+        val repos = Files.createDirectories(directory.resolve("opt")).resolve("repos.conf")
+        Files.writeString(repos, storesLine)
+        val base = repos.toString().removeSuffix(".conf")
+        assertStoresSurviveLoadAndMigration(directory, "include file(\"$base\")\n")
+    }
+
+    @Test
+    fun `a file URL include is read as a URL`(
+        @TempDir directory: Path,
+    ) {
+        val repos = Files.createDirectories(directory.resolve("opt")).resolve("repos.conf")
+        Files.writeString(repos, storesLine)
+        assertStoresSurviveLoadAndMigration(directory, "include \"${repos.toUri()}\"\n")
+    }
+
+    @Test
+    fun `a missing required include fails the load instead of reading as empty`(
+        @TempDir directory: Path,
+    ) {
+        val file = directory.resolve("server.conf")
+        Files.writeString(file, "include required(\"conf/absent.conf\")\n")
+        assertFailsWith<com.typesafe.config.ConfigException> { ConfigManager(file.toFile()) }
+    }
+
+    @Test
+    fun `the directory barrier syncs a directory on Unix-like systems`(
+        @TempDir directory: Path,
+    ) {
+        org.junit.jupiter.api.Assumptions.assumeTrue(xyz.nulldev.ts.config.DirectoryBarrier.isSupported, "Unix-like only")
         xyz.nulldev.ts.config.DirectoryBarrier.sync(directory)
+    }
+
+    /** Windows cannot open a directory as a channel: the barrier must do nothing there. */
+    @Test
+    fun `the directory barrier is a no-op where it is unsupported`(
+        @TempDir directory: Path,
+    ) {
+        xyz.nulldev.ts.config.DirectoryBarrier.sync(directory.resolve("not-even-there"), supported = false)
+    }
+
+    /** Review 7: a value change never writes a server.conf that would not parse back. */
+    @Test
+    fun `a value change keeps a qualified include parseable`(
+        @TempDir directory: Path,
+    ) {
+        Files.createDirectories(directory.resolve("conf"))
+        Files.writeString(directory.resolve("conf/stores.conf"), storesLine)
+        val file = directory.resolve("server.conf")
+        val original = "include required(\"conf/stores.conf\")\nserver.port = 4999\n"
+        Files.writeString(file, original)
+        val manager = ConfigManager(file.toFile())
+        runCatching { kotlinx.coroutines.runBlocking { manager.updateValue("server.port", 5000) } }
+        val reloaded = ConfigManager(file.toFile())
+        assertEquals(stores, reloaded.config.getStringList("server.extensionStores"))
     }
 }

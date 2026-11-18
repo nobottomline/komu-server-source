@@ -7,13 +7,9 @@ package xyz.nulldev.ts.config
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
-import com.typesafe.config.ConfigIncludeContext
-import com.typesafe.config.ConfigIncluder
-import com.typesafe.config.ConfigIncluderFile
-import com.typesafe.config.ConfigObject
 import com.typesafe.config.ConfigParseOptions
-import java.io.File
 import java.io.InputStream
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -38,8 +34,8 @@ import java.util.UUID
  * - a rewrite goes to a synced temporary sibling that is renamed over the
  *   file, then the directory is synced where the platform has a directory
  *   barrier ([DirectoryBarrier]);
- * - its text is parsed with the file's semantics ([parseOptions]): a
- *   relative `include` resolves next to the file (review 6).
+ * - it is parsed with Lightbend's file semantics ([parse], [parseAsFile]),
+ *   so includes resolve exactly as upstream resolves them (review 7).
  */
 object UserConfigFile {
     fun interface Attributes {
@@ -50,36 +46,43 @@ object UserConfigFile {
         Attributes { Files.readAttributes(it, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS) }
 
     /**
-     * Options to parse the text of [file] as `ConfigFactory.parseFile` would:
-     * the origin is the file and a relative `include "name"` or
-     * `include file("name")` resolves in its directory (missing includes are
-     * ignored, as there). Reading the text separately keeps the strict
-     * `ENOENT` / I/O error distinction of [read].
+     * The configuration of [file] with Lightbend's file semantics
+     * (`ConfigFactory.parseFile`: includes resolve relative to the including
+     * file, `required(...)`, `file(...)` and URLs as upstream); null only when
+     * [file] does not exist. Any other error throws, including a read error
+     * the parse meets (it does not allow a missing file).
      */
-    fun parseOptions(file: Path): ConfigParseOptions =
-        ConfigParseOptions
-            .defaults()
-            .setOriginDescription(file.toString())
-            .setIncluder(RelativeIncluder(file.toAbsolutePath().parent.toFile()))
-
-    private class RelativeIncluder(
-        private val directory: File,
-    ) : ConfigIncluder,
-        ConfigIncluderFile {
-        override fun withFallback(fallback: ConfigIncluder): ConfigIncluder = this
-
-        override fun include(
-            context: ConfigIncludeContext,
-            what: String,
-        ): ConfigObject = ConfigFactory.parseFileAnySyntax(resolve(File(what)), context.parseOptions()).root()
-
-        override fun includeFile(
-            context: ConfigIncludeContext,
-            what: File,
-        ): ConfigObject = ConfigFactory.parseFile(resolve(what), context.parseOptions()).root()
-
-        private fun resolve(what: File): File = if (what.isAbsolute) what else File(directory, what.path)
+    fun parse(
+        file: Path,
+        attributes: Attributes = systemAttributes,
+    ): Config? {
+        if (!exists(file, attributes)) return null
+        return ConfigFactory.parseFile(file.toFile(), strict)
     }
+
+    /**
+     * Parses [text] exactly as if it were the content of [file]: it is
+     * written to a temporary sibling with the same extension and parsed as a
+     * file there, so its includes resolve against the same directory; the
+     * sibling is removed afterwards.
+     */
+    fun parseAsFile(
+        file: Path,
+        text: String,
+    ): Config {
+        val directory = file.toAbsolutePath().parent
+        val name = file.fileName.toString()
+        val extension = name.substringAfterLast('.', "").takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
+        val temporary = directory.resolve(".$name.${UUID.randomUUID()}.parse$extension")
+        try {
+            Files.write(temporary, text.toByteArray(Charsets.UTF_8), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            return ConfigFactory.parseFile(temporary.toFile(), strict)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+
+    private val strict: ConfigParseOptions = ConfigParseOptions.defaults().setAllowMissing(false)
 
     /** Whether something exists at [file]; throws for any error but `ENOENT`. */
     fun exists(
@@ -156,8 +159,11 @@ object UserConfigFile {
 object DirectoryBarrier {
     val isSupported: Boolean = !System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true)
 
-    fun sync(directory: Path) {
-        if (!isSupported) return
+    fun sync(
+        directory: Path,
+        supported: Boolean = isSupported,
+    ) {
+        if (!supported) return
         FileChannel.open(directory, StandardOpenOption.READ).use { it.force(true) }
     }
 }

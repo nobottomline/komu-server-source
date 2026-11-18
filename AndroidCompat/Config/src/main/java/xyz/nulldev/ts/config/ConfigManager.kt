@@ -11,6 +11,7 @@ import ch.qos.logback.classic.Level
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigObject
+import com.typesafe.config.ConfigRenderOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
 import com.typesafe.config.parser.ConfigDocumentFactory
@@ -50,15 +51,11 @@ open class ConfigManager(
     @Suppress("UNCHECKED_CAST")
     fun <T : ConfigModule> module(type: Class<T>): T = loadedModules[type] as T
 
-    // Komu (review 5): a file parse reads any open failure as a missing
-    // file, i.e. an empty user config. Only `ENOENT` is absent; any other
-    // error throws. The text is parsed with the file's include semantics
-    // (review 6): a relative `include` resolves next to server.conf.
-    private fun getUserConfig(): Config =
-        UserConfigFile.read(userConfigFile.toPath())?.let(::parseUserConfigText) ?: ConfigFactory.empty()
-
-    private fun parseUserConfigText(text: String): Config =
-        ConfigFactory.parseString(text, UserConfigFile.parseOptions(userConfigFile.toPath()))
+    // Komu (reviews 5 and 7): only `ENOENT` reads as an absent (empty) user
+    // config; any other error throws. Parsing is Lightbend's own file parse,
+    // so every include resolves as upstream resolves it (relative to the
+    // including file, `required(...)`, `file(...)`, URLs).
+    private fun getUserConfig(): Config = UserConfigFile.parse(userConfigFile.toPath()) ?: ConfigFactory.empty()
 
     /** The user config document; an absent file is an empty one. */
     private fun userConfigDocument(): ConfigDocument =
@@ -121,6 +118,10 @@ open class ConfigManager(
         val userConfigDoc = userConfigDocument()
         val updatedConfigDoc = userConfigDoc.withValue(path, value)
         val newFileContent = updatedConfigDoc.render()
+        // Komu (review 7): Lightbend 1.4.9 renders `include required(...)` and
+        // `include file(...)` without their closing parenthesis. Write only a
+        // text that parses as server.conf would; otherwise fail and keep the file.
+        UserConfigFile.parseAsFile(userConfigFile.toPath(), newFileContent)
         writeUserConfig(newFileContent)
     }
 
@@ -184,9 +185,20 @@ open class ConfigManager(
         // every replacement key look explicitly configured through its
         // reference default. That combination silently lost values such as
         // extensionRepos during extensionStores upgrades.
-        val migratedUserConfigDoc =
-            migrate(userConfigDocument(), internalConfig)
-        val migratedUserConfig = parseUserConfigText(migratedUserConfigDoc.render())
+        //
+        // Komu (review 7): the migration works on the user's values with every
+        // include resolved by Lightbend's file semantics (`userConfig`), as a
+        // document without include statements. A document of the file's own
+        // text loses included values in the string parses below and in
+        // `migrateConfig`, and Lightbend 1.4.9 renders qualified includes
+        // without their closing parenthesis. The rebuilt file holds the values
+        // themselves, as it did upstream.
+        val resolvedUserConfigDoc =
+            ConfigDocumentFactory.parseString(
+                userConfig.root().render(ConfigRenderOptions.defaults().setOriginComments(false)),
+            )
+        val migratedUserConfigDoc = migrate(resolvedUserConfigDoc, internalConfig)
+        val migratedUserConfig = ConfigFactory.parseString(migratedUserConfigDoc.render())
 
         var newUserConfigDoc: ConfigDocument = createConfigDocumentFromReference()
         migratedUserConfig
