@@ -95,6 +95,61 @@ class ExtensionArtifactActivationTest {
         assertNoRollbackFiles()
     }
 
+    @Test
+    fun `unconfirmed durability keeps the journal and the previous artifact for recovery`() {
+        val previous = write("old.jar", "old")
+        val staged = write("candidate.staging.jar", "new")
+        val active = temporaryDirectory.resolve("new.jar")
+        val markers = mutableSetOf<String>()
+
+        val result =
+            commit(staged, active, previous, markers, confirmDurable = { throw java.io.IOException("sync failed") }) {
+                "committed"
+            }
+
+        assertEquals("committed", result)
+        assertEquals("old", Files.readString(previous), "the previous artifact outlives an unconfirmed commit")
+        assertEquals("new", Files.readString(active))
+        val journal = ExtensionActivationJournal(temporaryDirectory)
+        assertEquals(1, journal.loadAll().size, "the journal is kept")
+        assertEquals(1, markers.size, "the marker is kept")
+
+        // Startup recovery decides from the marker.
+        val report =
+            journal.recoverAll(DATABASE_IDENTITY, { key -> "app.komu.fixture".takeIf { key in markers } }, { markers.remove(it) })
+        assertEquals(1, report.finalized)
+        assertFalse(Files.exists(previous))
+        assertTrue(journal.loadAll().isEmpty())
+    }
+
+    @Test
+    fun `unconfirmed durability keeps the rollback copy of a same-name artifact`() {
+        val active = write("active.jar", "old")
+        val staged = write("candidate.staging.jar", "new")
+
+        commit(staged, active, previousArtifact = active, confirmDurable = { throw java.io.IOException("sync failed") }) {}
+
+        assertEquals("new", Files.readString(active))
+        Files.list(temporaryDirectory).use { paths ->
+            assertTrue(paths.anyMatch { it.fileName.toString().contains(".rollback-") }, "the rollback copy is kept")
+        }
+        assertEquals(1, ExtensionActivationJournal(temporaryDirectory).loadAll().size)
+    }
+
+    @Test
+    fun `cleanup runs only after the commit was confirmed durable`() {
+        val previous = write("old.jar", "old")
+        val staged = write("candidate.staging.jar", "new")
+        val active = temporaryDirectory.resolve("new.jar")
+        var previousAtConfirmation: Boolean? = null
+
+        commit(staged, active, previous, confirmDurable = { previousAtConfirmation = Files.exists(previous) }) {}
+
+        assertEquals(true, previousAtConfirmation)
+        assertFalse(Files.exists(previous))
+        assertNoRollbackFiles()
+    }
+
     private fun write(
         name: String,
         contents: String,
@@ -104,10 +159,11 @@ class ExtensionArtifactActivationTest {
         staged: Path,
         active: Path,
         previousArtifact: Path?,
+        markers: MutableSet<String> = mutableSetOf(),
+        confirmDurable: () -> Unit = {},
         commitMetadata: () -> T,
-    ): T {
-        val markers = mutableSetOf<String>()
-        return ExtensionArtifactActivation.commit(
+    ): T =
+        ExtensionArtifactActivation.commit(
             packageName = "app.komu.fixture",
             databaseIdentity = DATABASE_IDENTITY,
             stagedArtifact = staged,
@@ -117,9 +173,9 @@ class ExtensionArtifactActivationTest {
                 commitMetadata().also { markers += markerKey }
             },
             isCommitMarkerPresent = markers::contains,
-            removeCommitMarker = markers::remove,
+            removeCommitMarker = { markers.remove(it) },
+            confirmDurable = confirmDurable,
         )
-    }
 
     private fun assertNoRollbackFiles() {
         Files.list(temporaryDirectory).use { paths ->

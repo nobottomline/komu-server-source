@@ -245,6 +245,69 @@ class ExtensionJarActivationOrchestratorTest : ApplicationTest() {
             }
         }
 
+    /** Komu review 5: the cleanup is irreversible, so it waits for a durable marker. */
+    @Test
+    fun `unconfirmed durability keeps journal, marker and rollback copy for recovery`() =
+        runBlocking {
+            withFixtureDatabase {
+                val operation = prepareOperation(previousAtActivePath = true)
+                val confirm = ExtensionJarActivationOrchestrator.confirmDurable
+                ExtensionJarActivationOrchestrator.confirmDurable = { throw java.io.IOException("sync failed") }
+                val result =
+                    try {
+                        ExtensionJarActivationOrchestrator.activate(
+                            operation.candidate,
+                            ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                        )
+                    } finally {
+                        ExtensionJarActivationOrchestrator.confirmDurable = confirm
+                    }
+
+                assertTrue(result.extensionID > 0)
+                assertEquals("new", Files.readString(operation.active))
+                val pending = operation.candidate.journal.loadAll().single()
+                assertEquals(ExtensionActivationJournal.State.FILE_VISIBLE, pending.record.state)
+                val rollback = operation.active.resolveSibling(checkNotNull(pending.record.rollbackName))
+                assertEquals("old", Files.readString(rollback), "the old-good artifact is kept")
+                assertTrue(markerPresent(operation.markerKey))
+
+                val report =
+                    operation.candidate.journal.recoverAll(
+                        DATABASE_IDENTITY,
+                        { markerKey -> TARGET_PKG.takeIf { markerPresent(markerKey) } },
+                        ::removeMarker,
+                    )
+                assertEquals(1, report.finalized)
+                assertFalse(Files.exists(rollback))
+                assertEquals("new", Files.readString(operation.active))
+            }
+        }
+
+    @Test
+    fun `cleanup starts only after the marker transaction was confirmed durable`() =
+        runBlocking {
+            withFixtureDatabase {
+                val operation = prepareOperation(previousAtActivePath = true)
+                val confirm = ExtensionJarActivationOrchestrator.confirmDurable
+                var journalAtConfirmation: Int? = null
+                ExtensionJarActivationOrchestrator.confirmDurable = {
+                    journalAtConfirmation = operation.candidate.journal.loadAll().size
+                    confirm()
+                }
+                try {
+                    ExtensionJarActivationOrchestrator.activate(
+                        operation.candidate,
+                        ExtensionJarMetadataWriter.ExistingArtifactPolicy.INSTALL_OR_UPGRADE,
+                    )
+                } finally {
+                    ExtensionJarActivationOrchestrator.confirmDurable = confirm
+                }
+                assertEquals(1, journalAtConfirmation)
+                assertTrue(operation.candidate.journal.loadAll().isEmpty())
+                assertFalse(markerPresent(operation.markerKey))
+            }
+        }
+
     @Test
     fun `active-byte mutation during transaction fails closed and preserves recovery evidence`() =
         runBlocking {

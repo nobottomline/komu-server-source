@@ -9,6 +9,7 @@ package suwayomi.tachidesk.manga.impl.extension
 
 import android.content.pm.PackageInfo
 import android.net.Uri
+import app.komu.library.DatabaseDurability
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.source.Source
@@ -454,12 +455,16 @@ object Extension {
                     },
                     isCommitMarkerPresent = ::isActivationMarkerPresent,
                     removeCommitMarker = ::removeActivationMarker,
+                    confirmDurable = DatabaseDurability::syncCommitted,
                 )
 
                 previousJar?.let { oldJar ->
                     runCatching { PackageTools.jarLoaderMap.remove(oldJar.absolutePathString())?.close() }
                         .onFailure { logger.warn(it) { "Failed to close the previous classloader for $pkgName" } }
-                    if (oldJar != activeJar) {
+                    // An installed previous artifact belongs to the activation
+                    // journal, which retires it only once the commit is durable
+                    // (Komu review 5); only a stale, uninstalled one is removed here.
+                    if (oldJar != activeJar && !isInstalled) {
                         runCatching { oldJar.deleteIfExists() }
                             .onFailure { logger.warn(it) { "Failed to remove the retired JAR for $pkgName" } }
                     }

@@ -23,6 +23,7 @@ internal object ExtensionArtifactActivation {
         commitMetadata: (markerKey: String) -> T,
         isCommitMarkerPresent: (markerKey: String) -> Boolean,
         removeCommitMarker: (markerKey: String) -> Unit,
+        confirmDurable: () -> Unit,
     ): T {
         val root = activeArtifact.toAbsolutePath().normalize().parent
         val journal = ExtensionActivationJournal(root)
@@ -38,6 +39,18 @@ internal object ExtensionArtifactActivation {
             // From this point the DB marker is authoritative. Journal/backup
             // cleanup is retryable startup work and must not roll back a
             // transaction that has already committed.
+            //
+            // Komu review 5: the cleanup deletes the journal, the rollback copy
+            // and the previous artifact, so it waits until the marker
+            // transaction is durable. Unconfirmed, everything is kept and
+            // startup recovery decides from the marker.
+            val durable =
+                runCatching(confirmDurable).onFailure {
+                    logger.warn(it) {
+                        "Extension ${entry.record.packageName} committed; durability unconfirmed, cleanup deferred to startup recovery"
+                    }
+                }
+            if (durable.isFailure) return result
             runCatching {
                 entry = journal.transition(entry, ExtensionActivationJournal.State.DB_COMMITTED)
                 journal.finalizeCommitted(entry)
@@ -59,8 +72,10 @@ internal object ExtensionArtifactActivation {
                     }
 
             if (databaseCommitted) {
-                runCatching { journal.finalizeCommitted(entry) }
-                    .onFailure(failure::addSuppressed)
+                runCatching {
+                    confirmDurable()
+                    journal.finalizeCommitted(entry)
+                }.onFailure(failure::addSuppressed)
             } else {
                 runCatching { journal.rollback(entry) }
                     .onFailure(failure::addSuppressed)

@@ -7,6 +7,7 @@ package suwayomi.tachidesk.manga.impl.extension
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import app.komu.library.DatabaseDurability
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.JdbcTransaction
@@ -26,6 +27,13 @@ import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
  */
 internal object ExtensionJarActivationOrchestrator {
     private val logger = KotlinLogging.logger {}
+
+    /**
+     * Confirms the marker transaction is durable before the irreversible
+     * cleanup (Komu review 5); tests replace it.
+     */
+    @Volatile
+    internal var confirmDurable: () -> Unit = DatabaseDurability::syncCommitted
 
     /** Canonical authenticated persistence path for future guarded production wiring. */
     fun activate(
@@ -86,7 +94,12 @@ internal object ExtensionJarActivationOrchestrator {
 
             // The transaction marker is authoritative from this point. Cleanup is retryable
             // startup work and must never turn a committed activation into a guessed rollback.
-            runCatching { cleanupCommitted(journal, entry) }
+            // Komu review 5: it is irreversible (journal, rollback copy, previous artifact),
+            // so it needs the marker transaction durable; unconfirmed, everything is kept.
+            runCatching {
+                confirmDurable()
+                cleanupCommitted(journal, entry)
+            }
                 .onFailure { failure ->
                     logger.warn(failure) {
                         "Authenticated extension ${entry.record.packageName} committed; cleanup deferred to recovery"
@@ -112,8 +125,10 @@ internal object ExtensionJarActivationOrchestrator {
                         IllegalStateException("Extension activation marker exists before artifact visibility"),
                     )
                 } else {
-                    runCatching { cleanupCommitted(journal, entry) }
-                        .onFailure(failure::addSuppressed)
+                    runCatching {
+                        confirmDurable()
+                        cleanupCommitted(journal, entry)
+                    }.onFailure(failure::addSuppressed)
                 }
             } else {
                 runCatching { journal.rollback(entry) }

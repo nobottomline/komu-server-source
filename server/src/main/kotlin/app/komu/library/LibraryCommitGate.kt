@@ -9,7 +9,6 @@ package app.komu.library
 
 import app.komu.bridge.LibraryCommit
 import io.github.oshai.kotlinlogging.KotlinLogging
-import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import suwayomi.tachidesk.server.EmbeddedRuntimePlatform
 import kotlin.concurrent.thread
 
@@ -85,7 +84,5 @@ object LibraryCommitGate {
         }
     }
 
-    private fun checkpointSync() {
-        transaction { exec("CHECKPOINT SYNC") }
-    }
+    private fun checkpointSync() = DatabaseDurability.syncCommitted()
 }
