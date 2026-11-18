@@ -11,6 +11,7 @@ import ch.qos.logback.classic.Level
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import com.typesafe.config.ConfigObject
+import com.typesafe.config.ConfigParseOptions
 import com.typesafe.config.ConfigValue
 import com.typesafe.config.parser.ConfigDocument
 import com.typesafe.config.parser.ConfigDocumentFactory
@@ -23,10 +24,12 @@ import java.io.File
 /**
  * Manages app config.
  */
-open class ConfigManager {
+open class ConfigManager(
+    // Komu: injectable for tests; the server's is `<rootDir>/server.conf`.
+    private val userConfigFile: File = File(ApplicationRootDir, "server.conf"),
+) {
     val logger = KotlinLogging.logger {}
     private val generatedModules = mutableMapOf<Class<out ConfigModule>, ConfigModule>()
-    private val userConfigFile = File(ApplicationRootDir, "server.conf")
     private var internalConfig = loadConfigs()
     val config: Config
         get() = internalConfig
@@ -48,10 +51,22 @@ open class ConfigManager {
     @Suppress("UNCHECKED_CAST")
     fun <T : ConfigModule> module(type: Class<T>): T = loadedModules[type] as T
 
+    // Komu (review 5): a file parse reads any open failure as a missing
+    // file, i.e. an empty user config. Only `ENOENT` is absent; any other
+    // error throws.
     private fun getUserConfig(): Config =
-        userConfigFile.let {
-            ConfigFactory.parseFile(it)
-        }
+        UserConfigFile.read(userConfigFile.toPath())?.let {
+            ConfigFactory.parseString(it, ConfigParseOptions.defaults().setOriginDescription(userConfigFile.path))
+        } ?: ConfigFactory.empty()
+
+    /** The user config document; an absent file is an empty one. */
+    private fun userConfigDocument(): ConfigDocument =
+        ConfigDocumentFactory.parseString(UserConfigFile.read(userConfigFile.toPath()) ?: "")
+
+    /** Komu (review 5): never truncates the file in place. */
+    private fun writeUserConfig(text: String) {
+        UserConfigFile.replace(userConfigFile.toPath(), text)
+    }
 
     /**
      * Load configs
@@ -102,10 +117,10 @@ open class ConfigManager {
         path: String,
         value: ConfigValue,
     ) {
-        val userConfigDoc = ConfigDocumentFactory.parseFile(userConfigFile)
+        val userConfigDoc = userConfigDocument()
         val updatedConfigDoc = userConfigDoc.withValue(path, value)
         val newFileContent = updatedConfigDoc.render()
-        userConfigFile.writeText(newFileContent)
+        writeUserConfig(newFileContent)
     }
 
     suspend fun updateValue(
@@ -128,7 +143,7 @@ open class ConfigManager {
     fun resetUserConfig(): ConfigDocument {
         val serverConfigDoc = createConfigDocumentFromReference()
 
-        userConfigFile.writeText(serverConfigDoc.render())
+        writeUserConfig(serverConfigDoc.render())
         getUserConfig().entrySet().forEach { internalConfig = internalConfig.withValue(it.key, it.value) }
 
         return serverConfigDoc
@@ -169,7 +184,7 @@ open class ConfigManager {
         // reference default. That combination silently lost values such as
         // extensionRepos during extensionStores upgrades.
         val migratedUserConfigDoc =
-            migrate(ConfigDocumentFactory.parseFile(userConfigFile), internalConfig)
+            migrate(userConfigDocument(), internalConfig)
         val migratedUserConfig = ConfigFactory.parseString(migratedUserConfigDoc.render())
 
         var newUserConfigDoc: ConfigDocument = createConfigDocumentFromReference()
@@ -182,7 +197,7 @@ open class ConfigManager {
                     it.key.count { c -> c == '.' } > 1
             }.forEach { newUserConfigDoc = newUserConfigDoc.withValue(it.key, it.value) }
 
-        userConfigFile.writeText(newUserConfigDoc.render())
+        writeUserConfig(newUserConfigDoc.render())
         getUserConfig().entrySet().forEach { internalConfig = internalConfig.withValue(it.key, it.value) }
     }
 

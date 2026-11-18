@@ -66,14 +66,18 @@ import xyz.nulldev.androidcompat.webkit.KcefWebViewProvider
 import xyz.nulldev.ts.config.ApplicationRootDir
 import xyz.nulldev.ts.config.BASE_LOGGER_NAME
 import xyz.nulldev.ts.config.GlobalConfigManager
+import xyz.nulldev.ts.config.UserConfigFile
 import xyz.nulldev.ts.config.configManagerModule
 import xyz.nulldev.ts.config.initLoggerConfig
 import xyz.nulldev.ts.config.setLogLevelFor
 import xyz.nulldev.ts.config.updateFileAppender
 import java.io.File
+import java.io.InputStream
 import java.net.Authenticator
 import java.net.PasswordAuthentication
 import java.security.Security
+import java.nio.file.Path
+import java.nio.file.Paths
 import java.util.Locale
 
 private val logger = KotlinLogging.logger {}
@@ -155,6 +159,22 @@ fun serverModule(applicationDirs: ApplicationDirs): Module =
     }
 
 @OptIn(DelicateCoroutinesApi::class)
+/**
+ * Komu (review 5): creates `server.conf` from [reference] only when it is
+ * absent (`ENOENT`), exclusively; otherwise [update] migrates it, which
+ * replaces it atomically. Any other error reading its attributes throws
+ * before anything is written (it used to read as "absent" through
+ * `File.exists()` and the file was truncated).
+ */
+internal fun prepareServerConfFile(
+    file: Path,
+    reference: () -> InputStream,
+    update: () -> Unit,
+    attributes: UserConfigFile.Attributes = UserConfigFile.systemAttributes,
+) {
+    if (!UserConfigFile.createIfAbsent(file, reference, attributes)) update()
+}
+
 fun applicationSetup() {
     Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
         KotlinLogging.logger {}.error(throwable) { "unhandled exception" }
@@ -313,23 +333,22 @@ fun applicationSetup() {
 
     // create or update conf file if doesn't exist
     try {
-        val dataConfFile = File("${applicationDirs.dataRoot}/server.conf")
-        if (!dataConfFile.exists()) {
-            JavalinSetup::class.java.getResourceAsStream("/server-reference.conf").use { input ->
-                dataConfFile.outputStream().use { output -> input.copyTo(output) }
-            }
-        } else {
-            // make sure the user config file is up-to-date
-            GlobalConfigManager.updateUserConfig {
-                try {
-                    migrateConfig(this, it)
-                } catch (e: Throwable) {
-                    logger.error(e) { "Failed to migrate config" }
-                    shutdownApp(ExitCode.ConfigMigrationFailure)
-                    throw e
+        prepareServerConfFile(
+            file = Paths.get(applicationDirs.dataRoot, "server.conf"),
+            reference = { JavalinSetup::class.java.getResourceAsStream("/server-reference.conf")!! },
+            update = {
+                // make sure the user config file is up-to-date
+                GlobalConfigManager.updateUserConfig {
+                    try {
+                        migrateConfig(this, it)
+                    } catch (e: Throwable) {
+                        logger.error(e) { "Failed to migrate config" }
+                        shutdownApp(ExitCode.ConfigMigrationFailure)
+                        throw e
+                    }
                 }
-            }
-        }
+            },
+        )
     } catch (e: Exception) {
         logger.error(e) { "Exception while creating initial server.conf" }
         shutdownApp(ExitCode.SetupConfFileFailed)

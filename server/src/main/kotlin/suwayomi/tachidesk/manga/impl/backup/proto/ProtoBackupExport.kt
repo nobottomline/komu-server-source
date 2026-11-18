@@ -36,8 +36,12 @@ import uy.kohesive.injekt.injectLazy
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.OutputStream
+import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.util.UUID
 import kotlin.time.Duration.Companion.days
 
@@ -51,6 +55,38 @@ internal fun publishThenPrune(
 ) {
     val published = create()
     prune(published)
+}
+
+/**
+ * Komu (review 5): publishes an archive so that its name survives a system
+ * crash before anything relies on it. The bytes go to a temporary sibling,
+ * which is synced and renamed into place; then the directory is synced, so
+ * the rename itself is on disk. Any failure throws, and the caller (see
+ * [publishThenPrune]) prunes nothing.
+ */
+internal fun publishArchiveDurably(
+    target: File,
+    write: (OutputStream) -> Unit,
+    syncDirectory: (Path) -> Unit = ::syncDirectory,
+): File {
+    val directory = target.absoluteFile.parentFile
+    val temporary = File(directory, ".${target.name}.${UUID.randomUUID()}.tmp")
+    try {
+        FileOutputStream(temporary).use { output ->
+            write(output)
+            output.fd.sync()
+        }
+        Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+    } finally {
+        temporary.delete()
+    }
+    syncDirectory(directory.toPath())
+    return target
+}
+
+/** `fsync` of a directory (opening one for reading is allowed on Darwin and Linux). */
+internal fun syncDirectory(directory: Path) {
+    FileChannel.open(directory, StandardOpenOption.READ).use { it.force(true) }
 }
 
 object ProtoBackupExport : ProtoBackupBase() {
@@ -111,9 +147,10 @@ object ProtoBackupExport : ProtoBackupBase() {
     }
 
     /**
-     * Writes the archive under a temporary name, syncs it and renames it into
-     * place (Komu), so the name of an automated backup always denotes a
-     * complete archive. Returns the published file.
+     * Writes the archive under a temporary name, syncs it, renames it into
+     * place and syncs the directory (Komu, [publishArchiveDurably]), so the
+     * name of an automated backup always denotes a complete, durable
+     * archive. Returns the published file.
      */
     private fun createAutomatedBackup(): File {
         logger.info { "Creating automated backup..." }
@@ -123,17 +160,7 @@ object ProtoBackupExport : ProtoBackupBase() {
             automatedBackupDir.mkdirs()
 
             val backupFile = File(applicationDirs.automatedBackupRoot, Backup.getFilename(AUTO_BACKUP_FILENAME))
-            val temporary = File(automatedBackupDir, ".${backupFile.name}.${UUID.randomUUID()}.tmp")
-            try {
-                FileOutputStream(temporary).use { output ->
-                    input.copyTo(output)
-                    output.fd.sync()
-                }
-                Files.move(temporary.toPath(), backupFile.toPath(), StandardCopyOption.ATOMIC_MOVE)
-            } finally {
-                temporary.delete()
-            }
-            return backupFile
+            return publishArchiveDurably(backupFile, write = { output -> input.copyTo(output) })
         }
     }
 
