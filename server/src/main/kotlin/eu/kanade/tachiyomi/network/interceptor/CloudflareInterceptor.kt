@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.network.interceptor
 
+import app.komu.cloudflare.ChallengeHandOffAdmission
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.awaitSuccess
@@ -314,17 +315,20 @@ object CFClearance {
         val timeout = serverConfig.flareSolverrTimeout.value.seconds
         return with(json) {
             mutex.withLock {
+                // Komu: address, session and call are taken under the
+                // admission lock, so a switch-off can cancel and await them.
+                ChallengeHandOffAdmission.send({ flareSolverrUrl, flareSolverrSession ->
                 client.value
                     .newCall(
                         POST(
-                            url = serverConfig.flareSolverrUrl.value.removeSuffix("/") + "/v1",
+                            url = flareSolverrUrl.removeSuffix("/") + "/v1",
                             body =
                                 Json
                                     .encodeToString(
                                         FlareSolverRequest(
                                             "request.${originalRequest.method.lowercase()}",
                                             originalRequest.url.toString(),
-                                            session = serverConfig.flareSolverrSessionName.value,
+                                            session = flareSolverrSession,
                                             sessionTtlMinutes = serverConfig.flareSolverrSessionTtl.value,
                                             cookies =
                                                 network.cookieStore
@@ -349,8 +353,8 @@ object CFClearance {
                                         ),
                                     ).toRequestBody(jsonMediaType),
                         ),
-                    ).awaitSuccess()
-                    .parseAs<FlareSolverResponse>()
+                    )
+                }) { call -> call.awaitSuccess().parseAs<FlareSolverResponse>() }
             }
         }
     }
