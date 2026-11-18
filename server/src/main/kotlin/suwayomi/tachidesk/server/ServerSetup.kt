@@ -8,6 +8,7 @@ package suwayomi.tachidesk.server
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import android.os.Looper
+import app.komu.library.LibraryCommitGate
 import ch.qos.logback.classic.Level
 import com.typesafe.config.ConfigRenderOptions
 import dorkbox.updates.Updates
@@ -372,6 +373,14 @@ fun applicationSetup() {
         shutdownApp(ExitCode.LocalSourceSetupFailure)
     }
 
+    // Komu: the migrated library is durable; the iOS host may commit it.
+    try {
+        LibraryCommitGate.publishPrepared()
+    } catch (e: Throwable) {
+        logger.error(e) { "Could not make the migrated library durable" }
+        shutdownApp(ExitCode.LibraryCommitFailure)
+    }
+
     serverConfig.subscribeTo(
         combine<Any, DatabaseSettings>(
             serverConfig.databaseType,
@@ -478,17 +487,23 @@ fun applicationSetup() {
     // AES/CBC/PKCS7Padding Cypher provider for zh.copymanga
     Security.addProvider(BouncyCastleProvider())
 
-    // start automated global updates
-    val updater = Injekt.get<IUpdater>()
-    (updater as Updater).scheduleUpdateTask()
+    // Komu: background work that changes shared data (backups and their
+    // purge, downloads) or must not run on a library the host may still
+    // discard starts once the iOS host committed the library (immediately on
+    // desktop).
+    LibraryCommitGate.afterCommit("background-tasks") {
+        // start automated global updates
+        val updater = Injekt.get<IUpdater>()
+        (updater as Updater).scheduleUpdateTask()
 
-    // start automated backups
-    ProtoBackupExport.scheduleAutomatedBackupTask()
+        // start automated backups
+        ProtoBackupExport.scheduleAutomatedBackupTask()
 
-    // start DownloadManager and restore + resume downloads
-    DownloadManager.restoreAndResumeDownloads()
+        // start DownloadManager and restore + resume downloads
+        DownloadManager.restoreAndResumeDownloads()
 
-    SyncManager.scheduleSyncTask()
+        SyncManager.scheduleSyncTask()
+    }
 
     // CEF requires desktop AWT/JAWT and native JCEF libraries, which the iOS host
     // cannot load. There, CEF never starts: mark it failed so any KCEF path (the

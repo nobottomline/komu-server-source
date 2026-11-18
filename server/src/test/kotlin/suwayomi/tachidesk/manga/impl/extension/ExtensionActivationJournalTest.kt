@@ -45,6 +45,24 @@ class ExtensionActivationJournalTest {
     }
 
     @Test
+    fun `a journal moved with its data root is recovered when its identity is accepted`() {
+        val previous = write("active.jar", "old")
+        val staged = write("candidate.jar", "new")
+        val legacyIdentity = OTHER_DATABASE_IDENTITY
+        ExtensionActivationJournal(root).prepare(PACKAGE_NAME, legacyIdentity, staged, previous, previous)
+
+        val journal = ExtensionActivationJournal(root)
+        assertThrows(IllegalArgumentException::class.java) {
+            journal.recoverAll(DATABASE_IDENTITY, { null }, {})
+        }
+        val report = journal.recoverAll({ it == legacyIdentity }, { null }, {})
+
+        assertEquals(1, report.rolledBack)
+        assertEquals("old", Files.readString(previous))
+        assertTrue(journal.loadAll().isEmpty())
+    }
+
+    @Test
     fun `journal rejects artifact changed after authenticated preflight without leaking lease`() {
         val staged = write("candidate.jar", "new")
         val journal = ExtensionActivationJournal(root)

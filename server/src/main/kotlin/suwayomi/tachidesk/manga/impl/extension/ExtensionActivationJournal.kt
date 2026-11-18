@@ -241,11 +241,21 @@ internal class ExtensionActivationJournal(
         databaseIdentity: String,
         databaseMarkerOwner: (markerKey: String) -> String?,
         removeDatabaseMarker: (markerKey: String) -> Unit,
+    ): RecoveryReport = recoverAll({ it == databaseIdentity }, databaseMarkerOwner, removeDatabaseMarker)
+
+    /**
+     * Recovers every pending activation whose recorded database identity
+     * [acceptsDatabaseIdentity] accepts; refuses all of them otherwise.
+     */
+    fun recoverAll(
+        acceptsDatabaseIdentity: (recorded: String) -> Boolean,
+        databaseMarkerOwner: (markerKey: String) -> String?,
+        removeDatabaseMarker: (markerKey: String) -> Unit,
     ): RecoveryReport {
         sweepTemporaryJournalFiles()
         val entries = loadAll()
         reconcilePackageLeases(entries)
-        require(entries.all { it.record.databaseIdentity == databaseIdentity }) {
+        require(entries.all { acceptsDatabaseIdentity(it.record.databaseIdentity) }) {
             "Pending extension activation belongs to a different database configuration"
         }
         var rolledBack = 0

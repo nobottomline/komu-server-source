@@ -34,8 +34,24 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.UUID
 import kotlin.time.Duration.Companion.days
+
+/**
+ * Komu: publishes the new automated archive before pruning old ones, so a
+ * failed or interrupted backup never leaves fewer archives than before.
+ */
+internal fun publishThenPrune(
+    create: () -> File,
+    prune: (keep: File) -> Unit,
+) {
+    val published = create()
+    prune(published)
+}
 
 object ProtoBackupExport : ProtoBackupBase() {
     private val logger = KotlinLogging.logger { }
@@ -68,8 +84,7 @@ object ProtoBackupExport : ProtoBackupBase() {
 
         val task = {
             try {
-                cleanupAutomatedBackups()
-                createAutomatedBackup()
+                publishThenPrune(::createAutomatedBackup, ::cleanupAutomatedBackups)
                 preferences.edit().putLong(LAST_AUTOMATED_BACKUP_KEY, System.currentTimeMillis()).apply()
             } catch (e: Exception) {
                 logger.error(e) { "scheduleAutomatedBackupTask: failed due to" }
@@ -95,7 +110,12 @@ object ProtoBackupExport : ProtoBackupBase() {
         backupSchedulerJobId = HAScheduler.scheduleCron(task, "$backupMinute $backupHour */${backupInterval.inWholeDays} * *", "backup")
     }
 
-    private fun createAutomatedBackup() {
+    /**
+     * Writes the archive under a temporary name, syncs it and renames it into
+     * place (Komu), so the name of an automated backup always denotes a
+     * complete archive. Returns the published file.
+     */
+    private fun createAutomatedBackup(): File {
         logger.info { "Creating automated backup..." }
 
         createBackup(BackupFlags.fromServerConfig()).use { input ->
@@ -103,12 +123,21 @@ object ProtoBackupExport : ProtoBackupBase() {
             automatedBackupDir.mkdirs()
 
             val backupFile = File(applicationDirs.automatedBackupRoot, Backup.getFilename(AUTO_BACKUP_FILENAME))
-
-            backupFile.outputStream().use { output -> input.copyTo(output) }
+            val temporary = File(automatedBackupDir, ".${backupFile.name}.${UUID.randomUUID()}.tmp")
+            try {
+                FileOutputStream(temporary).use { output ->
+                    input.copyTo(output)
+                    output.fd.sync()
+                }
+                Files.move(temporary.toPath(), backupFile.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            } finally {
+                temporary.delete()
+            }
+            return backupFile
         }
     }
 
-    private fun cleanupAutomatedBackups() {
+    private fun cleanupAutomatedBackups(keep: File) {
         logger.debug { "Cleanup automated backups (ttl= ${serverConfig.backupTTL.value})" }
 
         val isCleanupDisabled = serverConfig.backupTTL.value == 0
@@ -121,7 +150,10 @@ object ProtoBackupExport : ProtoBackupBase() {
             return
         }
 
-        automatedBackupDir.listFiles { file -> file.name.startsWith(Backup.getBasename(AUTO_BACKUP_FILENAME)) }?.forEach { file ->
+        automatedBackupDir
+            .listFiles { file ->
+                file.name.startsWith(Backup.getBasename(AUTO_BACKUP_FILENAME)) && file != keep
+            }?.forEach { file ->
             try {
                 cleanupAutomatedBackupFile(file)
             } catch (_: Exception) {

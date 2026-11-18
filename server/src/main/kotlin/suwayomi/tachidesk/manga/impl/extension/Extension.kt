@@ -53,11 +53,11 @@ import suwayomi.tachidesk.manga.model.table.ExtensionActivationMarkerTable
 import suwayomi.tachidesk.manga.model.table.ExtensionTable
 import suwayomi.tachidesk.manga.model.table.SourceTable
 import suwayomi.tachidesk.server.ApplicationDirs
+import suwayomi.tachidesk.server.EmbeddedRuntimePlatform
 import suwayomi.tachidesk.server.serverConfig
 import uy.kohesive.injekt.injectLazy
 import java.io.InputStream
 import java.nio.file.Path
-import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -586,9 +586,17 @@ object Extension {
 
     internal fun recoverPendingActivations(): ExtensionActivationJournal.RecoveryReport {
         val journal = ExtensionActivationJournal(Path(applicationDirs.extensionsRoot))
+        val current = activationDatabaseIdentity()
         val report =
             journal.recoverAll(
-                activationDatabaseIdentity(),
+                { recorded ->
+                    ActivationDatabaseIdentity.accepts(
+                        recorded = recorded,
+                        current = current,
+                        databaseType = serverConfig.databaseType.value.name,
+                        embeddedIOS = EmbeddedRuntimePlatform.isIOS(),
+                    )
+                },
                 ::activationMarkerOwner,
                 ::removeActivationMarker,
             )
@@ -629,19 +637,14 @@ object Extension {
         }
     }
 
-    private fun activationDatabaseIdentity(): String {
-        val material =
-            listOf(
-                serverConfig.databaseType.value.name,
-                serverConfig.databaseUrl.value,
-                serverConfig.databaseUsername.value,
-                applicationDirs.dataRoot,
-            ).joinToString("\u0000")
-        return MessageDigest
-            .getInstance("SHA-256")
-            .digest(material.toByteArray(Charsets.UTF_8))
-            .joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
-    }
+    private fun activationDatabaseIdentity(): String =
+        ActivationDatabaseIdentity.of(
+            databaseType = serverConfig.databaseType.value.name,
+            databaseUrl = serverConfig.databaseUrl.value,
+            databaseUsername = serverConfig.databaseUsername.value,
+            dataRoot = applicationDirs.dataRoot,
+            embeddedIOS = EmbeddedRuntimePlatform.isIOS(),
+        )
 
     private fun cachePackageIcon(extPackage: ExtensionPackage) {
         when (extPackage) {
