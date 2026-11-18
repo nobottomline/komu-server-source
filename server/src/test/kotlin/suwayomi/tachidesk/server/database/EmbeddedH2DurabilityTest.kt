@@ -17,56 +17,45 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Komu review 5: on iOS a committed H2 transaction survives the process
- * ending right after the commit (iOS ends apps without warning).
+ * Komu review 5: the embedded H2 keeps its default write delay (lead
+ * decision, docs/problems/server-migration-interrupted-relaunch-2026-11-17.md);
+ * work that must outlive an abrupt end of the process is made durable with
+ * `CHECKPOINT SYNC` (`app.komu.library.DatabaseDurability`) before anything
+ * irreversible relies on it. This is the contract those barriers rest on.
  */
 class EmbeddedH2DurabilityTest {
+    /** A child JVM commits, runs `CHECKPOINT SYNC`, then halts at once (no shutdown hooks, no close). */
     @Test
-    fun `the iOS URL writes every commit before it returns`() {
-        assertEquals("jdbc:h2:/data/database;WRITE_DELAY=0", embeddedH2JdbcUrl("/data", isIOS = true))
-        assertEquals("jdbc:h2:/data/database", embeddedH2JdbcUrl("/data", isIOS = false))
-    }
-
-    @Test
-    fun `the setting reaches the database`(
+    fun `a checkpointed commit survives an immediate halt with the default write delay`(
         @TempDir directory: Path,
     ) {
-        DriverManager.getConnection(embeddedH2JdbcUrl(directory.toString(), isIOS = true)).use { connection ->
-            connection.createStatement().executeQuery(
-                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'WRITE_DELAY'",
-            ).use { result ->
-                assertTrue(result.next())
-                assertEquals("0", result.getString(1))
-            }
-        }
-    }
-
-    /** A child JVM commits, then halts at once (no shutdown hooks, no close). */
-    @Test
-    fun `a commit survives an immediate halt of the process`(
-        @TempDir directory: Path,
-    ) {
-        val url = embeddedH2JdbcUrl(directory.toString(), isIOS = true)
+        val url = "jdbc:h2:$directory/database"
         val java = File(System.getProperty("java.home"), "bin/java").path
         repeat(3) { round ->
             val child =
-                ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), H2CommitThenHalt::class.java.name, url, "$round")
+                ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), H2CheckpointThenHalt::class.java.name, url, "$round")
                     .redirectErrorStream(true)
                     .start()
             assertTrue(child.waitFor(60, TimeUnit.SECONDS), "child finished")
             val output = child.inputStream.bufferedReader().readText()
-            assertEquals(H2CommitThenHalt.HALT_STATUS, child.exitValue(), output)
+            assertEquals(H2CheckpointThenHalt.HALT_STATUS, child.exitValue(), output)
         }
-        DriverManager.getConnection("jdbc:h2:$directory/database").use { connection ->
+        DriverManager.getConnection(url).use { connection ->
             connection.createStatement().executeQuery("SELECT COUNT(*) FROM CANARY").use { result ->
                 assertTrue(result.next())
                 assertEquals(3, result.getInt(1))
+            }
+            connection.createStatement().executeQuery(
+                "SELECT SETTING_VALUE FROM INFORMATION_SCHEMA.SETTINGS WHERE SETTING_NAME = 'WRITE_DELAY'",
+            ).use { result ->
+                assertTrue(result.next())
+                assertEquals("500", result.getString(1), "the default write delay")
             }
         }
     }
 }
 
-object H2CommitThenHalt {
+object H2CheckpointThenHalt {
     const val HALT_STATUS = 37
 
     @JvmStatic
@@ -75,6 +64,7 @@ object H2CommitThenHalt {
         connection.autoCommit = true
         connection.createStatement().execute("CREATE TABLE IF NOT EXISTS CANARY(ID INT PRIMARY KEY)")
         connection.createStatement().execute("INSERT INTO CANARY VALUES (${args[1].toInt()})")
+        connection.createStatement().execute("CHECKPOINT SYNC")
         Runtime.getRuntime().halt(HALT_STATUS)
     }
 }

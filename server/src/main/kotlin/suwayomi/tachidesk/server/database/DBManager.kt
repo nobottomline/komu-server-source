@@ -55,7 +55,7 @@ object DBManager {
                     }
 
                     DatabaseType.H2 -> {
-                        jdbcUrl = embeddedH2JdbcUrl(applicationDirs.dataRoot, EmbeddedRuntimePlatform.isIOS())
+                        jdbcUrl = "jdbc:h2:${applicationDirs.dataRoot}/database"
                         driverClassName = "org.h2.Driver"
                         // H2 specific optimizations
                         addDataSourceProperty("cachePrepStmts", "true")
@@ -127,7 +127,7 @@ object DBManager {
 
                 DatabaseType.H2 -> {
                     Database.connect(
-                        embeddedH2JdbcUrl(Injekt.get<ApplicationDirs>().dataRoot, EmbeddedRuntimePlatform.isIOS()),
+                        "jdbc:h2:${Injekt.get<ApplicationDirs>().dataRoot}/database",
                         "org.h2.Driver",
                         databaseConfig = dbConfig,
                     )
@@ -198,21 +198,6 @@ fun databaseUp(givenDb: Database? = null) {
         shutdownApp(ExitCode.DbMigrationFailure)
     }
 }
-
-/**
- * Komu (review 5): on iOS every H2 commit is written to the database file
- * before it returns. H2 2.4.240 maps `WRITE_DELAY` to the MVStore
- * auto-commit delay (`Database.setWriteDelay`); with 0,
- * `TransactionStore.endTransaction` runs `MVStore.commit()`, which stores
- * the chunk synchronously (`FileStore.storeIt(…, syncWrite = true)`). The
- * default 500 ms leaves a committed transaction in memory, and iOS ends an
- * app without warning (a kill after a reply lost it). This bounds loss on
- * app termination, not on power loss (no `fsync` per commit).
- */
-internal fun embeddedH2JdbcUrl(
-    dataRoot: String,
-    isIOS: Boolean,
-): String = "jdbc:h2:$dataRoot/database" + if (isIOS) ";WRITE_DELAY=0" else ""
 
 /** Local file connections have no network keepalive or server-enforced lifetime. */
 internal fun HikariConfig.configureEmbeddedH2Maintenance(
