@@ -9,7 +9,6 @@ package suwayomi.tachidesk.manga.impl.backup.proto.handlers
 
 import suwayomi.tachidesk.global.impl.GlobalMeta
 import suwayomi.tachidesk.manga.impl.backup.BackupFlags
-import suwayomi.tachidesk.manga.impl.extension.ActivationDatabaseIdentity
 
 object BackupGlobalMetaHandler {
     fun backup(flags: BackupFlags): Map<String, String> {
@@ -17,11 +16,10 @@ object BackupGlobalMetaHandler {
             return emptyMap()
         }
 
-        // Komu: the database's own id never travels to another database.
-        return GlobalMeta.getMetaMap() - ActivationDatabaseIdentity.DATABASE_ID_KEY
+        return GlobalMeta.getMetaMap()
     }
 
     fun restore(meta: Map<String, String>) {
-        GlobalMeta.modifyMetas(meta - ActivationDatabaseIdentity.DATABASE_ID_KEY)
+        GlobalMeta.modifyMetas(meta)
     }
 }

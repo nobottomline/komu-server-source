@@ -591,7 +591,7 @@ object Extension {
 
     internal fun recoverPendingActivations(): ExtensionActivationJournal.RecoveryReport {
         val journal = ExtensionActivationJournal(Path(applicationDirs.extensionsRoot))
-        val (current, databaseHadId) = currentActivationDatabaseIdentity()
+        val current = activationDatabaseIdentity()
         val report =
             journal.recoverAll(
                 { recorded ->
@@ -600,7 +600,6 @@ object Extension {
                         current = current,
                         databaseType = serverConfig.databaseType.value.name,
                         embeddedIOS = EmbeddedRuntimePlatform.isIOS(),
-                        databaseHadId = databaseHadId,
                     )
                 },
                 ::activationMarkerOwner,
@@ -643,27 +642,14 @@ object Extension {
         }
     }
 
-    private fun activationDatabaseIdentity(): String = currentActivationDatabaseIdentity().first
-
-    /**
-     * The identity new journals record, and whether the database already had
-     * its id before this call (always true where no id is used).
-     */
-    private fun currentActivationDatabaseIdentity(): Pair<String, Boolean> {
-        val databaseType = serverConfig.databaseType.value.name
-        if (!ActivationDatabaseIdentity.usesDatabaseId(databaseType, EmbeddedRuntimePlatform.isIOS())) {
-            val identity =
-                ActivationDatabaseIdentity.of(
-                    databaseType = databaseType,
-                    databaseUrl = serverConfig.databaseUrl.value,
-                    databaseUsername = serverConfig.databaseUsername.value,
-                    dataRoot = applicationDirs.dataRoot,
-                )
-            return identity to true
-        }
-        val (id, existed) = ActivationDatabaseId.getOrCreate()
-        return ActivationDatabaseIdentity.ofEmbeddedDatabase(id) to existed
-    }
+    private fun activationDatabaseIdentity(): String =
+        ActivationDatabaseIdentity.of(
+            databaseType = serverConfig.databaseType.value.name,
+            databaseUrl = serverConfig.databaseUrl.value,
+            databaseUsername = serverConfig.databaseUsername.value,
+            dataRoot = applicationDirs.dataRoot,
+            embeddedIOS = EmbeddedRuntimePlatform.isIOS(),
+        )
 
     private fun cachePackageIcon(extPackage: ExtensionPackage) {
         when (extPackage) {

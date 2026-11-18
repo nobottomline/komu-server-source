@@ -17,57 +17,39 @@ import java.security.MessageDigest
  *
  * Komu on iOS (`komu.platform=ios`): the launcher forces H2, whose database
  * is `<dataRoot>/database`, next to the journal in `<dataRoot>/extensions`.
- * The two move together (Komu's copy-on-migrate library copies, its one-time
- * adoption of the old layout, an iOS container move), so no path names the
- * database (Komu review 4). Since review 5 the identity is a random id stored
- * once in the database itself ([DATABASE_ID_KEY] in the global meta table,
- * kept out of backups), so it travels with every copy of that database and
- * no other database has it: a journal restored without its database, or
- * next to another one, is refused.
- *
- * Transition: journals written before the id existed carry a path-based
- * identity (the absolute data root up to 2.4.2466, the root-relative constant
- * of 2.4.2468). They are accepted only while the database has no id yet,
- * i.e. on the first launch of this server on that database; on iOS no other
- * database could have written them then. Once the id exists, only this
- * server writes journals, and only with it.
+ * The two only ever move together (Komu's copy-on-migrate library copies,
+ * its one-time adoption of the old layout, an iOS container move), so the
+ * absolute data root says nothing about which database a journal belongs to
+ * and made recovery refuse a journal after every such move (Komu review 4).
+ * There the identity names the embedded H2 database relative to the data
+ * root, and a journal written by an older server (whose identity included the
+ * then absolute data root) is accepted: on iOS no other database could have
+ * written it.
  */
 internal object ActivationDatabaseIdentity {
     private const val H2 = "H2"
-    private const val EMBEDDED_H2_ID = "komu-ios-embedded-h2-id"
-    const val DATABASE_ID_KEY = "komu.activationDatabaseId"
+    private const val EMBEDDED_H2_LOCATION = "komu-ios-embedded:<dataRoot>/database"
     private val SHA256 = Regex("[0-9a-f]{64}")
 
-    /** Desktop, or any non-embedded database: the configuration. */
     fun of(
         databaseType: String,
         databaseUrl: String,
         databaseUsername: String,
         dataRoot: String,
-    ): String = digest(databaseType, databaseUrl, databaseUsername, dataRoot)
-
-    /** Embedded iOS H2: the id stored in the database. */
-    fun ofEmbeddedDatabase(databaseId: String): String = digest(H2, EMBEDDED_H2_ID, databaseId)
-
-    fun usesDatabaseId(
-        databaseType: String,
         embeddedIOS: Boolean,
-    ): Boolean = embeddedIOS && databaseType == H2
+    ): String =
+        if (embeddedIOS && databaseType == H2) {
+            digest(H2, EMBEDDED_H2_LOCATION)
+        } else {
+            digest(databaseType, databaseUrl, databaseUsername, dataRoot)
+        }
 
-    /**
-     * Whether a journal that recorded [recorded] belongs to the database
-     * whose identity is [current]. [databaseHadId]: the database already
-     * had its id before this launch asked for it.
-     */
     fun accepts(
         recorded: String,
         current: String,
         databaseType: String,
         embeddedIOS: Boolean,
-        databaseHadId: Boolean,
-    ): Boolean =
-        recorded == current ||
-            (usesDatabaseId(databaseType, embeddedIOS) && !databaseHadId && SHA256.matches(recorded))
+    ): Boolean = recorded == current || (embeddedIOS && databaseType == H2 && SHA256.matches(recorded))
 
     private fun digest(vararg material: String): String =
         MessageDigest
