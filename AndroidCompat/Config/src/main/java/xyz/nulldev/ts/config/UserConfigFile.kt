@@ -19,6 +19,7 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.UUID
 
 /**
@@ -69,13 +70,16 @@ object UserConfigFile {
     fun parseAsFile(
         file: Path,
         text: String,
+        // Tests: sees the temporary file while it exists.
+        observeTemporary: (Path) -> Unit = {},
     ): Config {
         val directory = file.toAbsolutePath().parent
         val name = file.fileName.toString()
         val extension = name.substringAfterLast('.', "").takeIf { it.isNotEmpty() }?.let { ".$it" } ?: ""
         val temporary = directory.resolve(".$name.${UUID.randomUUID()}.parse$extension")
         try {
-            Files.write(temporary, text.toByteArray(Charsets.UTF_8), StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+            writeOwnerOnly(temporary, text)
+            observeTemporary(temporary)
             return ConfigFactory.parseFile(temporary.toFile(), strict)
         } finally {
             Files.deleteIfExists(temporary)
@@ -132,13 +136,12 @@ object UserConfigFile {
         val directory = file.toAbsolutePath().parent
         val temporary = directory.resolve(".${file.fileName}.${UUID.randomUUID()}.tmp")
         try {
-            FileChannel
-                .open(temporary, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
-                .use { channel ->
-                    val buffer = java.nio.ByteBuffer.wrap(text.toByteArray(Charsets.UTF_8))
-                    while (buffer.hasRemaining()) channel.write(buffer)
-                    channel.force(true)
-                }
+            writeOwnerOnly(temporary, text, force = true)
+            // Review 8: the rename publishes the temporary file's mode; keep the
+            // original's (an absent original keeps the owner-only mode).
+            if (supportsPosix(temporary) && exists(file)) {
+                Files.setPosixFilePermissions(temporary, Files.getPosixFilePermissions(file, LinkOption.NOFOLLOW_LINKS))
+            }
             Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE)
         } finally {
             Files.deleteIfExists(temporary)
@@ -147,6 +150,34 @@ object UserConfigFile {
     }
 
     private fun syncDirectory(directory: Path) = DirectoryBarrier.sync(directory)
+
+    private val ownerReadWrite = PosixFilePermissions.fromString("rw-------")
+
+    private fun supportsPosix(path: Path): Boolean = "posix" in path.fileSystem.supportedFileAttributeViews()
+
+    /**
+     * Review 8: a temporary copy of server.conf (it holds credentials such as
+     * repository tokens) is created owner-only (0600) from the start where
+     * the file system has POSIX modes, never with the umask's default.
+     */
+    private fun writeOwnerOnly(
+        path: Path,
+        text: String,
+        force: Boolean = false,
+    ) {
+        val options = setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+        val channel =
+            if (supportsPosix(path)) {
+                FileChannel.open(path, options, PosixFilePermissions.asFileAttribute(ownerReadWrite))
+            } else {
+                FileChannel.open(path, options)
+            }
+        channel.use {
+            val buffer = java.nio.ByteBuffer.wrap(text.toByteArray(Charsets.UTF_8))
+            while (buffer.hasRemaining()) it.write(buffer)
+            if (force) it.force(true)
+        }
+    }
 }
 
 /**

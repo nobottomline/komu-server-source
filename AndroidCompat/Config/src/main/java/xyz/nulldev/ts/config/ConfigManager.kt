@@ -121,6 +121,16 @@ open class ConfigManager(
         // Komu (review 7): Lightbend 1.4.9 renders `include required(...)` and
         // `include file(...)` without their closing parenthesis. Write only a
         // text that parses as server.conf would; otherwise fail and keep the file.
+        //
+        // Contract (review 8, Komu docs/problems/server-migration-interrupted-
+        // relaunch-2026-11-17.md, "server.conf contract"): on Komu server.conf
+        // is app-owned and machine-written, one assignment per line, no
+        // include, no substitution; user-authored HOCON is out of contract and
+        // this guard is only defensive. Residual (pre-existing upstream): a
+        // caller that already changed the database (e.g. a repository list)
+        // still reports success when this save fails, and the start-up
+        // reconciliation then rolls the change back; follow-up: make the list
+        // persistence part of the confirmed operation.
         UserConfigFile.parseAsFile(userConfigFile.toPath(), newFileContent)
         writeUserConfig(newFileContent)
     }

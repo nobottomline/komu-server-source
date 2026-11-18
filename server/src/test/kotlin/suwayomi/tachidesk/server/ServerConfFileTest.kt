@@ -86,6 +86,7 @@ class ServerConfFileTest {
     fun `an unreadable user config is never migrated into a reference copy`(
         @TempDir directory: Path,
     ) {
+        assumePosix(directory)
         val file = directory.resolve("server.conf")
         Files.writeString(file, userSettings)
         val manager = ConfigManager(file.toFile())
@@ -180,7 +181,8 @@ class ServerConfFileTest {
         val repos = Files.createDirectories(directory.resolve("opt")).resolve("repos.conf")
         Files.writeString(repos, storesLine)
         val base = repos.toString().removeSuffix(".conf")
-        assertStoresSurviveLoadAndMigration(directory, "include file(\"$base\")\n")
+        // A HOCON string literal: backslashes and quotes of the path escaped.
+        assertStoresSurviveLoadAndMigration(directory, "include file(${com.typesafe.config.ConfigUtil.quoteString(base)})\n")
     }
 
     @Test
@@ -228,8 +230,51 @@ class ServerConfFileTest {
         val original = "include required(\"conf/stores.conf\")\nserver.port = 4999\n"
         Files.writeString(file, original)
         val manager = ConfigManager(file.toFile())
-        runCatching { kotlinx.coroutines.runBlocking { manager.updateValue("server.port", 5000) } }
+        // Lightbend 1.4.9 renders the include without its ')': the write is refused.
+        assertFailsWith<com.typesafe.config.ConfigException.Parse> {
+            kotlinx.coroutines.runBlocking { manager.updateValue("server.port", 5000) }
+        }
+        assertEquals(original, Files.readString(file), "the file is untouched")
+        assertEquals(4999, manager.config.getInt("server.port"), "the in-memory value is unchanged")
         val reloaded = ConfigManager(file.toFile())
         assertEquals(stores, reloaded.config.getStringList("server.extensionStores"))
+    }
+
+    private fun assumePosix(directory: Path) =
+        org.junit.jupiter.api.Assumptions.assumeTrue(
+            "posix" in directory.fileSystem.supportedFileAttributeViews(),
+            "POSIX file modes only",
+        )
+
+    /** Review 8: the atomic write never widens the mode of server.conf (umask 022 by default). */
+    @Test
+    fun `a rewrite keeps an owner-only mode and its temporary files are owner-only`(
+        @TempDir directory: Path,
+    ) {
+        assumePosix(directory)
+        val file = directory.resolve("server.conf")
+        Files.writeString(file, "server.port = 4999\n")
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-------"))
+
+        ConfigManager(file.toFile()).updateUserConfig { this }
+        assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(file)))
+
+        var temporaryMode: String? = null
+        UserConfigFile.parseAsFile(file, "server.port = 1\n") { temporary ->
+            temporaryMode = PosixFilePermissions.toString(Files.getPosixFilePermissions(temporary))
+        }
+        assertEquals("rw-------", temporaryMode)
+    }
+
+    @Test
+    fun `a rewrite keeps the original mode`(
+        @TempDir directory: Path,
+    ) {
+        assumePosix(directory)
+        val file = directory.resolve("server.conf")
+        Files.writeString(file, "server.port = 4999\n")
+        Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r-----"))
+        UserConfigFile.replace(file, "server.port = 5000\n")
+        assertEquals("rw-r-----", PosixFilePermissions.toString(Files.getPosixFilePermissions(file)))
     }
 }
